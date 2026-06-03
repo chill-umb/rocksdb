@@ -33,6 +33,11 @@ enum CompactionStyle : char {
   // Disable background compaction. Compaction jobs are submitted
   // via CompactFiles().
   kCompactionStyleNone = 0x3,
+  // RL-governed compaction style: uses leveled compaction for all levels
+  // except L0, whose trigger is decided by an online DQN agent over a
+  // Unix domain socket.  Falls back to standard level thresholds when the
+  // agent is unreachable.
+  kCompactionStyleRL = 0x4,
 };
 
 // In Level-based compaction, it Determines which file from a level to be

@@ -65,7 +65,7 @@ struct DbPath;
 
 using FileTypeSet = SmallEnumSet<FileType, FileType::kBlobFile>;
 using CompactionStyleSet =
-    SmallEnumSet<CompactionStyle, CompactionStyle::kCompactionStyleNone>;
+    SmallEnumSet<CompactionStyle, CompactionStyle::kCompactionStyleRL>;
 
 struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // The function recovers options to a previous version. Only 4.6 or later

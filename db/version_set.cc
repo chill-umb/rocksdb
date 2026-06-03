@@ -3591,7 +3591,8 @@ void VersionStorageInfo::ComputeCompensatedSizes() {
 }
 
 int VersionStorageInfo::MaxInputLevel() const {
-  if (compaction_style_ == kCompactionStyleLevel) {
+  if (compaction_style_ == kCompactionStyleLevel ||
+      compaction_style_ == kCompactionStyleRL) {
     return num_levels() - 2;
   }
   return 0;
@@ -3608,7 +3609,8 @@ int VersionStorageInfo::MaxOutputLevel(bool allow_ingest_behind) const {
 void VersionStorageInfo::EstimateCompactionBytesNeeded(
     const MutableCFOptions& mutable_cf_options) {
   // Only implemented for level-based compaction
-  if (compaction_style_ != kCompactionStyleLevel) {
+  if (compaction_style_ != kCompactionStyleLevel &&
+      compaction_style_ != kCompactionStyleRL) {
     estimated_compaction_needed_bytes_ = 0;
     return;
   }
@@ -5099,8 +5101,9 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
 
   level_max_bytes_.resize(ioptions.num_levels);
   if (!ioptions.level_compaction_dynamic_level_bytes) {
-    base_level_ = (ioptions.compaction_style == kCompactionStyleLevel) ? 1 : -1;
-
+    base_level_ = (ioptions.compaction_style == kCompactionStyleLevel ||
+                   ioptions.compaction_style == kCompactionStyleRL) ? 1 : -1;
+    
     // Calculate for static bytes base case
     for (int i = 0; i < ioptions.num_levels; ++i) {
       if (i == 0 && ioptions.compaction_style == kCompactionStyleUniversal) {

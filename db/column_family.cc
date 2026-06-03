@@ -21,6 +21,7 @@
 #include "db/compaction/compaction_picker.h"
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
+#include "db/compaction/compaction_picker_rl.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/db_impl/db_impl.h"
 #include "db/internal_stats.h"
@@ -683,6 +684,13 @@ ColumnFamilyData::ColumnFamilyData(
       ROCKS_LOG_WARN(ioptions_.logger,
                      "Column family %s does not use any background compaction. "
                      "Compactions can only be done via CompactFiles\n",
+                     GetName().c_str());
+    } else if (ioptions_.compaction_style == kCompactionStyleRL) {
+      compaction_picker_.reset(
+          new RLCompactionPicker(ioptions_, &internal_comparator_));
+      ROCKS_LOG_INFO(ioptions_.logger,
+                     "Column family %s is using RL-governed compaction. "
+                     "Start the Python RL server before opening the database.\n",
                      GetName().c_str());
     } else {
       ROCKS_LOG_ERROR(ioptions_.logger,
