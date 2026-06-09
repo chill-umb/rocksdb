@@ -1109,7 +1109,8 @@ uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options, int level,
                              CompactionStyle compaction_style, int base_level,
                              bool level_compaction_dynamic_level_bytes) {
   if (!level_compaction_dynamic_level_bytes || level < base_level ||
-      compaction_style != kCompactionStyleLevel) {
+      (compaction_style != kCompactionStyleLevel &&
+       compaction_style != kCompactionStyleRL)) {
     assert(level >= 0);
     assert(level < (int)cf_options.max_file_size.size());
     return cf_options.max_file_size[level];

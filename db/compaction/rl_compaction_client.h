@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sys/un.h>
+
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -11,21 +13,26 @@ namespace ROCKSDB_NAMESPACE {
 
 // Actions the RL agent can return for L0 compaction decisions.
 enum class RLAction : int {
-  kDoNothing  = 0,
+  kDoNothing = 0,
   kCompactNow = 1,
-  kDelay      = 2,
+  kDelay = 2,
+};
+
+struct RLQueryResult {
+  bool ok;
+  RLAction action;
 };
 
 // Normalized state vector sent to the Python RL server each step.
 struct RLState {
-  double f0;       // L0 file count / 20.0            [0, 1]
-  double df0;      // delta L0 file count / 20.0       [-1, 1]
-  double s0;       // L0 compaction score / 4.0        [0, 1]
-  double pcb;      // pending compaction bytes / 10 GB [0, 1]
-  double stall;    // binary stall indicator            {0, 1}
-  double bw;       // recent write pressure (proxy)    [0, 1]
-  double reward;   // reward for the previous action
-  bool   done;     // episode done flag
+  double f0;      // L0 file count / 20.0            [0, 1]
+  double df0;     // delta L0 file count / 20.0       [-1, 1]
+  double s0;      // L0 compaction score, clamped      [0, 1]
+  double pcb;     // pending compaction bytes / 10 GB [0, 1]
+  double stall;   // binary stall indicator            {0, 1}
+  double bw;      // recent write pressure (proxy)    [0, 1]
+  double reward;  // reward for the previous action
+  bool done;      // episode done flag
 };
 
 // Singleton client that communicates with the Python RL server over a
@@ -38,9 +45,9 @@ class RLCompactionClient {
   // Returns the process-wide singleton, lazily initialised.
   static RLCompactionClient& Get();
 
-  // Sends `state` to the Python server and returns the action.
-  // Falls back to kCompactNow on any I/O error so the DB stays safe.
-  RLAction QueryAction(const RLState& state);
+  // Sends `state` to the Python server and returns the action. `ok=false`
+  // means the caller should use its local fallback policy.
+  RLQueryResult QueryAction(const RLState& state);
 
   bool IsConnected() const { return fd_ >= 0; }
 
@@ -54,6 +61,8 @@ class RLCompactionClient {
 
   bool Connect();
   void Disconnect();
+  bool SetSocketTimeouts();
+  bool ConnectWithTimeout(::sockaddr_un* addr);
 
   // Send a newline-terminated string; returns false on error.
   bool SendLine(const std::string& line);
@@ -62,7 +71,8 @@ class RLCompactionClient {
   std::string RecvLine();
 
   std::string socket_path_;
-  int         fd_{-1};
+  int socket_timeout_ms_{100};
+  int fd_{-1};
   mutable std::mutex mu_;
 };
 

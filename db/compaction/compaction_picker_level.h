@@ -30,6 +30,18 @@ class LevelCompactionPicker : public CompactionPicker {
       bool /*require_max_output_level*/ = false) override;
 
   bool NeedsCompaction(const VersionStorageInfo* vstorage) const override;
+
+ protected:
+  // Pick from a specific input level while reusing leveled compaction's normal
+  // file selection, overlap expansion, clean-cut checks, and output-level
+  // setup. Policy wrappers can use this when they override only the trigger
+  // decision, not RocksDB's compaction construction mechanics.
+  Compaction* PickCompactionFromLevel(
+      const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+      const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+      LogBuffer* log_buffer, const std::string& full_history_ts_low,
+      int forced_start_level, double forced_start_level_score,
+      CompactionReason compaction_reason);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

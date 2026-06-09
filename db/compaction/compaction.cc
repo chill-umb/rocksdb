@@ -388,7 +388,8 @@ Compaction::Compaction(
   // Every compaction regardless of any compaction reason may respect the
   // existing compact cursor in the output level to split output files
   output_split_key_ = nullptr;
-  if (immutable_options_.compaction_style == kCompactionStyleLevel &&
+  if ((immutable_options_.compaction_style == kCompactionStyleLevel ||
+       immutable_options_.compaction_style == kCompactionStyleRL) &&
       immutable_options_.compaction_pri == kRoundRobin) {
     const InternalKey* cursor =
         &input_vstorage_->GetCompactCursors()[output_level_];
@@ -647,7 +648,8 @@ bool Compaction::KeyNotExistsBeyondOutputLevel(
   if (bottommost_level_) {
     return true;
   } else if (output_level_ != 0 &&
-             cfd_->ioptions().compaction_style == kCompactionStyleLevel) {
+             (cfd_->ioptions().compaction_style == kCompactionStyleLevel ||
+              cfd_->ioptions().compaction_style == kCompactionStyleRL)) {
     // TODO: apply the optimization here to other compaction styles and
     // compaction/flush to L0.
     // Maybe use binary search to find right entry instead of linear search?
@@ -690,7 +692,8 @@ bool Compaction::KeyRangeNotExistsBeyondOutputLevel(
   if (bottommost_level_) {
     return true /* does not overlap */;
   } else if (output_level_ != 0 &&
-             cfd_->ioptions().compaction_style == kCompactionStyleLevel) {
+             (cfd_->ioptions().compaction_style == kCompactionStyleLevel ||
+              cfd_->ioptions().compaction_style == kCompactionStyleRL)) {
     const Comparator* user_cmp = cfd_->user_comparator();
     for (int lvl = output_level_ + 1; lvl < number_levels_; lvl++) {
       const std::vector<FileMetaData*>& files =
@@ -925,7 +928,8 @@ bool Compaction::ShouldFormSubcompactions() const {
   // Round-Robin pri under leveled compaction allows subcompactions by default
   // and the number of subcompactions can be larger than max_subcompactions_
   if (cfd_->ioptions().compaction_pri == kRoundRobin &&
-      cfd_->ioptions().compaction_style == kCompactionStyleLevel) {
+      (cfd_->ioptions().compaction_style == kCompactionStyleLevel ||
+       cfd_->ioptions().compaction_style == kCompactionStyleRL)) {
     return output_level_ > 0;
   }
 
@@ -933,7 +937,8 @@ bool Compaction::ShouldFormSubcompactions() const {
     return false;
   }
 
-  if (cfd_->ioptions().compaction_style == kCompactionStyleLevel) {
+  if (cfd_->ioptions().compaction_style == kCompactionStyleLevel ||
+      cfd_->ioptions().compaction_style == kCompactionStyleRL) {
     return (start_level_ == 0 || is_manual_compaction_) && output_level_ > 0;
   } else if (cfd_->ioptions().compaction_style == kCompactionStyleUniversal) {
     return number_levels_ > 1 && output_level_ > 0;
@@ -1025,6 +1030,7 @@ int Compaction::EvaluateProximalLevel(
   // TODO: currently per_key_placement feature only support level and universal
   //  compaction
   if (immutable_options.compaction_style != kCompactionStyleLevel &&
+      immutable_options.compaction_style != kCompactionStyleRL &&
       immutable_options.compaction_style != kCompactionStyleUniversal) {
     return kInvalidLevel;
   }

@@ -207,7 +207,8 @@ Status CheckCFPathsSupported(const DBOptions& db_options,
   // in which cf_paths is not specified, which results in db_paths
   // being used.
   if ((cf_options.compaction_style != kCompactionStyleUniversal) &&
-      (cf_options.compaction_style != kCompactionStyleLevel)) {
+      (cf_options.compaction_style != kCompactionStyleLevel) &&
+      (cf_options.compaction_style != kCompactionStyleRL)) {
     if (cf_options.cf_paths.size() > 1) {
       return Status::NotSupported(
           "More than one CF paths are only supported in "
@@ -230,9 +231,9 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
                                       bool read_only,
                                       const ColumnFamilyOptions& src) {
   ColumnFamilyOptions result = src;
-  size_t clamp_max = std::conditional<
-      sizeof(size_t) == 4, std::integral_constant<size_t, 0xffffffff>,
-      std::integral_constant<uint64_t, 64ull << 30>>::type::value;
+  size_t clamp_max = std::conditional < sizeof(size_t) == 4,
+         std::integral_constant<size_t, 0xffffffff>,
+         std::integral_constant < uint64_t, 64ull << 30 >> ::type::value;
   ClipToRange(&result.write_buffer_size, (static_cast<size_t>(64)) << 10,
               clamp_max);
   // if user sets arena_block_size, we trust user to use this value. Otherwise,
@@ -275,7 +276,8 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
   if (result.num_levels < 1) {
     result.num_levels = 1;
   }
-  if (result.compaction_style == kCompactionStyleLevel &&
+  if ((result.compaction_style == kCompactionStyleLevel ||
+       result.compaction_style == kCompactionStyleRL) &&
       result.num_levels < 2) {
     result.num_levels = 2;
   }
@@ -385,7 +387,8 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
   }
 
   if (result.level_compaction_dynamic_level_bytes) {
-    if (result.compaction_style != kCompactionStyleLevel) {
+    if (result.compaction_style != kCompactionStyleLevel &&
+        result.compaction_style != kCompactionStyleRL) {
       ROCKS_LOG_INFO(db_options.info_log.get(),
                      "level_compaction_dynamic_level_bytes only makes sense "
                      "for level-based compaction");
@@ -426,7 +429,8 @@ ColumnFamilyOptions SanitizeCfOptions(const ImmutableDBOptions& db_options,
   }
 
   const uint64_t kAdjustedPeriodicCompSecs = 30 * 24 * 60 * 60;
-  if (result.compaction_style == kCompactionStyleLevel) {
+  if (result.compaction_style == kCompactionStyleLevel ||
+      result.compaction_style == kCompactionStyleRL) {
     if ((result.compaction_filter != nullptr ||
          result.compaction_filter_factory != nullptr) &&
         result.periodic_compaction_seconds == kDefaultPeriodicCompSecs &&
@@ -688,10 +692,11 @@ ColumnFamilyData::ColumnFamilyData(
     } else if (ioptions_.compaction_style == kCompactionStyleRL) {
       compaction_picker_.reset(
           new RLCompactionPicker(ioptions_, &internal_comparator_));
-      ROCKS_LOG_INFO(ioptions_.logger,
-                     "Column family %s is using RL-governed compaction. "
-                     "Start the Python RL server before opening the database.\n",
-                     GetName().c_str());
+      ROCKS_LOG_INFO(
+          ioptions_.logger,
+          "Column family %s is using RL-governed compaction. "
+          "Start the Python RL server before opening the database.\n",
+          GetName().c_str());
     } else {
       ROCKS_LOG_ERROR(ioptions_.logger,
                       "Unable to recognize the specified compaction style %d. "

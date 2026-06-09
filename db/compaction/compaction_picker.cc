@@ -423,7 +423,8 @@ Compaction* CompactionPicker::PickCompactionForCompactFiles(
   CompressionType compression_type;
   if (compact_options.compression == kDisableCompressionOption) {
     int base_level;
-    if (ioptions_.compaction_style == kCompactionStyleLevel) {
+    if (ioptions_.compaction_style == kCompactionStyleLevel ||
+        ioptions_.compaction_style == kCompactionStyleRL) {
       base_level = vstorage->base_level();
     } else {
       base_level = 1;
@@ -1215,7 +1216,8 @@ void CompactionPicker::RegisterCompaction(Compaction* c) {
   if (c == nullptr) {
     return;
   }
-  assert(ioptions_.compaction_style != kCompactionStyleLevel ||
+  assert((ioptions_.compaction_style != kCompactionStyleLevel &&
+          ioptions_.compaction_style != kCompactionStyleRL) ||
          c->output_level() == 0 ||
          !FilesRangeOverlapWithCompaction(*c->inputs(), c->output_level(),
                                           c->GetProximalLevel()));

@@ -1225,7 +1225,8 @@ Status DBImpl::CompactRangeInternal(const CompactRangeOptions& options,
             trim_ts);
         final_output_level = first_overlapped_level;
       } else {
-        assert(cfd->ioptions().compaction_style == kCompactionStyleLevel);
+        assert(cfd->ioptions().compaction_style == kCompactionStyleLevel ||
+               cfd->ioptions().compaction_style == kCompactionStyleRL);
         uint64_t next_file_number = versions_->current_next_file_number();
         // Start compaction from `first_overlapped_level`, one level down at a
         // time, until output level >= max_overlapped_level.

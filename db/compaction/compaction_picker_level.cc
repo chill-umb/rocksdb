@@ -55,14 +55,15 @@ enum class CompactToNextLevel {
 // A class to build a leveled compaction step-by-step.
 class LevelCompactionBuilder {
  public:
-  LevelCompactionBuilder(const std::string& cf_name,
-                         VersionStorageInfo* vstorage,
-                         CompactionPicker* compaction_picker,
-                         LogBuffer* log_buffer,
-                         const MutableCFOptions& mutable_cf_options,
-                         const ImmutableOptions& ioptions,
-                         const MutableDBOptions& mutable_db_options,
-                         const std::string& full_history_ts_low)
+  LevelCompactionBuilder(
+      const std::string& cf_name, VersionStorageInfo* vstorage,
+      CompactionPicker* compaction_picker, LogBuffer* log_buffer,
+      const MutableCFOptions& mutable_cf_options,
+      const ImmutableOptions& ioptions,
+      const MutableDBOptions& mutable_db_options,
+      const std::string& full_history_ts_low, int forced_start_level = -1,
+      double forced_start_level_score = 0,
+      CompactionReason forced_compaction_reason = CompactionReason::kUnknown)
       : cf_name_(cf_name),
         vstorage_(vstorage),
         compaction_picker_(compaction_picker),
@@ -70,7 +71,10 @@ class LevelCompactionBuilder {
         mutable_cf_options_(mutable_cf_options),
         ioptions_(ioptions),
         mutable_db_options_(mutable_db_options),
-        full_history_ts_low_(full_history_ts_low) {}
+        full_history_ts_low_(full_history_ts_low),
+        forced_start_level_(forced_start_level),
+        forced_start_level_score_(forced_start_level_score),
+        forced_compaction_reason_(forced_compaction_reason) {}
 
   // Pick and return a compaction.
   Compaction* PickCompaction();
@@ -158,6 +162,9 @@ class LevelCompactionBuilder {
   const ImmutableOptions& ioptions_;
   const MutableDBOptions& mutable_db_options_;
   const std::string& full_history_ts_low_;
+  const int forced_start_level_;
+  const double forced_start_level_score_;
+  const CompactionReason forced_compaction_reason_;
   // Pick a path ID to place a newly generated file, with its level
   static uint32_t GetPathId(const ImmutableCFOptions& ioptions,
                             const MutableCFOptions& mutable_cf_options,
@@ -202,6 +209,22 @@ void LevelCompactionBuilder::PickFileToCompact(
 }
 
 void LevelCompactionBuilder::SetupInitialFiles() {
+  if (forced_start_level_ >= 0) {
+    start_level_ = forced_start_level_;
+    start_level_score_ = forced_start_level_score_;
+    output_level_ =
+        (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+    if (output_level_ < 0 || output_level_ >= vstorage_->num_levels()) {
+      output_level_ = start_level_;
+    }
+    if (PickFileToCompact()) {
+      compaction_reason_ = forced_compaction_reason_;
+      return;
+    }
+    start_level_inputs_.clear();
+    return;
+  }
+
   // Find the compactions by size on all levels.
   bool skipped_l0_to_base = false;
   for (int i = 0; i < compaction_picker_->NumberLevels() - 1; i++) {
@@ -993,6 +1016,19 @@ Compaction* LevelCompactionPicker::PickCompaction(
   LevelCompactionBuilder builder(cf_name, vstorage, this, log_buffer,
                                  mutable_cf_options, ioptions_,
                                  mutable_db_options, full_history_ts_low);
+  return builder.PickCompaction();
+}
+
+Compaction* LevelCompactionPicker::PickCompactionFromLevel(
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+    const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+    LogBuffer* log_buffer, const std::string& full_history_ts_low,
+    int forced_start_level, double forced_start_level_score,
+    CompactionReason compaction_reason) {
+  LevelCompactionBuilder builder(
+      cf_name, vstorage, this, log_buffer, mutable_cf_options, ioptions_,
+      mutable_db_options, full_history_ts_low, forced_start_level,
+      forced_start_level_score, compaction_reason);
   return builder.PickCompaction();
 }
 }  // namespace ROCKSDB_NAMESPACE

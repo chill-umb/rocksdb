@@ -591,8 +591,10 @@ Status DBImpl::Recover(
       // the user wants to partition SST files.
       // Note that files moved in this step may not respect the compression
       // option in target level.
-      if (cfd->ioptions().compaction_style ==
-              CompactionStyle::kCompactionStyleLevel &&
+      if ((cfd->ioptions().compaction_style ==
+               CompactionStyle::kCompactionStyleLevel ||
+           cfd->ioptions().compaction_style ==
+               CompactionStyle::kCompactionStyleRL) &&
           cfd->ioptions().level_compaction_dynamic_level_bytes &&
           !moptions.disable_auto_compactions) {
         int to_level = cfd->ioptions().num_levels - 1;

@@ -51,11 +51,14 @@ class RLCompactionPicker : public LevelCompactionPicker {
   // -----------------------------------------------------------------------
   mutable std::mutex rl_mu_;
 
-  mutable int      rl_prev_l0_files_{0};
+  mutable int rl_prev_l0_files_{0};
   mutable uint64_t rl_prev_pcb_{0};
-  mutable int      rl_cooldown_steps_{0};
-  mutable bool     rl_last_decision_{true};
-  mutable int      rl_l0_trigger_{4};  // refreshed by PickCompaction
+  mutable int rl_cooldown_steps_{0};
+  mutable bool rl_last_decision_{true};
+  mutable bool rl_last_compaction_picked_{false};
+  mutable bool rl_force_l0_compaction_pending_{false};
+  mutable bool rl_fallback_logged_{false};
+  mutable int rl_l0_trigger_{4};  // refreshed by PickCompaction
   mutable std::chrono::steady_clock::time_point rl_last_query_time_{};
 
   // Rate-limit: minimum wall-clock gap between successive RL server queries.
@@ -64,14 +67,17 @@ class RLCompactionPicker : public LevelCompactionPicker {
   // -----------------------------------------------------------------------
   // Emergency safeguard thresholds — must match the Python config.
   // -----------------------------------------------------------------------
-  static constexpr int      kL0HardCap  = 20;
+  static constexpr int kL0HardCap = 20;
   static constexpr uint64_t kPcbHardCap = 10ULL * 1024 * 1024 * 1024;  // 10 GB
 
   // Compute the scalar reward for the step that just completed.
   double ComputeReward(int l0_files, uint64_t pcb, bool did_compact) const;
 
   // Normalise state, call RLCompactionClient, update tracking, return decision.
-  bool QueryRL(int l0_files, uint64_t pcb) const;
+  bool QueryRL(const VersionStorageInfo* vstorage, int l0_files,
+               uint64_t pcb) const;
+
+  double L0CompactionScore(const VersionStorageInfo* vstorage) const;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

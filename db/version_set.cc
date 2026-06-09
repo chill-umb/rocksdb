@@ -3861,7 +3861,9 @@ void VersionStorageInfo::ComputeCompactionScore(
         // if there is any compaction work to do.
         score = static_cast<double>(num_sorted_runs) /
                 mutable_cf_options.level0_file_num_compaction_trigger;
-        if (compaction_style_ == kCompactionStyleLevel && num_levels() > 1) {
+        if ((compaction_style_ == kCompactionStyleLevel ||
+             compaction_style_ == kCompactionStyleRL) &&
+            num_levels() > 1) {
           // Level-based involves L0->L0 compactions that can lead to oversized
           // L0 files. Take into account size as well to avoid later giant
           // compactions to the base level.
@@ -4018,7 +4020,9 @@ void VersionStorageInfo::ComputeFilesMarkedForCompaction(int last_level) {
 void VersionStorageInfo::ComputeExpiredTtlFiles(
     const ImmutableOptions& ioptions, const uint64_t ttl) {
   expired_ttl_files_.clear();
-  if (ttl == 0 || compaction_style_ != CompactionStyle::kCompactionStyleLevel) {
+  if (ttl == 0 ||
+      (compaction_style_ != CompactionStyle::kCompactionStyleLevel &&
+       compaction_style_ != CompactionStyle::kCompactionStyleRL)) {
     return;
   }
 
@@ -4253,7 +4257,8 @@ void VersionStorageInfo::SetFinalized() {
   finalized_ = true;
 
 #ifndef NDEBUG
-  if (compaction_style_ != kCompactionStyleLevel) {
+  if (compaction_style_ != kCompactionStyleLevel &&
+      compaction_style_ != kCompactionStyleRL) {
     // Not level based compaction.
     return;
   }
@@ -4926,7 +4931,9 @@ uint64_t VersionStorageInfo::NumLevelBytes(int level) const {
 const char* VersionStorageInfo::LevelSummary(
     LevelSummaryStorage* scratch) const {
   int len = 0;
-  if (compaction_style_ == kCompactionStyleLevel && num_levels() > 1) {
+  if ((compaction_style_ == kCompactionStyleLevel ||
+       compaction_style_ == kCompactionStyleRL) &&
+      num_levels() > 1) {
     assert(base_level_ < static_cast<int>(level_max_bytes_.size()));
     if (level_multiplier_ != 0.0) {
       len = snprintf(
@@ -5102,8 +5109,10 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
   level_max_bytes_.resize(ioptions.num_levels);
   if (!ioptions.level_compaction_dynamic_level_bytes) {
     base_level_ = (ioptions.compaction_style == kCompactionStyleLevel ||
-                   ioptions.compaction_style == kCompactionStyleRL) ? 1 : -1;
-    
+                   ioptions.compaction_style == kCompactionStyleRL)
+                      ? 1
+                      : -1;
+
     // Calculate for static bytes base case
     for (int i = 0; i < ioptions.num_levels; ++i) {
       if (i == 0 && ioptions.compaction_style == kCompactionStyleUniversal) {
@@ -5118,7 +5127,8 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
       }
     }
   } else {
-    assert(ioptions.compaction_style == kCompactionStyleLevel);
+    assert(ioptions.compaction_style == kCompactionStyleLevel ||
+           ioptions.compaction_style == kCompactionStyleRL);
     uint64_t max_level_size = 0;
 
     int first_non_empty_level = -1;
@@ -5313,6 +5323,7 @@ Env::WriteLifeTimeHint VersionStorageInfo::CalculateSSTWriteHint(
 
   switch (compaction_style_) {
     case kCompactionStyleLevel:
+    case kCompactionStyleRL:
       if (level == 0) {
         return Env::WLTH_MEDIUM;
       }
