@@ -23,6 +23,7 @@
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_rl.h"
 #include "db/compaction/compaction_picker_universal.h"
+#include "db/compaction/rl_compaction_telemetry.h"
 #include "db/db_impl/db_impl.h"
 #include "db/internal_stats.h"
 #include "db/job_context.h"
@@ -1466,6 +1467,10 @@ void ColumnFamilyData::InstallSuperVersion(
     }
     if (old_superversion->write_stall_condition !=
         new_superversion->write_stall_condition) {
+      if (ioptions().compaction_style == kCompactionStyleRL) {
+        RLCompactionTelemetry::Get().RecordWriteStall(
+            new_superversion->write_stall_condition);
+      }
       sv_context->PushWriteStallNotification(
           old_superversion->write_stall_condition,
           new_superversion->write_stall_condition, GetName(), &ioptions());

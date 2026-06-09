@@ -10,6 +10,7 @@
 #include <deque>
 
 #include "db/builder.h"
+#include "db/compaction/rl_compaction_telemetry.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
@@ -32,6 +33,18 @@
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+uint64_t ApproximateFlushBytesForRL(const TableProperties& props) {
+  uint64_t bytes = props.data_size + props.index_size + props.filter_size;
+  if (bytes == 0) {
+    bytes = props.raw_key_size + props.raw_value_size;
+  }
+  return bytes;
+}
+
+}  // namespace
 
 bool DBImpl::EnoughRoomForCompaction(
     ColumnFamilyData* cfd, const std::vector<CompactionInputFiles>& inputs,
@@ -915,6 +928,12 @@ void DBImpl::NotifyOnFlushCompleted(
     ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
     std::list<std::unique_ptr<FlushJobInfo>>* flush_jobs_info) {
   assert(flush_jobs_info != nullptr);
+  if (cfd->ioptions().compaction_style == kCompactionStyleRL) {
+    for (const auto& info : *flush_jobs_info) {
+      RLCompactionTelemetry::Get().RecordFlushBytes(
+          ApproximateFlushBytesForRL(info->table_properties));
+    }
+  }
   if (immutable_db_options_.listeners.size() == 0U) {
     return;
   }
@@ -1828,11 +1847,18 @@ void DBImpl::NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
 void DBImpl::NotifyOnCompactionCompleted(
     ColumnFamilyData* cfd, Compaction* c, const Status& st,
     const CompactionJobStats& compaction_job_stats, const int job_id) {
-  if (immutable_db_options_.listeners.size() == 0U) {
-    return;
-  }
   mutex_.AssertHeld();
   if (shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  if (cfd->ioptions().compaction_style == kCompactionStyleRL && st.ok()) {
+    RLCompactionTelemetry::Get().RecordCompactionCompleted(
+        c->start_level(), compaction_job_stats.total_input_bytes,
+        compaction_job_stats.total_output_bytes);
+  }
+
+  if (immutable_db_options_.listeners.size() == 0U) {
     return;
   }
 

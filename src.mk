@@ -39,10 +39,13 @@ LIB_SOURCES =                                                   \
   db/compaction/compaction_picker.cc                            \
   db/compaction/compaction_picker_fifo.cc                       \
   db/compaction/compaction_picker_level.cc                      \
+  db/compaction/compaction_picker_rl.cc                         \
   db/compaction/compaction_picker_universal.cc                  \
   db/compaction/compaction_service_job.cc                       \
   db/compaction/compaction_state.cc                             \
   db/compaction/compaction_outputs.cc                           \
+  db/compaction/rl_compaction_client.cc                         \
+  db/compaction/rl_compaction_telemetry.cc                      \
   db/compaction/sst_partitioner.cc                              \
   db/compaction/subcompaction_state.cc                          \
   db/convenience.cc                                             \

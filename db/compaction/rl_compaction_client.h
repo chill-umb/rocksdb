@@ -29,8 +29,8 @@ struct RLState {
   double df0;     // delta L0 file count / 20.0       [-1, 1]
   double s0;      // L0 compaction score, clamped      [0, 1]
   double pcb;     // pending compaction bytes / 10 GB [0, 1]
-  double stall;   // binary stall indicator            {0, 1}
-  double bw;      // recent write pressure (proxy)    [0, 1]
+  double stall;   // real stall observed in last step  {0, 1}
+  double bw;      // flushed bytes / 64 MB             [0, 1]
   double reward;  // reward for the previous action
   bool done;      // episode done flag
 };
