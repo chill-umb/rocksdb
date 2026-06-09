@@ -70,7 +70,11 @@ double RLCompactionPicker::L0CompactionScore(
 bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
                                  int l0_files, uint64_t pcb) const {
   auto now = std::chrono::steady_clock::now();
-  if (now - rl_last_query_time_ < kMinQueryInterval) return rl_last_decision_;
+  const double l0_score = L0CompactionScore(vstorage);
+  const bool l0_score_emergency = l0_score >= 1.0 && l0_files > 0;
+  if (!l0_score_emergency && now - rl_last_query_time_ < kMinQueryInterval) {
+    return rl_last_decision_;
+  }
 
   rl_last_compaction_picked_ = false;
   RLCompactionTelemetrySnapshot telemetry =
@@ -80,7 +84,7 @@ bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
   const double f0_norm = Clamp01(static_cast<double>(l0_files) / kL0HardCap);
   const double df0 = static_cast<double>(l0_files - rl_prev_l0_files_);
   const double df0_norm = std::max(-1.0, std::min(1.0, df0 / kL0HardCap));
-  const double s0_norm = Clamp01(L0CompactionScore(vstorage));
+  const double s0_norm = Clamp01(l0_score);
   const double pcb_norm = NormalizeBytes(pcb, kPcbHardCap);
   const double stall = reward.stall_norm;
   const double bw = NormalizeBytes(telemetry.flushed_bytes, kWriteBytesNorm);
@@ -114,7 +118,7 @@ bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
   rl_last_query_time_ = now;
 
   if (!result.ok) {
-    if (stall_emergency) {
+    if (stall_emergency || l0_score_emergency) {
       rl_force_l0_compaction_pending_ = true;
       rl_last_decision_ = true;
       rl_cooldown_steps_ = 0;
@@ -133,7 +137,11 @@ bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
   }
   rl_fallback_logged_ = false;
 
-  if (stall_emergency) {
+  if (stall_emergency || l0_score_emergency) {
+    ROCKS_LOG_WARN(ioptions_.logger,
+                   "RL compaction action overridden by safety guard: "
+                   "l0_score=%.4f stall_emergency=%d l0_files=%d",
+                   l0_score, static_cast<int>(stall_emergency), l0_files);
     rl_force_l0_compaction_pending_ = true;
     rl_last_decision_ = true;
     rl_cooldown_steps_ = 0;
@@ -195,8 +203,11 @@ bool RLCompactionPicker::NeedsCompaction(
   std::unique_lock<std::mutex> lock(rl_mu_);
 
   if (rl_cooldown_steps_ > 0) {
-    --rl_cooldown_steps_;
-    return false;
+    if (L0CompactionScore(vstorage) < 1.0 || l0_files == 0) {
+      --rl_cooldown_steps_;
+      return false;
+    }
+    rl_cooldown_steps_ = 0;
   }
 
   return QueryRL(vstorage, l0_files, pcb);
