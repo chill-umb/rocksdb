@@ -39,9 +39,24 @@ std::string FormatState(const RLState& s) {
   std::ostringstream os;
   os.precision(6);
   os << std::fixed;
-  os << "{\"f0\":" << s.f0 << ",\"df0\":" << s.df0 << ",\"s0\":" << s.s0
-     << ",\"pcb\":" << s.pcb << ",\"stall\":" << s.stall << ",\"bw\":" << s.bw
-     << ",\"reward\":" << s.reward
+  os << "{\"l0_files\":" << s.l0_files
+     << ",\"l0_size_bytes\":" << s.l0_size_bytes
+     << ",\"l0_score\":" << s.l0_score
+     << ",\"l0_delay_trigger_count\":" << s.l0_delay_trigger_count
+     << ",\"l0_compaction_trigger\":" << s.l0_compaction_trigger
+     << ",\"l0_slowdown_trigger\":" << s.l0_slowdown_trigger
+     << ",\"l0_stop_trigger\":" << s.l0_stop_trigger
+     << ",\"pending_compaction_bytes\":" << s.pending_compaction_bytes
+     << ",\"flushed_bytes\":" << s.flushed_bytes
+     << ",\"compaction_bytes_read\":" << s.compaction_bytes_read
+     << ",\"compaction_bytes_written\":" << s.compaction_bytes_written
+     << ",\"compactions_completed\":" << s.compactions_completed
+     << ",\"l0_compactions_completed\":" << s.l0_compactions_completed
+     << ",\"l0_compactions_scheduled\":" << s.l0_compactions_scheduled
+     << ",\"stall_count\":" << s.stall_count
+     << ",\"stop_count\":" << s.stop_count
+     << ",\"default_l0_compaction_needed\":"
+     << (s.default_l0_compaction_needed ? "true" : "false")
      << ",\"done\":" << (s.done ? "true" : "false") << "}";
   return os.str();
 }
@@ -228,7 +243,7 @@ RLQueryResult RLCompactionClient::QueryAction(const RLState& state) {
 
   int action = ParseIntField(response, "action",
                              static_cast<int>(RLAction::kCompactNow));
-  if (action < 0 || action > 2)
+  if (action < 0 || action > 1)
     action = static_cast<int>(RLAction::kCompactNow);
   return {true, static_cast<RLAction>(action)};
 }

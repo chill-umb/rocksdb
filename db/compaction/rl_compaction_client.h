@@ -15,7 +15,6 @@ namespace ROCKSDB_NAMESPACE {
 enum class RLAction : int {
   kDoNothing = 0,
   kCompactNow = 1,
-  kDelay = 2,
 };
 
 struct RLQueryResult {
@@ -23,16 +22,28 @@ struct RLQueryResult {
   RLAction action;
 };
 
-// Normalized state vector sent to the Python RL server each step.
+// Raw state vector sent to the Python RL server each step.
+// RocksDB only reports observable L0 state and recent telemetry deltas. The
+// Python agent owns normalization, reward computation, and learning.
 struct RLState {
-  double f0;      // L0 file count / 20.0            [0, 1]
-  double df0;     // delta L0 file count / 20.0       [-1, 1]
-  double s0;      // L0 compaction score, clamped      [0, 1]
-  double pcb;     // pending compaction bytes / 10 GB [0, 1]
-  double stall;   // real stall observed in last step  {0, 1}
-  double bw;      // flushed bytes / 64 MB             [0, 1]
-  double reward;  // reward for the previous action
-  bool done;      // episode done flag
+  int l0_files;
+  uint64_t l0_size_bytes;
+  double l0_score;
+  int l0_delay_trigger_count;
+  int l0_compaction_trigger;
+  int l0_slowdown_trigger;
+  int l0_stop_trigger;
+  uint64_t pending_compaction_bytes;
+  uint64_t flushed_bytes;
+  uint64_t compaction_bytes_read;
+  uint64_t compaction_bytes_written;
+  uint64_t compactions_completed;
+  uint64_t l0_compactions_completed;
+  uint64_t l0_compactions_scheduled;
+  uint64_t stall_count;
+  uint64_t stop_count;
+  bool default_l0_compaction_needed;
+  bool done;
 };
 
 // Singleton client that communicates with the Python RL server over a

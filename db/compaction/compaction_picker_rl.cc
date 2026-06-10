@@ -17,46 +17,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-namespace {
-
-double Clamp01(double value) { return std::max(0.0, std::min(1.0, value)); }
-
-double NormalizeBytes(uint64_t value, uint64_t norm) {
-  return norm == 0 ? 0.0 : Clamp01(static_cast<double>(value) / norm);
-}
-
-}  // namespace
-
-RLCompactionPicker::RLRewardBreakdown RLCompactionPicker::ComputeReward(
-    int l0_files, uint64_t pcb,
-    const RLCompactionTelemetrySnapshot& telemetry) const {
-  RLRewardBreakdown reward;
-  const double delta_f0_pos =
-      std::max(0.0, static_cast<double>(l0_files - rl_prev_l0_files_));
-  const double delta_pcb_pos =
-      std::max(0.0, static_cast<double>(static_cast<int64_t>(pcb) -
-                                        static_cast<int64_t>(rl_prev_pcb_)));
-  const bool l0_pressure_relieved = l0_files < rl_prev_l0_files_;
-  const bool pcb_pressure_relieved = pcb < rl_prev_pcb_;
-
-  reward.delta_f0_norm = Clamp01(delta_f0_pos / kL0HardCap);
-  reward.delta_pcb_norm = Clamp01(delta_pcb_pos / kPcbHardCap);
-  reward.stall_norm =
-      telemetry.stall_count > 0 || telemetry.stop_count > 0 ? 1.0 : 0.0;
-  reward.compact_cost = telemetry.l0_compactions_completed > 0 ? 1.0 : 0.0;
-  reward.bytes_compacted_norm = NormalizeBytes(
-      telemetry.compaction_bytes_read + telemetry.compaction_bytes_written,
-      kCompactionBytesNorm);
-  reward.pressure_relieved =
-      l0_pressure_relieved || pcb_pressure_relieved ? 1.0 : 0.0;
-
-  reward.reward = -0.30 * reward.delta_f0_norm - 0.30 * reward.delta_pcb_norm -
-                  0.30 * reward.stall_norm - 0.10 * reward.compact_cost -
-                  0.05 * reward.bytes_compacted_norm +
-                  0.50 * reward.pressure_relieved;
-  return reward;
-}
-
 double RLCompactionPicker::L0CompactionScore(
     const VersionStorageInfo* vstorage) const {
   for (int i = 0; i <= vstorage->MaxInputLevel(); ++i) {
@@ -79,49 +39,53 @@ bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
   rl_last_compaction_picked_ = false;
   RLCompactionTelemetrySnapshot telemetry =
       RLCompactionTelemetry::Get().Consume();
-  RLRewardBreakdown reward = ComputeReward(l0_files, pcb, telemetry);
 
-  const double f0_norm = Clamp01(static_cast<double>(l0_files) / kL0HardCap);
-  const double df0 = static_cast<double>(l0_files - rl_prev_l0_files_);
-  const double df0_norm = std::max(-1.0, std::min(1.0, df0 / kL0HardCap));
-  const double s0_norm = Clamp01(l0_score);
-  const double pcb_norm = NormalizeBytes(pcb, kPcbHardCap);
-  const double stall = reward.stall_norm;
-  const double bw = NormalizeBytes(telemetry.flushed_bytes, kWriteBytesNorm);
   const bool stall_emergency = telemetry.stop_count > 0 && l0_files > 0;
 
-  RLState state{f0_norm, df0_norm, s0_norm,       pcb_norm,
-                stall,   bw,       reward.reward, false};
+  RLState state{l0_files,
+                vstorage->NumLevelBytes(0),
+                l0_score,
+                vstorage->l0_delay_trigger_count(),
+                rl_l0_trigger_,
+                rl_l0_slowdown_trigger_,
+                rl_l0_stop_trigger_,
+                pcb,
+                telemetry.flushed_bytes,
+                telemetry.compaction_bytes_read,
+                telemetry.compaction_bytes_written,
+                telemetry.compactions_completed,
+                telemetry.l0_compactions_completed,
+                telemetry.l0_compactions_scheduled,
+                telemetry.stall_count,
+                telemetry.stop_count,
+                l0_score >= 1.0,
+                false};
 
   ROCKS_LOG_INFO(
       ioptions_.logger,
-      "RL compaction state: f0=%.4f df0=%.4f score0=%.4f pcb=%.4f "
-      "stall=%.4f bw=%.4f reward=%.4f "
-      "reward_components={delta_f0=%.4f,delta_pcb=%.4f,stall=%.4f,"
-      "compact=%.4f,bytes=%.4f,relieved=%.4f} "
-      "telemetry={flushed=%" PRIu64 ",compact_read=%" PRIu64
-      ",compact_written=%" PRIu64 ",l0_completed=%" PRIu64
-      ",l0_scheduled=%" PRIu64 ",stall_count=%" PRIu64 ",stop_count=%" PRIu64
-      "}",
-      state.f0, state.df0, state.s0, state.pcb, state.stall, state.bw,
-      state.reward, reward.delta_f0_norm, reward.delta_pcb_norm,
-      reward.stall_norm, reward.compact_cost, reward.bytes_compacted_norm,
-      reward.pressure_relieved, telemetry.flushed_bytes,
+      "RL compaction state: l0_files=%d l0_size=%" PRIu64
+      " l0_score=%.4f l0_delay=%d trigger=%d slowdown=%d stop=%d "
+      "pending_compaction_bytes=%" PRIu64 " telemetry={flushed=%" PRIu64
+      ",compact_read=%" PRIu64 ",compact_written=%" PRIu64
+      ",compactions=%" PRIu64 ",l0_completed=%" PRIu64 ",l0_scheduled=%" PRIu64
+      ",stall_count=%" PRIu64 ",stop_count=%" PRIu64 "}",
+      state.l0_files, state.l0_size_bytes, state.l0_score,
+      state.l0_delay_trigger_count, state.l0_compaction_trigger,
+      state.l0_slowdown_trigger, state.l0_stop_trigger,
+      state.pending_compaction_bytes, telemetry.flushed_bytes,
       telemetry.compaction_bytes_read, telemetry.compaction_bytes_written,
-      telemetry.l0_compactions_completed, telemetry.l0_compactions_scheduled,
-      telemetry.stall_count, telemetry.stop_count);
+      telemetry.compactions_completed, telemetry.l0_compactions_completed,
+      telemetry.l0_compactions_scheduled, telemetry.stall_count,
+      telemetry.stop_count);
 
   RLQueryResult result = RLCompactionClient::Get().QueryAction(state);
 
-  rl_prev_l0_files_ = l0_files;
-  rl_prev_pcb_ = pcb;
   rl_last_query_time_ = now;
 
   if (!result.ok) {
     if (stall_emergency || l0_score_emergency) {
       rl_force_l0_compaction_pending_ = true;
       rl_last_decision_ = true;
-      rl_cooldown_steps_ = 0;
       return true;
     }
     rl_force_l0_compaction_pending_ = false;
@@ -144,7 +108,6 @@ bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
                    l0_score, static_cast<int>(stall_emergency), l0_files);
     rl_force_l0_compaction_pending_ = true;
     rl_last_decision_ = true;
-    rl_cooldown_steps_ = 0;
     return true;
   }
 
@@ -153,11 +116,6 @@ bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
       rl_force_l0_compaction_pending_ = true;
       rl_last_decision_ = true;
       return true;
-    case RLAction::kDelay:
-      rl_cooldown_steps_ = 1;
-      rl_force_l0_compaction_pending_ = false;
-      rl_last_decision_ = false;
-      return false;
     case RLAction::kDoNothing:
     default:
       rl_force_l0_compaction_pending_ = false;
@@ -189,25 +147,13 @@ bool RLCompactionPicker::NeedsCompaction(
 
   int l0_files = vstorage->NumLevelFiles(0);
   uint64_t pcb = vstorage->estimated_compaction_needed_bytes();
+  std::unique_lock<std::mutex> lock(rl_mu_);
+  const int l0_safety_cap = std::max(1, rl_l0_stop_trigger_);
 
-  if (l0_files >= kL0HardCap || pcb >= kPcbHardCap) {
-    std::unique_lock<std::mutex> lock(rl_mu_);
-    rl_prev_l0_files_ = l0_files;
-    rl_prev_pcb_ = pcb;
+  if (l0_files >= l0_safety_cap || pcb >= kPcbHardCap) {
     rl_last_decision_ = true;
     rl_force_l0_compaction_pending_ = l0_files > 0;
-    rl_cooldown_steps_ = 0;
     return true;
-  }
-
-  std::unique_lock<std::mutex> lock(rl_mu_);
-
-  if (rl_cooldown_steps_ > 0) {
-    if (L0CompactionScore(vstorage) < 1.0 || l0_files == 0) {
-      --rl_cooldown_steps_;
-      return false;
-    }
-    rl_cooldown_steps_ = 0;
   }
 
   return QueryRL(vstorage, l0_files, pcb);
@@ -223,6 +169,8 @@ Compaction* RLCompactionPicker::PickCompaction(
   {
     std::unique_lock<std::mutex> lock(rl_mu_);
     rl_l0_trigger_ = mutable_cf_options.level0_file_num_compaction_trigger;
+    rl_l0_slowdown_trigger_ = mutable_cf_options.level0_slowdown_writes_trigger;
+    rl_l0_stop_trigger_ = mutable_cf_options.level0_stop_writes_trigger;
   }
 
   bool force_l0_compaction = false;

@@ -54,44 +54,25 @@ class RLCompactionPicker : public LevelCompactionPicker {
   // -----------------------------------------------------------------------
   mutable std::mutex rl_mu_;
 
-  mutable int rl_prev_l0_files_{0};
-  mutable uint64_t rl_prev_pcb_{0};
-  mutable int rl_cooldown_steps_{0};
   mutable bool rl_last_decision_{true};
   mutable bool rl_last_compaction_picked_{false};
   mutable bool rl_force_l0_compaction_pending_{false};
   mutable bool rl_fallback_logged_{false};
   mutable int rl_l0_trigger_{4};  // refreshed by PickCompaction
+  mutable int rl_l0_slowdown_trigger_{20};
+  mutable int rl_l0_stop_trigger_{36};
   mutable std::chrono::steady_clock::time_point rl_last_query_time_{};
 
   // Rate-limit: minimum wall-clock gap between successive RL server queries.
   static constexpr std::chrono::milliseconds kMinQueryInterval{50};
 
   // -----------------------------------------------------------------------
-  // Emergency safeguard thresholds — must match the Python config.
+  // Emergency safeguard threshold for pending compaction bytes.
+  // L0 file-count safety uses the live level0_stop_writes_trigger.
   // -----------------------------------------------------------------------
-  static constexpr int kL0HardCap = 20;
   static constexpr uint64_t kPcbHardCap = 10ULL * 1024 * 1024 * 1024;  // 10 GB
-  static constexpr uint64_t kWriteBytesNorm = 64ULL * 1024 * 1024;     // 64 MB
-  static constexpr uint64_t kCompactionBytesNorm =
-      1024ULL * 1024 * 1024;  // 1 GB
 
-  struct RLRewardBreakdown {
-    double reward = 0.0;
-    double delta_f0_norm = 0.0;
-    double delta_pcb_norm = 0.0;
-    double stall_norm = 0.0;
-    double compact_cost = 0.0;
-    double bytes_compacted_norm = 0.0;
-    double pressure_relieved = 0.0;
-  };
-
-  // Compute the scalar reward for the step that just completed.
-  RLRewardBreakdown ComputeReward(
-      int l0_files, uint64_t pcb,
-      const RLCompactionTelemetrySnapshot& telemetry) const;
-
-  // Normalise state, call RLCompactionClient, update tracking, return decision.
+  // Send raw state to RLCompactionClient and return the selected decision.
   bool QueryRL(const VersionStorageInfo* vstorage, int l0_files,
                uint64_t pcb) const;
 
