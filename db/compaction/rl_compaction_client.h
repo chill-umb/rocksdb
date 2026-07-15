@@ -6,49 +6,69 @@
 #include <chrono>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-// Actions the RL agent can return for L0 compaction decisions.
+// Actions the RL agent can return for a per-level compaction decision.
 enum class RLAction : int {
   kDoNothing = 0,
   kCompactNow = 1,
 };
 
-struct RLQueryResult {
-  bool ok;
-  RLAction action;
+// Raw observable state for one LSM level. RocksDB only reports observables;
+// the Python agent owns normalization, reward computation, and learning.
+struct RLLevelState {
+  int level = 0;
+  int files = 0;
+  uint64_t bytes = 0;
+  double score = 0.0;           // RocksDB compaction score for this level
+  uint64_t target_bytes = 0;    // MaxBytesForLevel (0 for L0: use triggers)
+  int next_level_files = 0;     // 0 when is_last
+  uint64_t next_level_bytes = 0;
+  double next_level_score = 0.0;
+  uint64_t next_level_target_bytes = 0;
+  uint64_t overlap_bytes = 0;   // bytes in level+1 overlapping this level
+  // Telemetry deltas since the previous RL query, scoped to this level.
+  uint64_t bytes_in = 0;            // arrived via flush/compaction output
+  uint64_t bytes_read_out = 0;      // compaction reads with this base level
+  uint64_t bytes_written_out = 0;   // compaction writes with this base level
+  uint64_t compactions_from = 0;    // completed compactions from this level
+  uint64_t compactions_scheduled = 0;
+  bool default_needed = false;  // would RocksDB's own trigger fire (score>=1)
+  bool is_last = false;         // no next level below this one
 };
 
-// Raw state vector sent to the Python RL server each step.
-// RocksDB only reports observable L0 state and recent telemetry deltas. The
-// Python agent owns normalization, reward computation, and learning.
-struct RLState {
-  int l0_files;
-  uint64_t l0_size_bytes;
-  double l0_score;
-  int l0_delay_trigger_count;
-  int l0_compaction_trigger;
-  int l0_slowdown_trigger;
-  int l0_stop_trigger;
-  uint64_t pending_compaction_bytes;
-  uint64_t flushed_bytes;
-  uint64_t compaction_bytes_read;
-  uint64_t compaction_bytes_written;
-  uint64_t compactions_completed;
-  uint64_t l0_compactions_completed;
-  uint64_t l0_compactions_scheduled;
-  uint64_t stall_count;
-  uint64_t stop_count;
-  bool default_l0_compaction_needed;
-  bool done;
+// Full request: global state + one entry per candidate level.
+struct RLStateV2 {
+  uint64_t pending_compaction_bytes = 0;
+  uint64_t flushed_bytes = 0;
+  uint64_t compaction_bytes_read = 0;
+  uint64_t compaction_bytes_written = 0;
+  uint64_t compactions_completed = 0;
+  uint64_t stall_count = 0;
+  uint64_t stop_count = 0;
+  int l0_compaction_trigger = 4;
+  int l0_slowdown_trigger = 20;
+  int l0_stop_trigger = 36;
+  int l0_delay_trigger_count = 0;
+  bool done = false;
+  std::vector<RLLevelState> levels;
+};
+
+// Result of a multi-level query: one action per requested level, in request
+// order. `ok=false` means the caller should use its local fallback policy.
+struct RLMultiQueryResult {
+  bool ok = false;
+  std::vector<RLAction> actions;
 };
 
 // Singleton client that communicates with the Python RL server over a
-// Unix domain socket.  The C++ compaction picker calls QueryAction()
-// on each L0 evaluation; the server returns an action and trains online.
+// Unix domain socket.  The C++ compaction picker calls QueryActions()
+// on each decision evaluation; the server returns per-level actions and
+// trains its per-level agents online.
 //
 // Thread-safe: a single mutex serialises socket I/O.
 class RLCompactionClient {
@@ -56,9 +76,10 @@ class RLCompactionClient {
   // Returns the process-wide singleton, lazily initialised.
   static RLCompactionClient& Get();
 
-  // Sends `state` to the Python server and returns the action. `ok=false`
-  // means the caller should use its local fallback policy.
-  RLQueryResult QueryAction(const RLState& state);
+  // Sends `state` to the Python server and returns one action per level in
+  // `state.levels` (same order). `ok=false` on connection failure, timeout,
+  // or a malformed/mis-sized response.
+  RLMultiQueryResult QueryActions(const RLStateV2& state);
 
   bool IsConnected() const { return fd_ >= 0; }
 

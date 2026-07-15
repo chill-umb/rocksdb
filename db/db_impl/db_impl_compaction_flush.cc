@@ -1854,7 +1854,8 @@ void DBImpl::NotifyOnCompactionCompleted(
 
   if (cfd->ioptions().compaction_style == kCompactionStyleRL && st.ok()) {
     RLCompactionTelemetry::Get().RecordCompactionCompleted(
-        c->start_level(), compaction_job_stats.total_input_bytes,
+        c->start_level(), c->output_level(),
+        compaction_job_stats.total_input_bytes,
         compaction_job_stats.total_output_bytes);
   }
 

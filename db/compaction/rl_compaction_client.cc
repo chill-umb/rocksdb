@@ -34,43 +34,71 @@ int SocketTimeoutMsFromEnv() {
   return timeout_ms > 0 ? timeout_ms : 100;
 }
 
-// Minimal JSON number formatting (no external dependency).
-std::string FormatState(const RLState& s) {
+// Minimal JSON formatting (no external dependency).
+void AppendLevelState(std::ostringstream& os, const RLLevelState& l) {
+  os << "{\"level\":" << l.level << ",\"files\":" << l.files
+     << ",\"bytes\":" << l.bytes << ",\"score\":" << l.score
+     << ",\"target_bytes\":" << l.target_bytes
+     << ",\"next_level_files\":" << l.next_level_files
+     << ",\"next_level_bytes\":" << l.next_level_bytes
+     << ",\"next_level_score\":" << l.next_level_score
+     << ",\"next_level_target_bytes\":" << l.next_level_target_bytes
+     << ",\"overlap_bytes\":" << l.overlap_bytes
+     << ",\"bytes_in\":" << l.bytes_in
+     << ",\"bytes_read_out\":" << l.bytes_read_out
+     << ",\"bytes_written_out\":" << l.bytes_written_out
+     << ",\"compactions_from\":" << l.compactions_from
+     << ",\"compactions_scheduled\":" << l.compactions_scheduled
+     << ",\"default_needed\":" << (l.default_needed ? "true" : "false")
+     << ",\"is_last\":" << (l.is_last ? "true" : "false") << "}";
+}
+
+std::string FormatStateV2(const RLStateV2& s) {
   std::ostringstream os;
   os.precision(6);
   os << std::fixed;
-  os << "{\"l0_files\":" << s.l0_files
-     << ",\"l0_size_bytes\":" << s.l0_size_bytes
-     << ",\"l0_score\":" << s.l0_score
-     << ",\"l0_delay_trigger_count\":" << s.l0_delay_trigger_count
-     << ",\"l0_compaction_trigger\":" << s.l0_compaction_trigger
-     << ",\"l0_slowdown_trigger\":" << s.l0_slowdown_trigger
-     << ",\"l0_stop_trigger\":" << s.l0_stop_trigger
+  os << "{\"version\":2"
      << ",\"pending_compaction_bytes\":" << s.pending_compaction_bytes
      << ",\"flushed_bytes\":" << s.flushed_bytes
      << ",\"compaction_bytes_read\":" << s.compaction_bytes_read
      << ",\"compaction_bytes_written\":" << s.compaction_bytes_written
      << ",\"compactions_completed\":" << s.compactions_completed
-     << ",\"l0_compactions_completed\":" << s.l0_compactions_completed
-     << ",\"l0_compactions_scheduled\":" << s.l0_compactions_scheduled
      << ",\"stall_count\":" << s.stall_count
      << ",\"stop_count\":" << s.stop_count
-     << ",\"default_l0_compaction_needed\":"
-     << (s.default_l0_compaction_needed ? "true" : "false")
-     << ",\"done\":" << (s.done ? "true" : "false") << "}";
+     << ",\"l0_compaction_trigger\":" << s.l0_compaction_trigger
+     << ",\"l0_slowdown_trigger\":" << s.l0_slowdown_trigger
+     << ",\"l0_stop_trigger\":" << s.l0_stop_trigger
+     << ",\"l0_delay_trigger_count\":" << s.l0_delay_trigger_count
+     << ",\"done\":" << (s.done ? "true" : "false") << ",\"levels\":[";
+  for (size_t i = 0; i < s.levels.size(); ++i) {
+    if (i > 0) os << ",";
+    AppendLevelState(os, s.levels[i]);
+  }
+  os << "]}";
   return os.str();
 }
 
-// Naive JSON field extractor: finds "key":N and returns N as int.
-// Returns `fallback` if not found.
-int ParseIntField(const std::string& json, const char* key, int fallback) {
-  std::string needle = std::string("\"") + key + "\":";
+// Naive JSON array extractor: finds "key":[a,b,...] and returns the ints.
+// Returns an empty vector if the key is missing or the array is malformed.
+std::vector<int> ParseIntArrayField(const std::string& json, const char* key) {
+  std::vector<int> out;
+  std::string needle = std::string("\"") + key + "\":[";
   auto pos = json.find(needle);
-  if (pos == std::string::npos) return fallback;
+  if (pos == std::string::npos) return out;
   pos += needle.size();
-  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
-  if (pos >= json.size()) return fallback;
-  return std::atoi(json.c_str() + pos);
+  while (pos < json.size() && json[pos] != ']') {
+    while (pos < json.size() &&
+           (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ',')) {
+      ++pos;
+    }
+    if (pos >= json.size() || json[pos] == ']') break;
+    if (json[pos] != '-' && (json[pos] < '0' || json[pos] > '9')) {
+      return {};  // malformed
+    }
+    out.push_back(std::atoi(json.c_str() + pos));
+    while (pos < json.size() && json[pos] != ',' && json[pos] != ']') ++pos;
+  }
+  return out;
 }
 
 }  // namespace
@@ -221,31 +249,45 @@ std::string RLCompactionClient::RecvLine() {
 // Main entry point called by compaction picker
 // ---------------------------------------------------------------------------
 
-RLQueryResult RLCompactionClient::QueryAction(const RLState& state) {
+RLMultiQueryResult RLCompactionClient::QueryActions(const RLStateV2& state) {
+  RLMultiQueryResult result;
+  if (state.levels.empty()) {
+    return result;
+  }
+
   std::unique_lock<std::mutex> lock(mu_);
 
   // Lazy connect; retry if connection was lost.
   if (!IsConnected() && !Connect()) {
-    return {false, RLAction::kDoNothing};
+    return result;
   }
 
-  const std::string msg = FormatState(state);
+  const std::string msg = FormatStateV2(state);
   if (!SendLine(msg)) {
     Disconnect();
-    return {false, RLAction::kDoNothing};
+    return result;
   }
 
   const std::string response = RecvLine();
   if (response.empty()) {
     Disconnect();
-    return {false, RLAction::kDoNothing};
+    return result;
   }
 
-  int action = ParseIntField(response, "action",
-                             static_cast<int>(RLAction::kCompactNow));
-  if (action < 0 || action > 1)
-    action = static_cast<int>(RLAction::kCompactNow);
-  return {true, static_cast<RLAction>(action)};
+  std::vector<int> actions = ParseIntArrayField(response, "actions");
+  if (actions.size() != state.levels.size()) {
+    // Mis-sized or malformed response: treat as unavailable so the caller
+    // falls back to its local policy rather than misrouting actions.
+    return result;
+  }
+
+  result.actions.reserve(actions.size());
+  for (int a : actions) {
+    if (a < 0 || a > 1) a = static_cast<int>(RLAction::kDoNothing);
+    result.actions.push_back(static_cast<RLAction>(a));
+  }
+  result.ok = true;
+  return result;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
