@@ -67,6 +67,9 @@ class RLCompactionPicker : public LevelCompactionPicker {
 
   mutable bool rl_last_decision_{true};
   mutable bool rl_fallback_logged_{false};
+  // Counts consecutive fallbacks (server unavailable / bad response). Re-warned
+  // periodically so a permanently broken RL path can never fail silently.
+  mutable uint64_t rl_fallback_count_{0};
   // Per-level force flags set by kCompactNow answers, consumed by
   // PickCompaction. rl_force_score_ caches the level's score at decision
   // time for arbiter ordering and forced-pick bookkeeping.

@@ -145,6 +145,7 @@ bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
 
   if (!result.ok) {
     ClearForcePending();
+    ++rl_fallback_count_;
     if (stall_emergency || l0_score_emergency) {
       rl_force_pending_[0] = true;
       rl_force_score_[0] = l0_score;
@@ -152,16 +153,22 @@ bool RLCompactionPicker::QueryRL(const VersionStorageInfo* vstorage,
       return true;
     }
     rl_last_decision_ = LevelCompactionPicker::NeedsCompaction(vstorage);
-    if (!rl_fallback_logged_) {
+    // Warn on the first fallback and every 200th after: a permanently broken
+    // RL path (server down, unparseable/mis-sized response) must stay visible
+    // in the LOG rather than silently degrading to leveled behavior.
+    if (!rl_fallback_logged_ || rl_fallback_count_ % 200 == 0) {
       ROCKS_LOG_WARN(
           ioptions_.logger,
-          "RL compaction server unavailable or timed out; falling back to "
-          "normal leveled compaction thresholds.");
+          "RL compaction server unavailable, timed out, or returned an "
+          "unusable response; falling back to normal leveled thresholds "
+          "(fallback_count=%" PRIu64 ").",
+          rl_fallback_count_);
       rl_fallback_logged_ = true;
     }
     return rl_last_decision_;
   }
   rl_fallback_logged_ = false;
+  rl_fallback_count_ = 0;
 
   ClearForcePending();
   for (size_t i = 0; i < state.levels.size(); ++i) {

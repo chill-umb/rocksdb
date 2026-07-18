@@ -78,14 +78,26 @@ std::string FormatStateV2(const RLStateV2& s) {
   return os.str();
 }
 
-// Naive JSON array extractor: finds "key":[a,b,...] and returns the ints.
-// Returns an empty vector if the key is missing or the array is malformed.
+// Naive JSON array extractor: finds "key": [a, b, ...] and returns the ints.
+// Whitespace-tolerant around ':' and '[' — json.dumps and hand-rolled
+// serializers differ here, and an intolerant needle silently rejected every
+// response once (causing a permanent fallback to leveled). Returns an empty
+// vector if the key is missing or the array is malformed.
 std::vector<int> ParseIntArrayField(const std::string& json, const char* key) {
   std::vector<int> out;
-  std::string needle = std::string("\"") + key + "\":[";
-  auto pos = json.find(needle);
+  const std::string needle = std::string("\"") + key + "\"";
+  size_t pos = json.find(needle);
   if (pos == std::string::npos) return out;
   pos += needle.size();
+  auto skip_ws = [&json](size_t p) {
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
+    return p;
+  };
+  pos = skip_ws(pos);
+  if (pos >= json.size() || json[pos] != ':') return out;
+  pos = skip_ws(pos + 1);
+  if (pos >= json.size() || json[pos] != '[') return out;
+  ++pos;
   while (pos < json.size() && json[pos] != ']') {
     while (pos < json.size() &&
            (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ',')) {
