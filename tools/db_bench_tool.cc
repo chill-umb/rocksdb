@@ -40,6 +40,7 @@
 #include <unordered_map>
 
 #include "db/db_impl/db_impl.h"
+#include "db/compaction/rl_compaction_telemetry.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
 #include "monitoring/histogram.h"
@@ -5996,7 +5997,12 @@ class Benchmark {
       }
       if (!use_blob_db_) {
         // Not stacked BlobDB
+        const uint64_t rl_write_start = FLAGS_env->NowNanos();
         s = db_with_cfh->db->Write(write_options_, &batch);
+        RLCompactionTelemetry::Get().RecordForegroundOperation(
+            RLCompactionTelemetry::ForegroundOperation::kWrite,
+            FLAGS_env->NowNanos() - rl_write_start,
+            static_cast<uint64_t>(batch_bytes));
       }
       thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db,
                                 entries_per_batch_, kWrite);
@@ -7254,6 +7260,7 @@ class Benchmark {
       if (query_type == 0) {
         // the Get query
         gets++;
+        const uint64_t rl_get_start = FLAGS_env->NowNanos();
         if (FLAGS_num_column_families > 1) {
           s = db_with_cfh->db->Get(read_options_, db_with_cfh->GetCfh(key_rand),
                                    key, &pinnable_val);
@@ -7263,6 +7270,9 @@ class Benchmark {
                                    db_with_cfh->db->DefaultColumnFamily(), key,
                                    &pinnable_val);
         }
+        RLCompactionTelemetry::Get().RecordForegroundOperation(
+            RLCompactionTelemetry::ForegroundOperation::kGet,
+            FLAGS_env->NowNanos() - rl_get_start);
 
         if (s.ok()) {
           get_found++;
@@ -7289,9 +7299,14 @@ class Benchmark {
         }
         total_val_size += val_size;
 
-        s = db_with_cfh->db->Put(
-            write_options_, key,
-            gen.Generate(static_cast<unsigned int>(val_size)));
+        const Slice generated_value =
+            gen.Generate(static_cast<unsigned int>(val_size));
+        const uint64_t rl_write_start = FLAGS_env->NowNanos();
+        s = db_with_cfh->db->Put(write_options_, key, generated_value);
+        RLCompactionTelemetry::Get().RecordForegroundOperation(
+            RLCompactionTelemetry::ForegroundOperation::kWrite,
+            FLAGS_env->NowNanos() - rl_write_start,
+            static_cast<uint64_t>(key.size() + generated_value.size()));
         if (!s.ok()) {
           fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           ErrorExit();
@@ -7305,6 +7320,12 @@ class Benchmark {
       } else if (query_type == 2) {
         // Seek query
         if (db_with_cfh->db != nullptr) {
+          const uint64_t skips_before =
+              dbstats == nullptr ? 0 : dbstats->getTickerCount(NUMBER_ITER_SKIP);
+          const uint64_t seeks_before =
+              dbstats == nullptr ? 0 : dbstats->getTickerCount(SORTED_RUN_SEEK);
+          const uint64_t rl_scan_start = FLAGS_env->NowNanos();
+          uint64_t returned_entries = 0;
           Iterator* single_iter = nullptr;
           single_iter = db_with_cfh->db->NewIterator(read_options_);
           if (single_iter != nullptr) {
@@ -7325,9 +7346,20 @@ class Benchmark {
               single_iter->Next();
               assert(single_iter->status().ok());
               total_scan_length++;
+              returned_entries++;
             }
           }
           delete single_iter;
+          const uint64_t skips_after =
+              dbstats == nullptr ? 0 : dbstats->getTickerCount(NUMBER_ITER_SKIP);
+          const uint64_t seeks_after =
+              dbstats == nullptr ? 0 : dbstats->getTickerCount(SORTED_RUN_SEEK);
+          RLCompactionTelemetry::Get().RecordForegroundOperation(
+              RLCompactionTelemetry::ForegroundOperation::kScan,
+              FLAGS_env->NowNanos() - rl_scan_start,
+              /*logical_write_bytes=*/0, returned_entries,
+              skips_after >= skips_before ? skips_after - skips_before : 0,
+              seeks_after >= seeks_before ? seeks_after - seeks_before : 0);
         }
         thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kSeek);
       }
@@ -7335,10 +7367,12 @@ class Benchmark {
     char msg[256];
     snprintf(msg, sizeof(msg),
              "( Gets:%" PRIu64 " Puts:%" PRIu64 " Seek:%" PRIu64
+             " ScanEntries:%" PRIu64
              ", reads %" PRIu64 " in %" PRIu64
              " found, "
              "avg size: %.1f value, %.1f scan)\n",
-             gets, puts, seek, get_found + seek_found, gets + seek,
+             gets, puts, seek, static_cast<uint64_t>(total_scan_length),
+             get_found + seek_found, gets + seek,
              total_val_size / puts, total_scan_length / seek);
 
     thread->stats.AddBytes(bytes);
@@ -8879,13 +8913,19 @@ class Benchmark {
     fprintf(stdout, "waitforcompaction(%s): started\n",
             db.db->GetName().c_str());
 
-    Status s = db.db->WaitForCompact(WaitForCompactOptions());
+    WaitForCompactOptions options;
+    options.flush = true;
+    Status s = db.db->WaitForCompact(options);
 
     fprintf(stdout, "waitforcompaction(%s): finished with status (%s)\n",
             db.db->GetName().c_str(), s.ToString().c_str());
   }
 
   void WaitForCompaction() {
+    // An RL policy can have valid deferrals with no job currently scheduled.
+    // Enter the same explicit drain mode as db_runner before waiting so a low
+    // WAF cannot be manufactured by leaving compaction debt unpaid at exit.
+    SetRLDrainMode(true);
     // Give background threads a chance to wake
     FLAGS_env->SleepForMicroseconds(5 * 1000000);
 
@@ -8896,6 +8936,7 @@ class Benchmark {
         WaitForCompactionHelper(db_with_cfh);
       }
     }
+    SetRLDrainMode(false);
   }
 
   bool CompactLevelHelper(DBWithColumnFamilies& db_with_cfh, int from_level) {

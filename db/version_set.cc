@@ -2773,6 +2773,10 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         GetPerfLevel() >= PerfLevel::kEnableTimeExceptForMutex &&
         get_perf_context()->per_level_perf_context_enabled;
     StopWatchNano timer(clock_, timer_enabled /* auto_start */);
+    // FilePicker selected this SST, so it is a logical probe even when the
+    // subsequent table lookup is rejected by a Bloom filter or served from a
+    // cache. Physical file-read counters are retained separately.
+    RecordTick(db_statistics_, POINT_SST_PROBE);
     *status = table_cache_->Get(
         read_options, *internal_comparator(), *f->file_metadata, ikey,
         &get_context, mutable_cf_options_,

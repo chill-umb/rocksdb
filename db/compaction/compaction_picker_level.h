@@ -12,6 +12,31 @@
 #include "db/compaction/compaction_picker.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// Non-mutating description of the compaction RocksDB would construct when a
+// particular source SST is selected. Policy wrappers use this so preview and
+// actuation share clean-cut expansion and conflict checks.
+struct LevelCompactionCandidate {
+  int source_level = 0;
+  int output_level = 0;
+  uint64_t source_file_number = 0;
+  uint64_t source_bytes = 0;
+  uint64_t expanded_source_bytes = 0;
+  uint64_t overlap_bytes = 0;
+  uint64_t estimated_read_bytes = 0;
+  uint64_t estimated_write_bytes = 0;
+  uint64_t num_entries = 0;
+  uint64_t num_deletions = 0;
+  uint64_t compensated_size = 0;
+  double projected_source_fullness = 0.0;
+  double projected_output_fullness = 0.0;
+  bool empties_source_level = false;
+  bool conflict = false;
+  int priority_rank = 0;
+  std::vector<uint64_t> expanded_source_files;
+  std::vector<uint64_t> overlap_files;
+};
+
 // Picking compactions for leveled compaction. See wiki page
 // https://github.com/facebook/rocksdb/wiki/Leveled-Compaction
 // for description of Leveled compaction.
@@ -42,6 +67,19 @@ class LevelCompactionPicker : public CompactionPicker {
       LogBuffer* log_buffer, const std::string& full_history_ts_low,
       int forced_start_level, double forced_start_level_score,
       CompactionReason compaction_reason);
+
+  Compaction* PickCompactionFromFile(
+      const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+      const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+      LogBuffer* log_buffer, const std::string& full_history_ts_low,
+      int forced_start_level, uint64_t source_file_number,
+      double forced_start_level_score, CompactionReason compaction_reason);
+
+  std::vector<LevelCompactionCandidate> PreviewCompactionCandidates(
+      const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+      const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+      LogBuffer* log_buffer, const std::string& full_history_ts_low, int level,
+      size_t limit);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

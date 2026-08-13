@@ -1,9 +1,12 @@
 #pragma once
 
-#include <array>
-#include <chrono>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/rl_compaction_client.h"
@@ -11,43 +14,18 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// RLCompactionPicker — a leveled compaction picker whose per-level compaction
-// triggers are governed by online DQN agents (one per level) running in a
-// separate Python process.
-//
-// Every decision cadence the picker assembles one state entry per candidate
-// level (own level + next-level observables, including the bytes in level+1
-// overlapping this level's key range) and sends them in a single batched
-// request; the server returns one action per level. Levels whose agent
-// answers kCompactNow are marked force-pending; PickCompaction resolves
-// contention by compacting the pending level with the highest RocksDB score
-// first (stall-risk proxy), leaving the rest pending for subsequent picks.
-//
-// Non-score triggers (TTL, periodic compaction, marked files, blob GC) are
-// preserved unchanged via the parent picker.
-//
-// Emergency safeguards override the RL agents and force an L0 compaction
-// when:
-//   • L0 file count reaches the live level0_stop_writes_trigger, OR
-//   • estimated pending compaction bytes reaches kPcbHardCap, OR
-//   • a write-stop was observed in the telemetry window.
-//
-// If the RL server is unreachable the picker transparently falls back to the
-// standard level-based thresholds so the database stays operational.
+// Candidate-aware leveled picker. The socket worker can authorize at most one
+// exact SST per actuation. Every authorization is a versioned, single-use
+// lease; stale or blocked candidates fail closed and are reported to the next
+// observation rather than being replaced by a different file or level.
 class RLCompactionPicker : public LevelCompactionPicker {
  public:
   RLCompactionPicker(const ImmutableOptions& ioptions,
-                     const InternalKeyComparator* icmp)
-      : LevelCompactionPicker(ioptions, icmp) {}
+                     const InternalKeyComparator* icmp);
+  ~RLCompactionPicker() override;
 
-  // Overrides LevelCompactionPicker::NeedsCompaction.
-  // Non-score triggers delegate to the parent. Score-based decisions for
-  // levels 0..MaxInputLevel are routed to the per-level RL agents (with
-  // safeguard overrides).
   bool NeedsCompaction(const VersionStorageInfo* vstorage) const override;
 
-  // Overrides PickCompaction to serve RL force-pending levels (highest score
-  // first) before delegating to the parent.
   Compaction* PickCompaction(
       const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
       const MutableDBOptions& mutable_db_options,
@@ -57,53 +35,121 @@ class RLCompactionPicker : public LevelCompactionPicker {
       bool require_max_output_level = false) override;
 
  private:
+  friend class RLCompactionPickerTestPeer;
+
   static constexpr int kMaxRLLevels = kRLTelemetryMaxLevels;
+  static constexpr size_t kMaxCandidatesPerLevel = 8;
+  static constexpr uint64_t kPcbHardCap = 10ULL * 1024 * 1024 * 1024;
 
-  // -----------------------------------------------------------------------
-  // Per-instance RL tracking state.
-  // All fields are mutable because NeedsCompaction is const.
-  // -----------------------------------------------------------------------
-  mutable std::mutex rl_mu_;
+  enum class ActionReason : int {
+    kPolicy = 0,
+    kBudget = 1,
+    kMaintenance = 2,
+    kEmergency = 3,
+    kFallback = 4,
+    kDrain = 5,
+  };
 
-  mutable bool rl_last_decision_{true};
-  mutable bool rl_fallback_logged_{false};
-  // Counts consecutive fallbacks (server unavailable / bad response). Re-warned
-  // periodically so a permanently broken RL path can never fail silently.
-  mutable uint64_t rl_fallback_count_{0};
-  // Per-level force flags set by kCompactNow answers, consumed by
-  // PickCompaction. rl_force_score_ caches the level's score at decision
-  // time for arbiter ordering and forced-pick bookkeeping.
-  mutable std::array<bool, kMaxRLLevels> rl_force_pending_{};
-  mutable std::array<double, kMaxRLLevels> rl_force_score_{};
-  mutable int rl_l0_trigger_{4};  // refreshed by PickCompaction
-  mutable int rl_l0_slowdown_trigger_{20};
-  mutable int rl_l0_stop_trigger_{36};
-  mutable std::chrono::steady_clock::time_point rl_last_query_time_{};
+  struct ActionLease {
+    bool active = false;
+    uint64_t decision_id = 0;
+    uint64_t snapshot_epoch = 0;
+    uint64_t candidate_file_number = 0;
+    int level = -1;
+    double score = 0.0;
+    ActionReason reason = ActionReason::kPolicy;
+  };
 
-  // Rate-limit: minimum wall-clock gap between successive RL server queries.
-  static constexpr std::chrono::milliseconds kMinQueryInterval{50};
+  int decision_interval_ms_;
+  int observe_interval_ms_;
+  int max_defer_steps_;
+  int max_defer_steps_l0_;
+  bool allow_defer_;
+  int protocol_version_;
 
-  // -----------------------------------------------------------------------
-  // Emergency safeguard threshold for pending compaction bytes.
-  // L0 file-count safety uses the live level0_stop_writes_trigger.
-  // -----------------------------------------------------------------------
-  static constexpr uint64_t kPcbHardCap = 10ULL * 1024 * 1024 * 1024;  // 10 GB
+  int MaxDeferSteps(int level) const {
+    return level == 0 ? max_defer_steps_l0_ : max_defer_steps_;
+  }
 
-  // Batch-query the RL server for all candidate levels; updates
-  // rl_force_pending_/rl_force_score_ and returns whether any compaction is
-  // wanted. Caller must hold rl_mu_.
-  bool QueryRL(const VersionStorageInfo* vstorage, uint64_t pcb) const;
+  // Snapshot handoff. Structural preview is built while DBImpl holds its
+  // mutex; network I/O and learning remain on worker_.
+  mutable std::mutex snap_mu_;
+  mutable std::condition_variable snap_cv_;
+  mutable RLStateV2 pending_snapshot_;
+  mutable bool snapshot_valid_{false};
+  mutable std::vector<int> last_sent_levels_;
+  mutable std::atomic<uint64_t> last_publish_micros_{0};
+  std::thread worker_;
+  std::atomic<bool> worker_stop_{false};
 
-  // RocksDB's compaction score for `level` (0.0 when absent).
+  // The options required by RocksDB's real candidate builder become available
+  // on the first PickCompaction call. They are subsequently refreshed on every
+  // call (all accesses occur under DBImpl's mutex).
+  mutable MutableCFOptions cached_cf_options_;
+  mutable MutableDBOptions cached_db_options_;
+  mutable std::string cached_cf_name_;
+  mutable std::string cached_history_ts_low_;
+  mutable bool picker_options_valid_{false};
+
+  // Per-level leases and outcome attribution cross the worker/DB threads.
+  mutable std::mutex lease_mu_;
+  mutable ActionLease leases_[kMaxRLLevels];
+  mutable std::atomic<int> defer_count_[kMaxRLLevels] = {};
+  mutable std::atomic<int> last_effective_action_[kMaxRLLevels] = {};
+  mutable std::atomic<bool> last_action_overridden_[kMaxRLLevels] = {};
+  mutable std::atomic<bool> compaction_picked_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> last_decision_id_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> last_snapshot_epoch_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> last_candidate_file_[kMaxRLLevels] = {};
+  mutable std::atomic<int> last_scheduling_result_[kMaxRLLevels] = {};
+  mutable std::atomic<int> last_override_reason_[kMaxRLLevels] = {};
+  mutable std::atomic<bool> last_transition_valid_[kMaxRLLevels] = {};
+
+  mutable std::atomic<bool> rl_available_{false};
+  // Only maintenance and drain use the ordinary parent picker. The reason is
+  // consumed by PickCompaction and stamped on the resulting Compaction.
+  mutable std::atomic<int> parent_bypass_reason_{-1};
+  std::atomic<int> rl_l0_trigger_{4};
+  std::atomic<int> rl_l0_slowdown_trigger_{20};
+  std::atomic<int> rl_l0_stop_trigger_{36};
+
+  mutable std::atomic<uint64_t> rl_fallback_count_{0};
+  mutable std::atomic<uint64_t> rl_query_count_{0};
+  mutable std::atomic<uint64_t> rl_actuation_count_{0};
+  mutable std::atomic<uint64_t> rl_skipped_ticks_{0};
+  mutable std::atomic<uint64_t> rl_bypass_count_{0};
+  mutable std::atomic<bool> rl_fallback_logged_{false};
+  mutable std::atomic<uint64_t> rl_nc_calls_{0};
+  mutable std::atomic<uint64_t> rl_nc_nanos_{0};
+  mutable std::atomic<uint64_t> rl_publish_calls_{0};
+  mutable std::atomic<uint64_t> rl_publish_nanos_{0};
+
+  static constexpr int kNumReadTickers = 9;
+  uint64_t prev_read_tickers_[kNumReadTickers] = {};
+  static constexpr uint64_t kDiagnosticsEveryQueries = 200;
+
+  void WorkerLoop();
+  void RunDecisionCycle(RLStateV2& state, bool actuate);
+  void PopulateReadStats(RLStateV2& state);
+  void LogDiagnostics(bool final) const;
+  void SendDoneMessage();
+
+  void BuildSnapshot(const VersionStorageInfo* vstorage, uint64_t pcb,
+                     RLStateV2* state) const;
+  void PublishSnapshot(const VersionStorageInfo* vstorage, uint64_t pcb) const;
+  uint64_t SnapshotEpoch(const VersionStorageInfo* vstorage) const;
   double LevelScore(const VersionStorageInfo* vstorage, int level) const;
-
-  // Bytes in level+1 whose key range overlaps level's span. 0 for an empty
-  // level or the last level.
   uint64_t NextLevelOverlapBytes(const VersionStorageInfo* vstorage,
                                  int level) const;
 
-  bool AnyForcePending() const;  // caller must hold rl_mu_
-  void ClearForcePending() const;  // caller must hold rl_mu_
+  bool HasActiveLease() const;
+  void ExpireLeasesAtActuation() const;
+  void InstallLease(const ActionLease& lease) const;
+  bool TakeLease(ActionLease* lease) const;
+  int HighestDueLevel(const VersionStorageInfo* vstorage) const;
+  uint64_t FirstValidCandidate(const RLLevelState& level) const;
+  void InstallLocalLease(const VersionStorageInfo* vstorage, int level,
+                         ActionReason reason) const;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -296,6 +296,8 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {PREFETCH_MEMORY_BYTES_RELEASED, "rocksdb.prefetch.memory.bytes.released"},
     {PREFETCH_MEMORY_REQUESTS_BLOCKED,
      "rocksdb.prefetch.memory.requests.blocked"},
+    {POINT_SST_PROBE, "rocksdb.point.sst.probe"},
+    {SORTED_RUN_SEEK, "rocksdb.sorted.run.seek"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

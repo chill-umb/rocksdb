@@ -583,6 +583,12 @@ enum Tickers : uint32_t {
   // # of prefetch requests that were blocked waiting for memory
   PREFETCH_MEMORY_REQUESTS_BLOCKED,
 
+  // Logical amplification counters for workload evaluation. Unlike physical
+  // read counters these intentionally include work satisfied by filters or
+  // caches.
+  POINT_SST_PROBE,
+  SORTED_RUN_SEEK,
+
   TICKER_ENUM_MAX
 };
 

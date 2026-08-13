@@ -1852,11 +1852,12 @@ void DBImpl::NotifyOnCompactionCompleted(
     return;
   }
 
-  if (cfd->ioptions().compaction_style == kCompactionStyleRL && st.ok()) {
+  if (cfd->ioptions().compaction_style == kCompactionStyleRL) {
     RLCompactionTelemetry::Get().RecordCompactionCompleted(
         c->start_level(), c->output_level(),
         compaction_job_stats.total_input_bytes,
-        compaction_job_stats.total_output_bytes);
+        compaction_job_stats.total_output_bytes, c->rl_decision_id(),
+        c->rl_candidate_file_number(), st.ok());
   }
 
   if (immutable_db_options_.listeners.size() == 0U) {

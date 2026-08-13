@@ -35,6 +35,9 @@ void BlockBasedTableIterator::SeekSecondPass(const Slice* target) {
 
 void BlockBasedTableIterator::SeekImpl(const Slice* target,
                                        bool async_prefetch) {
+  if (lookup_context_.caller != TableReaderCaller::kCompaction) {
+    RecordTick(table_->GetStatistics(), SORTED_RUN_SEEK);
+  }
   // TODO(hx235): set `seek_key_prefix_for_readahead_trimming_`
   // even when `target == nullptr` that is when `SeekToFirst()` is called
   if (!multi_scan_status_.ok()) {
@@ -205,6 +208,9 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
 }
 
 void BlockBasedTableIterator::SeekForPrev(const Slice& target) {
+  if (lookup_context_.caller != TableReaderCaller::kCompaction) {
+    RecordTick(table_->GetStatistics(), SORTED_RUN_SEEK);
+  }
   ResetMultiScan();
   direction_ = IterDirection::kBackward;
   ResetBlockCacheLookupVar();
