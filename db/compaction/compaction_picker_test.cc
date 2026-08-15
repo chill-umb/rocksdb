@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#include <algorithm>
 #include <limits>
 #include <string>
 #include <utility>
@@ -297,15 +296,6 @@ class CompactionPickerTest : public CompactionPickerTestBase {
   }
 };
 
-class CandidatePreviewPicker : public LevelCompactionPicker {
- public:
-  CandidatePreviewPicker(const ImmutableOptions& options,
-                         const InternalKeyComparator* comparator)
-      : LevelCompactionPicker(options, comparator) {}
-  using LevelCompactionPicker::PickCompactionFromFile;
-  using LevelCompactionPicker::PreviewCompactionCandidates;
-};
-
 class RLCompactionPickerTestPeer {
  public:
   static void StopWorker(RLCompactionPicker* picker) {
@@ -331,13 +321,12 @@ class RLCompactionPickerTestPeer {
   }
 
   static void InstallPolicyLease(RLCompactionPicker* picker, int level,
-                                 uint64_t epoch, uint64_t file_number,
-                                 double score, uint64_t decision_id) {
+                                 uint64_t epoch, double score,
+                                 uint64_t decision_id) {
     RLCompactionPicker::ActionLease lease;
     lease.active = true;
     lease.decision_id = decision_id;
     lease.snapshot_epoch = epoch;
-    lease.candidate_file_number = file_number;
     lease.level = level;
     lease.score = score;
     lease.reason = RLCompactionPicker::ActionReason::kPolicy;
@@ -345,72 +334,48 @@ class RLCompactionPickerTestPeer {
   }
 };
 
-TEST_F(CompactionPickerTest, CandidatePreviewMatchesExactFilePick) {
+TEST_F(CompactionPickerTest, RLTriggerUsesRocksDBNativeFilePriority) {
   NewVersionStorage(4, kCompactionStyleLevel);
   mutable_cf_options_.max_bytes_for_level_base = 100;
   mutable_cf_options_.max_compaction_bytes = 10000;
   Add(1, 11U, "a", "c", 100);
-  // Same user-key boundary forces RocksDB's real clean-cut expansion.
-  Add(1, 12U, "c", "f", 120);
+  Add(1, 12U, "d", "f", 120);
   Add(2, 21U, "b", "d", 300);
   Add(2, 22U, "e", "g", 400);
   UpdateVersionStorageInfo();
 
-  CandidatePreviewPicker picker(ioptions_, &icmp_);
-  auto previews = picker.PreviewCompactionCandidates(
-      cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
-      &log_buffer_, "", /*level=*/1, /*limit=*/8);
-  auto preview = std::find_if(
-      previews.begin(), previews.end(),
-      [](const LevelCompactionCandidate& item) {
-        return item.source_file_number == 11;
-      });
-  ASSERT_NE(preview, previews.end());
-  ASSERT_FALSE(preview->conflict);
+  const auto& native_order = vstorage_->FilesByCompactionPri(1);
+  const unsigned int native_cursor = vstorage_->NextCompactionIndex(1);
+  ASSERT_LT(native_cursor, native_order.size());
+  const int native_index = native_order[native_cursor];
+  const uint64_t native_file =
+      vstorage_->LevelFiles(1)[native_index]->fd.GetNumber();
 
-  std::unique_ptr<Compaction> compaction(picker.PickCompactionFromFile(
-      cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
-      &log_buffer_, "", /*forced_start_level=*/1,
-      /*source_file_number=*/11, /*score=*/1.0,
-      CompactionReason::kLevelMaxLevelSize));
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+  const uint64_t epoch =
+      RLCompactionPickerTestPeer::SnapshotEpoch(picker, vstorage_.get());
+  RLCompactionPickerTestPeer::InstallPolicyLease(
+      &picker, /*level=*/1, epoch, /*score=*/2.0, /*decision_id=*/70);
+
+  std::unique_ptr<Compaction> compaction(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
   ASSERT_NE(compaction, nullptr);
-  std::vector<uint64_t> actual_source;
-  std::vector<uint64_t> actual_overlap;
+  ASSERT_EQ(compaction->start_level(), 1);
+  bool contains_native_file = false;
   for (size_t i = 0; i < compaction->num_input_files(0); ++i) {
-    actual_source.push_back(compaction->input(0, i)->fd.GetNumber());
+    contains_native_file |=
+        compaction->input(0, i)->fd.GetNumber() == native_file;
   }
-  if (compaction->num_input_levels() > 1) {
-    for (size_t i = 0; i < compaction->num_input_files(1); ++i) {
-      actual_overlap.push_back(compaction->input(1, i)->fd.GetNumber());
-    }
-  }
-  ASSERT_EQ(actual_source, preview->expanded_source_files);
-  ASSERT_EQ(actual_overlap, preview->overlap_files);
-  ASSERT_EQ(TotalFileSize(*compaction->inputs(0)),
-            preview->expanded_source_bytes);
-  if (compaction->num_input_levels() > 1) {
-    ASSERT_EQ(TotalFileSize(*compaction->inputs(1)), preview->overlap_bytes);
-  }
+  // RocksDB may expand around the priority-selected file, so it need not be
+  // first after the final source inputs are sorted by key.
+  ASSERT_TRUE(contains_native_file);
+  ASSERT_EQ(compaction->rl_decision_id(), 70U);
   picker.UnregisterCompaction(compaction.get());
 }
 
-TEST_F(CompactionPickerTest, ExactFilePickNeverRetargetsStaleCandidate) {
-  NewVersionStorage(4, kCompactionStyleLevel);
-  Add(1, 11U, "a", "c", 100);
-  Add(1, 12U, "d", "f", 120);
-  UpdateVersionStorageInfo();
-  CandidatePreviewPicker picker(ioptions_, &icmp_);
-  std::unique_ptr<Compaction> stale(picker.PickCompactionFromFile(
-      cf_name_, mutable_cf_options_, mutable_db_options_, vstorage_.get(),
-      &log_buffer_, "", 1, /*missing file=*/999, 1.0,
-      CompactionReason::kLevelMaxLevelSize));
-  ASSERT_EQ(stale, nullptr);
-  ASSERT_FALSE(file_map_[11].first->being_compacted);
-  ASSERT_FALSE(file_map_[12].first->being_compacted);
-}
-
-TEST_F(CompactionPickerTest,
-       RLCrossLevelLeaseFailureDoesNotAuthorizeAnotherLevel) {
+TEST_F(CompactionPickerTest, RLLevelTriggerDoesNotAuthorizeAnotherLevel) {
   NewVersionStorage(4, kCompactionStyleLevel);
   mutable_cf_options_.max_bytes_for_level_base = 100;
   mutable_cf_options_.max_bytes_for_level_multiplier = 10;
@@ -423,21 +388,22 @@ TEST_F(CompactionPickerTest,
   const uint64_t epoch =
       RLCompactionPickerTestPeer::SnapshotEpoch(picker, vstorage_.get());
   RLCompactionPickerTestPeer::InstallPolicyLease(
-      &picker, /*level=*/1, epoch, /*missing file=*/999, /*score=*/2.0,
-      /*decision_id=*/71);
+      &picker, /*level=*/1, epoch, /*score=*/2.0, /*decision_id=*/71);
 
   std::unique_ptr<Compaction> first(picker.PickCompaction(
       cf_name_, mutable_cf_options_, mutable_db_options_,
-      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
-      vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
-  ASSERT_EQ(first, nullptr);
-  ASSERT_FALSE(file_map_[11].first->being_compacted);
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->start_level(), 1);
+  ASSERT_TRUE(file_map_[11].first->being_compacted);
   ASSERT_FALSE(file_map_[21].first->being_compacted);
+  picker.UnregisterCompaction(first.get());
 
   std::unique_ptr<Compaction> second(picker.PickCompaction(
       cf_name_, mutable_cf_options_, mutable_db_options_,
-      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
-      vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
   ASSERT_EQ(second, nullptr);
 }
 
@@ -457,15 +423,15 @@ TEST_F(CompactionPickerTest, RLExhaustedLevelUsesItsOwnForcedPath) {
 
   std::unique_ptr<Compaction> compaction(picker.PickCompaction(
       cf_name_, mutable_cf_options_, mutable_db_options_,
-      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr,
-      vstorage_.get(), &log_buffer_, /*full_history_ts_low=*/""));
+      /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
+      &log_buffer_, /*full_history_ts_low=*/""));
   ASSERT_NE(compaction, nullptr);
   ASSERT_EQ(compaction->start_level(), 1);
   ASSERT_EQ(compaction->rl_override_reason(), 1);
   picker.UnregisterCompaction(compaction.get());
 }
 
-TEST_F(CompactionPickerTest, RLStaleEpochFailsClosedAndExpiresLease) {
+TEST_F(CompactionPickerTest, RLLevelTriggerUsesCurrentRocksDBState) {
   NewVersionStorage(4, kCompactionStyleLevel);
   Add(1, 11U, "a", "c", 200);
   UpdateVersionStorageInfo();
@@ -475,17 +441,18 @@ TEST_F(CompactionPickerTest, RLStaleEpochFailsClosedAndExpiresLease) {
   const uint64_t epoch =
       RLCompactionPickerTestPeer::SnapshotEpoch(picker, vstorage_.get());
   RLCompactionPickerTestPeer::InstallPolicyLease(
-      &picker, /*level=*/1, epoch + 1, /*file_number=*/11, /*score=*/2.0,
-      /*decision_id=*/72);
+      &picker, /*level=*/1, epoch + 1, /*score=*/2.0, /*decision_id=*/72);
 
-  std::unique_ptr<Compaction> first(picker.PickCompaction(
-      cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
-      vstorage_.get(), &log_buffer_, ""));
-  ASSERT_EQ(first, nullptr);
-  ASSERT_FALSE(file_map_[11].first->being_compacted);
-  std::unique_ptr<Compaction> second(picker.PickCompaction(
-      cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
-      vstorage_.get(), &log_buffer_, ""));
+  std::unique_ptr<Compaction> first(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->start_level(), 1);
+  ASSERT_EQ(first->input(0, 0)->fd.GetNumber(), 11U);
+  picker.UnregisterCompaction(first.get());
+  std::unique_ptr<Compaction> second(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
   ASSERT_EQ(second, nullptr);
 }
 
@@ -502,9 +469,9 @@ TEST_F(CompactionPickerTest, RLMaintenanceBypassIsExplicitlyAttributed) {
   RLCompactionPicker picker(ioptions_, &icmp_);
   RLCompactionPickerTestPeer::StopWorker(&picker);
   ASSERT_TRUE(picker.NeedsCompaction(vstorage_.get()));
-  std::unique_ptr<Compaction> compaction(picker.PickCompaction(
-      cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
-      vstorage_.get(), &log_buffer_, ""));
+  std::unique_ptr<Compaction> compaction(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
   ASSERT_NE(compaction, nullptr);
   ASSERT_EQ(compaction->compaction_reason(),
             CompactionReason::kFilesMarkedForCompaction);
@@ -524,9 +491,9 @@ TEST_F(CompactionPickerTest, RLUnavailableServerFallbackIsLevelScoped) {
   RLCompactionPickerTestPeer::StopWorker(&picker);
   RLCompactionPickerTestPeer::SetAvailable(&picker, false);
   ASSERT_TRUE(picker.NeedsCompaction(vstorage_.get()));
-  std::unique_ptr<Compaction> compaction(picker.PickCompaction(
-      cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
-      vstorage_.get(), &log_buffer_, ""));
+  std::unique_ptr<Compaction> compaction(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
   ASSERT_NE(compaction, nullptr);
   ASSERT_EQ(compaction->start_level(), 2);
   ASSERT_EQ(compaction->rl_override_reason(), 4);
@@ -543,20 +510,18 @@ TEST_F(CompactionPickerTest, RLPolicyLeaseActuatesExactlyOnce) {
   const uint64_t epoch =
       RLCompactionPickerTestPeer::SnapshotEpoch(picker, vstorage_.get());
   RLCompactionPickerTestPeer::InstallPolicyLease(
-      &picker, /*level=*/1, epoch, /*file_number=*/11, /*score=*/2.0,
-      /*decision_id=*/73);
+      &picker, /*level=*/1, epoch, /*score=*/2.0, /*decision_id=*/73);
 
-  std::unique_ptr<Compaction> first(picker.PickCompaction(
-      cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
-      vstorage_.get(), &log_buffer_, ""));
+  std::unique_ptr<Compaction> first(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
   ASSERT_NE(first, nullptr);
   ASSERT_EQ(first->rl_decision_id(), 73U);
-  ASSERT_EQ(first->rl_candidate_file_number(), 11U);
   picker.UnregisterCompaction(first.get());
 
-  std::unique_ptr<Compaction> second(picker.PickCompaction(
-      cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
-      vstorage_.get(), &log_buffer_, ""));
+  std::unique_ptr<Compaction> second(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
   ASSERT_EQ(second, nullptr);
 }
 

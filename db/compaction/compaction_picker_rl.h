@@ -14,10 +14,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// Candidate-aware leveled picker. The socket worker can authorize at most one
-// exact SST per actuation. Every authorization is a versioned, single-use
-// lease; stale or blocked candidates fail closed and are reported to the next
-// observation rather than being replaced by a different file or level.
+// Trigger-only leveled picker. The socket worker can authorize at most one
+// source level per actuation. RocksDB's native leveled picker retains sole
+// authority over which SSTs that level's compaction consumes.
 class RLCompactionPicker : public LevelCompactionPicker {
  public:
   RLCompactionPicker(const ImmutableOptions& ioptions,
@@ -38,7 +37,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
   friend class RLCompactionPickerTestPeer;
 
   static constexpr int kMaxRLLevels = kRLTelemetryMaxLevels;
-  static constexpr size_t kMaxCandidatesPerLevel = 8;
   static constexpr uint64_t kPcbHardCap = 10ULL * 1024 * 1024 * 1024;
 
   enum class ActionReason : int {
@@ -54,7 +52,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
     bool active = false;
     uint64_t decision_id = 0;
     uint64_t snapshot_epoch = 0;
-    uint64_t candidate_file_number = 0;
     int level = -1;
     double score = 0.0;
     ActionReason reason = ActionReason::kPolicy;
@@ -65,7 +62,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
   int max_defer_steps_;
   int max_defer_steps_l0_;
   bool allow_defer_;
-  int protocol_version_;
 
   int MaxDeferSteps(int level) const {
     return level == 0 ? max_defer_steps_l0_ : max_defer_steps_;
@@ -82,15 +78,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
   std::thread worker_;
   std::atomic<bool> worker_stop_{false};
 
-  // The options required by RocksDB's real candidate builder become available
-  // on the first PickCompaction call. They are subsequently refreshed on every
-  // call (all accesses occur under DBImpl's mutex).
-  mutable MutableCFOptions cached_cf_options_;
-  mutable MutableDBOptions cached_db_options_;
-  mutable std::string cached_cf_name_;
-  mutable std::string cached_history_ts_low_;
-  mutable bool picker_options_valid_{false};
-
   // Per-level leases and outcome attribution cross the worker/DB threads.
   mutable std::mutex lease_mu_;
   mutable ActionLease leases_[kMaxRLLevels];
@@ -100,7 +87,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<bool> compaction_picked_[kMaxRLLevels] = {};
   mutable std::atomic<uint64_t> last_decision_id_[kMaxRLLevels] = {};
   mutable std::atomic<uint64_t> last_snapshot_epoch_[kMaxRLLevels] = {};
-  mutable std::atomic<uint64_t> last_candidate_file_[kMaxRLLevels] = {};
   mutable std::atomic<int> last_scheduling_result_[kMaxRLLevels] = {};
   mutable std::atomic<int> last_override_reason_[kMaxRLLevels] = {};
   mutable std::atomic<bool> last_transition_valid_[kMaxRLLevels] = {};
@@ -147,7 +133,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
   void InstallLease(const ActionLease& lease) const;
   bool TakeLease(ActionLease* lease) const;
   int HighestDueLevel(const VersionStorageInfo* vstorage) const;
-  uint64_t FirstValidCandidate(const RLLevelState& level) const;
   void InstallLocalLease(const VersionStorageInfo* vstorage, int level,
                          ActionReason reason) const;
 };

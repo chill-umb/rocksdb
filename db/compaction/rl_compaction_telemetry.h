@@ -63,7 +63,6 @@ struct RLCompactionTelemetrySnapshot {
   // to the agent as an effect of its own action.
   uint64_t compactions_forced_from_level[kRLTelemetryMaxLevels] = {};
   uint64_t last_completed_decision_id[kRLTelemetryMaxLevels] = {};
-  uint64_t last_completed_candidate_file[kRLTelemetryMaxLevels] = {};
   int last_completion_result[kRLTelemetryMaxLevels] = {};
 };
 
@@ -81,7 +80,6 @@ class RLCompactionTelemetry {
   void RecordCompactionCompleted(int base_input_level, int output_level,
                                  uint64_t bytes_read, uint64_t bytes_written,
                                  uint64_t decision_id = 0,
-                                 uint64_t candidate_file_number = 0,
                                  bool successful = true);
   void RecordWriteStall(WriteStallCondition condition);
   void RecordForegroundOperation(ForegroundOperation operation,
@@ -133,8 +131,6 @@ class RLCompactionTelemetry {
   std::atomic<uint64_t> compactions_forced_from_level_[kRLTelemetryMaxLevels] =
       {};
   std::atomic<uint64_t> last_completed_decision_id_[kRLTelemetryMaxLevels] = {};
-  std::atomic<uint64_t> last_completed_candidate_file_[kRLTelemetryMaxLevels] =
-      {};
   std::atomic<int> last_completion_result_[kRLTelemetryMaxLevels] = {};
 
   // steady_clock microseconds at the last Consume(); 0 until the first one.

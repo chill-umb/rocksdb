@@ -27,9 +27,7 @@ void SetRLDrainMode(bool enabled) {
   g_rl_drain_mode.store(enabled, std::memory_order_release);
 }
 
-bool RLDrainMode() {
-  return g_rl_drain_mode.load(std::memory_order_acquire);
-}
+bool RLDrainMode() { return g_rl_drain_mode.load(std::memory_order_acquire); }
 
 RLCompactionTelemetry& RLCompactionTelemetry::Get() {
   static RLCompactionTelemetry telemetry;
@@ -47,29 +45,22 @@ void RLCompactionTelemetry::RecordCompactionScheduled(int level,
   compactions_scheduled_from_level_[idx].fetch_add(1,
                                                    std::memory_order_relaxed);
   if (rl_forced) {
-    compactions_forced_from_level_[idx].fetch_add(1,
-                                                  std::memory_order_relaxed);
+    compactions_forced_from_level_[idx].fetch_add(1, std::memory_order_relaxed);
   }
   if (idx == 0) {
     l0_compactions_scheduled_.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
-void RLCompactionTelemetry::RecordCompactionCompleted(int base_input_level,
-                                                      int output_level,
-                                                      uint64_t bytes_read,
-                                                      uint64_t bytes_written,
-                                                      uint64_t decision_id,
-                                                      uint64_t candidate_file_number,
-                                                      bool successful) {
+void RLCompactionTelemetry::RecordCompactionCompleted(
+    int base_input_level, int output_level, uint64_t bytes_read,
+    uint64_t bytes_written, uint64_t decision_id, bool successful) {
   const int in_idx = ClampLevel(base_input_level);
   if (decision_id != 0) {
     last_completed_decision_id_[in_idx].store(decision_id,
-                                               std::memory_order_relaxed);
-    last_completed_candidate_file_[in_idx].store(candidate_file_number,
-                                                  std::memory_order_relaxed);
+                                              std::memory_order_relaxed);
     last_completion_result_[in_idx].store(successful ? 1 : 2,
-                                           std::memory_order_relaxed);
+                                          std::memory_order_relaxed);
   }
   if (!successful) return;
   compactions_completed_.fetch_add(1, std::memory_order_relaxed);
@@ -100,8 +91,8 @@ void RLCompactionTelemetry::RecordWriteStall(WriteStallCondition condition) {
   const uint64_t now = NowMicros();
   if (condition != WriteStallCondition::kNormal) {
     uint64_t expected = 0;
-    stall_started_micros_.compare_exchange_strong(
-        expected, now, std::memory_order_relaxed);
+    stall_started_micros_.compare_exchange_strong(expected, now,
+                                                  std::memory_order_relaxed);
   } else {
     const uint64_t started =
         stall_started_micros_.exchange(0, std::memory_order_relaxed);
@@ -120,7 +111,7 @@ void RLCompactionTelemetry::RecordForegroundOperation(
   if (index < 0 || index >= 3) return;
   foreground_count_[index].fetch_add(1, std::memory_order_relaxed);
   foreground_latency_sum_ns_[index].fetch_add(latency_ns,
-                                               std::memory_order_relaxed);
+                                              std::memory_order_relaxed);
   int bucket = 0;
   uint64_t value = latency_ns;
   while (value > 1 && bucket + 1 < kLatencyBuckets) {
@@ -204,8 +195,6 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Snapshot() const {
         compactions_forced_from_level_[i].load(std::memory_order_acquire);
     snapshot.last_completed_decision_id[i] =
         last_completed_decision_id_[i].load(std::memory_order_acquire);
-    snapshot.last_completed_candidate_file[i] =
-        last_completed_candidate_file_[i].load(std::memory_order_acquire);
     snapshot.last_completion_result[i] =
         last_completion_result_[i].load(std::memory_order_acquire);
   }
@@ -238,8 +227,8 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Consume() {
       stall_started_micros_.load(std::memory_order_acquire);
   while (active_stall_started != 0 &&
          !stall_started_micros_.compare_exchange_weak(
-             active_stall_started, stall_window_end,
-             std::memory_order_acq_rel, std::memory_order_acquire)) {
+             active_stall_started, stall_window_end, std::memory_order_acq_rel,
+             std::memory_order_acquire)) {
   }
   if (active_stall_started != 0 && stall_window_end >= active_stall_started) {
     snapshot.stall_duration_micros += stall_window_end - active_stall_started;
@@ -287,9 +276,6 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Consume() {
                                                    std::memory_order_acq_rel);
     snapshot.last_completed_decision_id[i] =
         last_completed_decision_id_[i].exchange(0, std::memory_order_acq_rel);
-    snapshot.last_completed_candidate_file[i] =
-        last_completed_candidate_file_[i].exchange(0,
-                                                    std::memory_order_acq_rel);
     snapshot.last_completion_result[i] =
         last_completion_result_[i].exchange(0, std::memory_order_acq_rel);
   }

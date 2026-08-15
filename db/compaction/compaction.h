@@ -408,21 +408,16 @@ class Compaction {
 
   CompactionReason compaction_reason() const { return compaction_reason_; }
 
-  // Candidate-aware RL attribution. A value of zero means this compaction was
-  // selected by RocksDB maintenance/fallback logic rather than a policy lease.
+  // Trigger attribution. A zero decision ID means this compaction came from a
+  // RocksDB maintenance/fallback path rather than an RL level authorization.
   void SetRLDecisionAttribution(uint64_t decision_id, uint64_t snapshot_epoch,
-                                uint64_t candidate_file_number,
                                 int override_reason) {
     rl_decision_id_ = decision_id;
     rl_snapshot_epoch_ = snapshot_epoch;
-    rl_candidate_file_number_ = candidate_file_number;
     rl_override_reason_ = override_reason;
   }
   uint64_t rl_decision_id() const { return rl_decision_id_; }
   uint64_t rl_snapshot_epoch() const { return rl_snapshot_epoch_; }
-  uint64_t rl_candidate_file_number() const {
-    return rl_candidate_file_number_;
-  }
   int rl_override_reason() const { return rl_override_reason_; }
 
   const std::vector<FileMetaData*>& grandparents() const {
@@ -641,7 +636,6 @@ class Compaction {
 
   uint64_t rl_decision_id_ = 0;
   uint64_t rl_snapshot_epoch_ = 0;
-  uint64_t rl_candidate_file_number_ = 0;
   int rl_override_reason_ = 0;
 
   // Notify on compaction completion only if listener was notified on compaction

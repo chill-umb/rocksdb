@@ -47,14 +47,12 @@ RLCompactionPicker::RLCompactionPicker(const ImmutableOptions& ioptions,
                                        const InternalKeyComparator* icmp)
     : LevelCompactionPicker(ioptions, icmp),
       decision_interval_ms_(EnvInt("RL_DECISION_INTERVAL_MS", 50)),
-      observe_interval_ms_(std::min(
-          EnvInt("RL_OBSERVE_INTERVAL_MS", decision_interval_ms_),
-          decision_interval_ms_)),
+      observe_interval_ms_(
+          std::min(EnvInt("RL_OBSERVE_INTERVAL_MS", decision_interval_ms_),
+                   decision_interval_ms_)),
       max_defer_steps_(EnvInt("RL_MAX_DEFER_STEPS", 50)),
       max_defer_steps_l0_(EnvInt("RL_MAX_DEFER_STEPS_L0", 1)),
-      allow_defer_(EnvBool("RL_ALLOW_DEFER", true)),
-      protocol_version_(EnvInt("RL_PROTOCOL_VERSION", 3)) {
-  if (protocol_version_ != 2 && protocol_version_ != 3) protocol_version_ = 3;
+      allow_defer_(EnvBool("RL_ALLOW_DEFER", true)) {
   for (int level = 0; level < kMaxRLLevels; ++level) {
     last_transition_valid_[level].store(true, std::memory_order_relaxed);
   }
@@ -106,7 +104,8 @@ uint64_t RLCompactionPicker::NextLevelOverlapBytes(
   const InternalKey* smallest = &files.front()->smallest;
   const InternalKey* largest = &files.front()->largest;
   for (const FileMetaData* file : files) {
-    if (icmp_->Compare(file->smallest, *smallest) < 0) smallest = &file->smallest;
+    if (icmp_->Compare(file->smallest, *smallest) < 0)
+      smallest = &file->smallest;
     if (icmp_->Compare(file->largest, *largest) > 0) largest = &file->largest;
   }
   std::vector<FileMetaData*> overlaps;
@@ -118,7 +117,7 @@ uint64_t RLCompactionPicker::NextLevelOverlapBytes(
 
 void RLCompactionPicker::BuildSnapshot(const VersionStorageInfo* vstorage,
                                        uint64_t pcb, RLStateV2* state) const {
-  state->protocol_version = protocol_version_;
+  state->protocol_version = 2;
   state->snapshot_epoch = SnapshotEpoch(vstorage);
   state->pending_compaction_bytes = pcb;
   state->l0_compaction_trigger = rl_l0_trigger_.load(std::memory_order_relaxed);
@@ -135,10 +134,8 @@ void RLCompactionPicker::BuildSnapshot(const VersionStorageInfo* vstorage,
 
   const int max_input_level =
       std::min(vstorage->MaxInputLevel(), kMaxRLLevels - 1);
-  LogBuffer preview_log(InfoLogLevel::DEBUG_LEVEL, ioptions_.logger);
   for (int level = 0; level <= max_input_level; ++level) {
-    if (protocol_version_ == 2 && level > 0 &&
-        vstorage->NumLevelFiles(level) == 0) {
+    if (level > 0 && vstorage->NumLevelFiles(level) == 0) {
       continue;
     }
     RLLevelState ls;
@@ -169,8 +166,6 @@ void RLCompactionPicker::BuildSnapshot(const VersionStorageInfo* vstorage,
         last_decision_id_[level].load(std::memory_order_relaxed);
     ls.prev_snapshot_epoch =
         last_snapshot_epoch_[level].load(std::memory_order_relaxed);
-    ls.prev_candidate_file_number =
-        last_candidate_file_[level].load(std::memory_order_relaxed);
     ls.prev_scheduling_result =
         last_scheduling_result_[level].load(std::memory_order_relaxed);
     ls.prev_override_reason =
@@ -178,46 +173,6 @@ void RLCompactionPicker::BuildSnapshot(const VersionStorageInfo* vstorage,
     ls.prev_transition_valid =
         last_transition_valid_[level].load(std::memory_order_relaxed);
 
-    if (protocol_version_ == 3 && picker_options_valid_ && ls.files > 0 &&
-        !ls.is_last) {
-      const auto previews = const_cast<RLCompactionPicker*>(this)
-                                ->PreviewCompactionCandidates(
-                                    cached_cf_name_, cached_cf_options_,
-                                    cached_db_options_,
-                                    const_cast<VersionStorageInfo*>(vstorage),
-                                    &preview_log, cached_history_ts_low_, level,
-                                    kMaxCandidatesPerLevel);
-      for (const LevelCompactionCandidate& source : previews) {
-        RLCandidateState candidate;
-        candidate.snapshot_epoch = state->snapshot_epoch;
-        candidate.source_file_number = source.source_file_number;
-        candidate.source_level = source.source_level;
-        candidate.output_level = source.output_level;
-        candidate.source_bytes = source.source_bytes;
-        candidate.expanded_source_bytes = source.expanded_source_bytes;
-        candidate.expanded_source_files = source.expanded_source_files;
-        candidate.overlap_files = source.overlap_files;
-        candidate.overlap_bytes = source.overlap_bytes;
-        candidate.estimated_read_bytes = source.estimated_read_bytes;
-        candidate.estimated_write_bytes = source.estimated_write_bytes;
-        candidate.overlap_ratio =
-            source.expanded_source_bytes == 0
-                ? 0.0
-                : static_cast<double>(source.overlap_bytes) /
-                      static_cast<double>(source.expanded_source_bytes);
-        candidate.num_entries = source.num_entries;
-        candidate.num_deletions = source.num_deletions;
-        candidate.compensated_size = source.compensated_size;
-        candidate.projected_source_fullness =
-            source.projected_source_fullness;
-        candidate.projected_output_fullness =
-            source.projected_output_fullness;
-        candidate.empties_source_level = source.empties_source_level;
-        candidate.priority_rank = source.priority_rank;
-        candidate.conflict = source.conflict;
-        ls.candidates.push_back(std::move(candidate));
-      }
-    }
     state->levels.push_back(std::move(ls));
   }
 }
@@ -225,7 +180,8 @@ void RLCompactionPicker::BuildSnapshot(const VersionStorageInfo* vstorage,
 void RLCompactionPicker::PublishSnapshot(const VersionStorageInfo* vstorage,
                                          uint64_t pcb) const {
   const uint64_t now = NowMicros();
-  const uint64_t previous = last_publish_micros_.load(std::memory_order_relaxed);
+  const uint64_t previous =
+      last_publish_micros_.load(std::memory_order_relaxed);
   const uint64_t min_gap =
       static_cast<uint64_t>(observe_interval_ms_) * 1000 / 4;
   if (previous != 0 && now - previous < min_gap) return;
@@ -247,18 +203,20 @@ void RLCompactionPicker::PublishSnapshot(const VersionStorageInfo* vstorage,
 void RLCompactionPicker::PopulateReadStats(RLStateV2& state) {
   Statistics* stats = ioptions_.stats;
   if (stats == nullptr) return;
-  const uint32_t tickers[kNumReadTickers] = {
-      NUMBER_KEYS_READ,          NUMBER_DB_SEEK,
-      GET_HIT_L0,                GET_HIT_L1,
-      GET_HIT_L2_AND_UP,         BLOOM_FILTER_USEFUL,
-      NON_LAST_LEVEL_READ_COUNT, LAST_LEVEL_READ_COUNT,
-      POINT_SST_PROBE};
+  const uint32_t tickers[kNumReadTickers] = {NUMBER_KEYS_READ,
+                                             NUMBER_DB_SEEK,
+                                             GET_HIT_L0,
+                                             GET_HIT_L1,
+                                             GET_HIT_L2_AND_UP,
+                                             BLOOM_FILTER_USEFUL,
+                                             NON_LAST_LEVEL_READ_COUNT,
+                                             LAST_LEVEL_READ_COUNT,
+                                             POINT_SST_PROBE};
   uint64_t delta[kNumReadTickers] = {};
   for (int i = 0; i < kNumReadTickers; ++i) {
     const uint64_t current = stats->getTickerCount(tickers[i]);
-    delta[i] = current >= prev_read_tickers_[i]
-                   ? current - prev_read_tickers_[i]
-                   : 0;
+    delta[i] =
+        current >= prev_read_tickers_[i] ? current - prev_read_tickers_[i] : 0;
     prev_read_tickers_[i] = current;
   }
   state.keys_read = delta[0];
@@ -270,14 +228,6 @@ void RLCompactionPicker::PopulateReadStats(RLStateV2& state) {
   state.non_last_level_read_count = delta[6];
   state.last_level_read_count = delta[7];
   state.point_sst_probes = delta[8];
-}
-
-uint64_t RLCompactionPicker::FirstValidCandidate(
-    const RLLevelState& level) const {
-  for (const RLCandidateState& candidate : level.candidates) {
-    if (!candidate.conflict) return candidate.source_file_number;
-  }
-  return 0;
 }
 
 void RLCompactionPicker::ExpireLeasesAtActuation() const {
@@ -296,14 +246,12 @@ void RLCompactionPicker::InstallLease(const ActionLease& lease) const {
   leases_[lease.level] = lease;
   leases_[lease.level].active = true;
   last_decision_id_[lease.level].store(lease.decision_id,
-                                        std::memory_order_relaxed);
+                                       std::memory_order_relaxed);
   last_snapshot_epoch_[lease.level].store(lease.snapshot_epoch,
-                                           std::memory_order_relaxed);
-  last_candidate_file_[lease.level].store(lease.candidate_file_number,
-                                           std::memory_order_relaxed);
+                                          std::memory_order_relaxed);
   last_scheduling_result_[lease.level].store(0, std::memory_order_relaxed);
   last_override_reason_[lease.level].store(static_cast<int>(lease.reason),
-                                            std::memory_order_relaxed);
+                                           std::memory_order_relaxed);
   last_transition_valid_[lease.level].store(
       lease.reason != ActionReason::kFallback, std::memory_order_relaxed);
 }
@@ -348,8 +296,9 @@ int RLCompactionPicker::HighestDueLevel(
   return chosen;
 }
 
-void RLCompactionPicker::InstallLocalLease(
-    const VersionStorageInfo* vstorage, int level, ActionReason reason) const {
+void RLCompactionPicker::InstallLocalLease(const VersionStorageInfo* vstorage,
+                                           int level,
+                                           ActionReason reason) const {
   if (level < 0 || level >= kMaxRLLevels) return;
   {
     std::lock_guard<std::mutex> lock(lease_mu_);
@@ -390,25 +339,25 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
   state.scan_sorted_run_seeks = telemetry.scan_sorted_run_seeks;
   state.interval_micros = telemetry.interval_micros;
   state.get_latency_count = telemetry.foreground_count[0];
-  state.get_latency_avg_ns = telemetry.foreground_count[0] == 0
-                                 ? 0.0
-                                 : static_cast<double>(
-                                       telemetry.foreground_latency_sum_ns[0]) /
-                                       telemetry.foreground_count[0];
+  state.get_latency_avg_ns =
+      telemetry.foreground_count[0] == 0
+          ? 0.0
+          : static_cast<double>(telemetry.foreground_latency_sum_ns[0]) /
+                telemetry.foreground_count[0];
   state.get_latency_p95_ns = telemetry.foreground_latency_p95_ns[0];
   state.scan_latency_count = telemetry.foreground_count[1];
-  state.scan_latency_avg_ns = telemetry.foreground_count[1] == 0
-                                  ? 0.0
-                                  : static_cast<double>(telemetry
-                                                            .foreground_latency_sum_ns[1]) /
-                                        telemetry.foreground_count[1];
+  state.scan_latency_avg_ns =
+      telemetry.foreground_count[1] == 0
+          ? 0.0
+          : static_cast<double>(telemetry.foreground_latency_sum_ns[1]) /
+                telemetry.foreground_count[1];
   state.scan_latency_p95_ns = telemetry.foreground_latency_p95_ns[1];
   state.write_latency_count = telemetry.foreground_count[2];
-  state.write_latency_avg_ns = telemetry.foreground_count[2] == 0
-                                   ? 0.0
-                                   : static_cast<double>(telemetry
-                                                             .foreground_latency_sum_ns[2]) /
-                                         telemetry.foreground_count[2];
+  state.write_latency_avg_ns =
+      telemetry.foreground_count[2] == 0
+          ? 0.0
+          : static_cast<double>(telemetry.foreground_latency_sum_ns[2]) /
+                telemetry.foreground_count[2];
   state.write_latency_p95_ns = telemetry.foreground_latency_p95_ns[2];
   state.fallback_count = rl_fallback_count_.load(std::memory_order_relaxed);
   PopulateReadStats(state);
@@ -424,14 +373,13 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
     level.compactions_forced = telemetry.compactions_forced_from_level[index];
     level.prev_completed_decision_id =
         telemetry.last_completed_decision_id[index];
-    level.prev_completed_candidate_file_number =
-        telemetry.last_completed_candidate_file[index];
     level.prev_completion_result = telemetry.last_completion_result[index];
   }
 
   const RLMultiQueryResult result =
       RLCompactionClient::Get().QueryActions(state);
-  rl_query_count_.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t query_id =
+      rl_query_count_.fetch_add(1, std::memory_order_relaxed) + 1;
   if (!result.ok) {
     rl_available_.store(false, std::memory_order_release);
     const uint64_t failures =
@@ -449,8 +397,6 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
         ActionLease fallback;
         fallback.active = true;
         fallback.snapshot_epoch = state.snapshot_epoch;
-        fallback.candidate_file_number =
-            protocol_version_ == 3 ? FirstValidCandidate(*due) : 0;
         fallback.level = due->level;
         fallback.score = due->score;
         fallback.reason = ActionReason::kFallback;
@@ -481,16 +427,15 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
     bool compact = result.actions[i] == RLAction::kCompactNow;
     bool overridden = false;
     ActionReason reason = ActionReason::kPolicy;
-    uint64_t file = result.candidate_file_numbers[i];
 
     if (level.default_needed && !compact) {
       const int deferred =
-          defer_count_[source_level].fetch_add(1, std::memory_order_relaxed) + 1;
+          defer_count_[source_level].fetch_add(1, std::memory_order_relaxed) +
+          1;
       if (!allow_defer_ || deferred >= MaxDeferSteps(source_level)) {
         compact = true;
         overridden = true;
         reason = ActionReason::kBudget;
-        if (protocol_version_ == 3) file = FirstValidCandidate(level);
       }
     } else if (!level.default_needed || compact) {
       defer_count_[source_level].store(0, std::memory_order_relaxed);
@@ -499,13 +444,12 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
       compact = true;
       overridden = true;
       reason = ActionReason::kEmergency;
-      if (protocol_version_ == 3 && file == 0) file = FirstValidCandidate(level);
     }
 
     last_effective_action_[source_level].store(compact ? 1 : 0,
-                                                std::memory_order_relaxed);
+                                               std::memory_order_relaxed);
     last_action_overridden_[source_level].store(overridden,
-                                                 std::memory_order_relaxed);
+                                                std::memory_order_relaxed);
     compaction_picked_[source_level].store(false, std::memory_order_relaxed);
     if (!compact) continue;
 
@@ -516,14 +460,15 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
         (priority == chosen_priority && level.score > chosen.score)) {
       if (chosen.level >= 0) {
         last_effective_action_[chosen.level].store(0,
-                                                    std::memory_order_relaxed);
+                                                   std::memory_order_relaxed);
         last_action_overridden_[chosen.level].store(true,
                                                     std::memory_order_relaxed);
       }
       chosen.active = true;
-      chosen.decision_id = result.decision_id;
-      chosen.snapshot_epoch = result.snapshot_epoch;
-      chosen.candidate_file_number = file;
+      // Protocol v2 deliberately returns actions only. Generate attribution
+      // locally so file identity never has to cross the policy boundary.
+      chosen.decision_id = query_id;
+      chosen.snapshot_epoch = state.snapshot_epoch;
       chosen.level = source_level;
       chosen.score = level.score;
       chosen.reason = reason;
@@ -541,8 +486,7 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
 void RLCompactionPicker::WorkerLoop() {
   auto next_tick = std::chrono::steady_clock::now();
   auto next_actuation = next_tick;
-  const auto observe_interval =
-      std::chrono::milliseconds(observe_interval_ms_);
+  const auto observe_interval = std::chrono::milliseconds(observe_interval_ms_);
   const auto actuation_interval =
       std::chrono::milliseconds(decision_interval_ms_);
   while (!worker_stop_.load(std::memory_order_acquire)) {
@@ -566,7 +510,8 @@ void RLCompactionPicker::WorkerLoop() {
     }
     if (state.levels.empty()) continue;
     std::vector<int> levels;
-    for (const RLLevelState& level : state.levels) levels.push_back(level.level);
+    for (const RLLevelState& level : state.levels)
+      levels.push_back(level.level);
     const bool actuate = next_tick >= next_actuation;
     if (actuate) next_actuation = next_tick + actuation_interval;
     RunDecisionCycle(state, actuate);
@@ -587,7 +532,7 @@ void RLCompactionPicker::SendDoneMessage() {
   }
   if (levels.empty()) return;
   RLStateV2 state;
-  state.protocol_version = protocol_version_;
+  state.protocol_version = 2;
   state.done = true;
   for (int source_level : levels) {
     RLLevelState level;
@@ -610,23 +555,21 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
   if (!final && (queries == 0 || queries % kDiagnosticsEveryQueries != 0)) {
     return;
   }
-  ROCKS_LOG_INFO(
-      ioptions_.logger,
-      "RL candidate diagnostics: protocol=%d queries=%" PRIu64
-      " actuations=%" PRIu64 " bypasses=%" PRIu64
-      " skipped_ticks=%" PRIu64 " cumulative_fallbacks=%" PRIu64
-      " available=%d nc_calls=%" PRIu64 " nc_total_ms=%" PRIu64
-      " publish_calls=%" PRIu64 " publish_total_ms=%" PRIu64,
-      protocol_version_, queries,
-      rl_actuation_count_.load(std::memory_order_relaxed),
-      rl_bypass_count_.load(std::memory_order_relaxed),
-      rl_skipped_ticks_.load(std::memory_order_relaxed),
-      rl_fallback_count_.load(std::memory_order_relaxed),
-      rl_available_.load(std::memory_order_relaxed) ? 1 : 0,
-      rl_nc_calls_.load(std::memory_order_relaxed),
-      rl_nc_nanos_.load(std::memory_order_relaxed) / 1000000,
-      rl_publish_calls_.load(std::memory_order_relaxed),
-      rl_publish_nanos_.load(std::memory_order_relaxed) / 1000000);
+  ROCKS_LOG_INFO(ioptions_.logger,
+                 "RL trigger diagnostics: protocol=2 queries=%" PRIu64
+                 " actuations=%" PRIu64 " bypasses=%" PRIu64
+                 " skipped_ticks=%" PRIu64 " cumulative_fallbacks=%" PRIu64
+                 " available=%d nc_calls=%" PRIu64 " nc_total_ms=%" PRIu64
+                 " publish_calls=%" PRIu64 " publish_total_ms=%" PRIu64,
+                 queries, rl_actuation_count_.load(std::memory_order_relaxed),
+                 rl_bypass_count_.load(std::memory_order_relaxed),
+                 rl_skipped_ticks_.load(std::memory_order_relaxed),
+                 rl_fallback_count_.load(std::memory_order_relaxed),
+                 rl_available_.load(std::memory_order_relaxed) ? 1 : 0,
+                 rl_nc_calls_.load(std::memory_order_relaxed),
+                 rl_nc_nanos_.load(std::memory_order_relaxed) / 1000000,
+                 rl_publish_calls_.load(std::memory_order_relaxed),
+                 rl_publish_nanos_.load(std::memory_order_relaxed) / 1000000);
 }
 
 bool RLCompactionPicker::NeedsCompaction(
@@ -702,11 +645,6 @@ Compaction* RLCompactionPicker::PickCompaction(
     const SnapshotChecker* snapshot_checker, VersionStorageInfo* vstorage,
     LogBuffer* log_buffer, const std::string& full_history_ts_low,
     bool require_max_output_level) {
-  cached_cf_options_ = mutable_cf_options;
-  cached_db_options_ = mutable_db_options;
-  cached_cf_name_ = cf_name;
-  cached_history_ts_low_ = full_history_ts_low;
-  picker_options_valid_ = true;
   rl_l0_trigger_.store(mutable_cf_options.level0_file_num_compaction_trigger,
                        std::memory_order_relaxed);
   rl_l0_slowdown_trigger_.store(
@@ -719,51 +657,39 @@ Compaction* RLCompactionPicker::PickCompaction(
   if (TakeLease(&lease)) {
     Compaction* compaction = nullptr;
     const uint64_t current_epoch = SnapshotEpoch(vstorage);
-    const bool exact = protocol_version_ == 3 &&
-                       lease.candidate_file_number != 0;
-    if (!exact || current_epoch == lease.snapshot_epoch) {
-      const CompactionReason reason =
-          lease.level == 0 ? CompactionReason::kLevelL0FilesNum
-                           : CompactionReason::kLevelMaxLevelSize;
-      if (exact) {
-        compaction = PickCompactionFromFile(
-            cf_name, mutable_cf_options, mutable_db_options, vstorage,
-            log_buffer, full_history_ts_low, lease.level,
-            lease.candidate_file_number, lease.score, reason);
-      } else {
-        compaction = PickCompactionFromLevel(
-            cf_name, mutable_cf_options, mutable_db_options, vstorage,
-            log_buffer, full_history_ts_low, lease.level, lease.score, reason);
-      }
-    }
+    const CompactionReason reason = lease.level == 0
+                                        ? CompactionReason::kLevelL0FilesNum
+                                        : CompactionReason::kLevelMaxLevelSize;
+    // Force only the source level. PickCompactionFromLevel immediately enters
+    // RocksDB's normal FilesByCompactionPri/clean-cut/overlap path; the RL
+    // response never supplies an SST identity.
+    compaction = PickCompactionFromLevel(
+        cf_name, mutable_cf_options, mutable_db_options, vstorage, log_buffer,
+        full_history_ts_low, lease.level, lease.score, reason);
     if (compaction == nullptr) {
-      last_scheduling_result_[lease.level].store(2,
-                                                  std::memory_order_relaxed);
+      last_scheduling_result_[lease.level].store(2, std::memory_order_relaxed);
       last_transition_valid_[lease.level].store(false,
-                                                 std::memory_order_relaxed);
+                                                std::memory_order_relaxed);
       ROCKS_LOG_WARN(ioptions_.logger,
-                     "RL lease validation failed: decision=%" PRIu64
+                     "RL level trigger scheduling failed: decision=%" PRIu64
                      " epoch=%" PRIu64 " current_epoch=%" PRIu64
-                     " level=%d file=%" PRIu64 " reason=%d",
+                     " level=%d reason=%d",
                      lease.decision_id, lease.snapshot_epoch, current_epoch,
-                     lease.level, lease.candidate_file_number,
-                     static_cast<int>(lease.reason));
+                     lease.level, static_cast<int>(lease.reason));
       return nullptr;
     }
-    compaction->SetRLDecisionAttribution(
-        lease.decision_id, lease.snapshot_epoch, lease.candidate_file_number,
-        static_cast<int>(lease.reason));
+    compaction->SetRLDecisionAttribution(lease.decision_id,
+                                         lease.snapshot_epoch,
+                                         static_cast<int>(lease.reason));
     last_scheduling_result_[lease.level].store(1, std::memory_order_relaxed);
     compaction_picked_[lease.level].store(true, std::memory_order_relaxed);
     defer_count_[lease.level].store(0, std::memory_order_relaxed);
     RLCompactionTelemetry::Get().RecordCompactionScheduled(
         lease.level, lease.reason == ActionReason::kPolicy);
     ROCKS_LOG_INFO(ioptions_.logger,
-                   "RL lease scheduled: decision=%" PRIu64
-                   " epoch=%" PRIu64 " level=%d file=%" PRIu64
-                   " reason=%d",
+                   "RL lease scheduled: decision=%" PRIu64 " epoch=%" PRIu64
+                   " level=%d reason=%d",
                    lease.decision_id, lease.snapshot_epoch, lease.level,
-                   lease.candidate_file_number,
                    static_cast<int>(lease.reason));
     return compaction;
   }
@@ -776,7 +702,7 @@ Compaction* RLCompactionPicker::PickCompaction(
       snapshot_checker, vstorage, log_buffer, full_history_ts_low,
       require_max_output_level);
   if (compaction != nullptr) {
-    compaction->SetRLDecisionAttribution(0, SnapshotEpoch(vstorage), 0,
+    compaction->SetRLDecisionAttribution(0, SnapshotEpoch(vstorage),
                                          parent_reason);
     RLCompactionTelemetry::Get().RecordCompactionScheduled(
         compaction->start_level(), false);

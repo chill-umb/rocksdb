@@ -35,45 +35,6 @@ int SocketTimeoutMsFromEnv() {
 }
 
 // Minimal JSON formatting (no external dependency).
-void AppendUInt64Array(std::ostringstream& os,
-                       const std::vector<uint64_t>& values) {
-  os << "[";
-  for (size_t i = 0; i < values.size(); ++i) {
-    if (i > 0) os << ",";
-    os << values[i];
-  }
-  os << "]";
-}
-
-void AppendCandidateState(std::ostringstream& os,
-                          const RLCandidateState& c) {
-  os << "{\"snapshot_epoch\":" << c.snapshot_epoch
-     << ",\"source_file_number\":" << c.source_file_number
-     << ",\"source_level\":" << c.source_level
-     << ",\"output_level\":" << c.output_level
-     << ",\"source_bytes\":" << c.source_bytes
-     << ",\"expanded_source_bytes\":" << c.expanded_source_bytes
-     << ",\"expanded_source_files\":";
-  AppendUInt64Array(os, c.expanded_source_files);
-  os << ",\"overlap_files\":";
-  AppendUInt64Array(os, c.overlap_files);
-  os << ",\"overlap_bytes\":" << c.overlap_bytes
-     << ",\"estimated_read_bytes\":" << c.estimated_read_bytes
-     << ",\"estimated_write_bytes\":" << c.estimated_write_bytes
-     << ",\"overlap_ratio\":" << c.overlap_ratio
-     << ",\"num_entries\":" << c.num_entries
-     << ",\"num_deletions\":" << c.num_deletions
-     << ",\"compensated_size\":" << c.compensated_size
-     << ",\"projected_source_fullness\":"
-     << c.projected_source_fullness
-     << ",\"projected_output_fullness\":"
-     << c.projected_output_fullness
-     << ",\"empties_source_level\":"
-     << (c.empties_source_level ? "true" : "false")
-     << ",\"priority_rank\":" << c.priority_rank
-     << ",\"conflict\":" << (c.conflict ? "true" : "false") << "}";
-}
-
 void AppendLevelState(std::ostringstream& os, const RLLevelState& l) {
   os << "{\"level\":" << l.level << ",\"files\":" << l.files
      << ",\"bytes\":" << l.bytes << ",\"score\":" << l.score
@@ -96,26 +57,15 @@ void AppendLevelState(std::ostringstream& os, const RLLevelState& l) {
      << (l.prev_compaction_picked ? "true" : "false")
      << ",\"prev_decision_id\":" << l.prev_decision_id
      << ",\"prev_snapshot_epoch\":" << l.prev_snapshot_epoch
-     << ",\"prev_candidate_file_number\":"
-     << l.prev_candidate_file_number
      << ",\"prev_scheduling_result\":" << l.prev_scheduling_result
      << ",\"prev_completion_result\":" << l.prev_completion_result
-     << ",\"prev_completed_decision_id\":"
-     << l.prev_completed_decision_id
-     << ",\"prev_completed_candidate_file_number\":"
-     << l.prev_completed_candidate_file_number
+     << ",\"prev_completed_decision_id\":" << l.prev_completed_decision_id
      << ",\"prev_override_reason\":" << l.prev_override_reason
      << ",\"prev_transition_valid\":"
      << (l.prev_transition_valid ? "true" : "false")
      << ",\"defer_count\":" << l.defer_count
      << ",\"default_needed\":" << (l.default_needed ? "true" : "false")
-     << ",\"is_last\":" << (l.is_last ? "true" : "false")
-     << ",\"candidates\":[";
-  for (size_t i = 0; i < l.candidates.size(); ++i) {
-    if (i > 0) os << ",";
-    AppendCandidateState(os, l.candidates[i]);
-  }
-  os << "]}";
+     << ",\"is_last\":" << (l.is_last ? "true" : "false") << "}";
 }
 
 std::string FormatStateV2(const RLStateV2& s) {
@@ -138,8 +88,7 @@ std::string FormatStateV2(const RLStateV2& s) {
      << ",\"l0_delay_trigger_count\":" << s.l0_delay_trigger_count
      << ",\"interval_micros\":" << s.interval_micros
      << ",\"keys_read\":" << s.keys_read << ",\"seeks\":" << s.seeks
-     << ",\"get_hit_l0\":" << s.get_hit_l0
-     << ",\"get_hit_l1\":" << s.get_hit_l1
+     << ",\"get_hit_l0\":" << s.get_hit_l0 << ",\"get_hit_l1\":" << s.get_hit_l1
      << ",\"get_hit_l2_and_up\":" << s.get_hit_l2_and_up
      << ",\"bloom_useful\":" << s.bloom_useful
      << ",\"non_last_level_read_count\":" << s.non_last_level_read_count
@@ -200,53 +149,6 @@ std::vector<int> ParseIntArrayField(const std::string& json, const char* key) {
       return {};  // malformed
     }
     out.push_back(std::atoi(json.c_str() + pos));
-    while (pos < json.size() && json[pos] != ',' && json[pos] != ']') ++pos;
-  }
-  return out;
-}
-
-uint64_t ParseUInt64Field(const std::string& json, const char* key,
-                          bool* found) {
-  *found = false;
-  const std::string needle = std::string("\"") + key + "\"";
-  size_t pos = json.find(needle);
-  if (pos == std::string::npos) return 0;
-  pos = json.find(':', pos + needle.size());
-  if (pos == std::string::npos) return 0;
-  ++pos;
-  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
-  if (pos >= json.size() || json[pos] < '0' || json[pos] > '9') return 0;
-  char* end = nullptr;
-  const unsigned long long value = std::strtoull(json.c_str() + pos, &end, 10);
-  if (end == json.c_str() + pos) return 0;
-  *found = true;
-  return static_cast<uint64_t>(value);
-}
-
-std::vector<uint64_t> ParseUInt64ArrayField(const std::string& json,
-                                            const char* key) {
-  std::vector<uint64_t> out;
-  const std::string needle = std::string("\"") + key + "\"";
-  size_t pos = json.find(needle);
-  if (pos == std::string::npos) return out;
-  pos = json.find(':', pos + needle.size());
-  if (pos == std::string::npos) return out;
-  pos = json.find('[', pos + 1);
-  if (pos == std::string::npos) return out;
-  ++pos;
-  while (pos < json.size() && json[pos] != ']') {
-    while (pos < json.size() &&
-           (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ',')) {
-      ++pos;
-    }
-    if (pos >= json.size() || json[pos] == ']') break;
-    if (json[pos] < '0' || json[pos] > '9') return {};
-    char* end = nullptr;
-    const unsigned long long value =
-        std::strtoull(json.c_str() + pos, &end, 10);
-    if (end == json.c_str() + pos) return {};
-    out.push_back(static_cast<uint64_t>(value));
-    pos = static_cast<size_t>(end - json.c_str());
     while (pos < json.size() && json[pos] != ',' && json[pos] != ']') ++pos;
   }
   return out;
@@ -391,8 +293,8 @@ std::string RLCompactionClient::RecvLine() {
     if (n <= 0) return {};
     if (c == '\n') break;
     result += c;
-    // Protocol v3 carries up to eight candidates per level; bound malformed
-    // peers without truncating a legitimate multi-level observation.
+    // Bound malformed peers without truncating a legitimate multi-level
+    // trigger observation.
     if (result.size() > 1024 * 1024) return {};
   }
   return result;
@@ -438,48 +340,6 @@ RLMultiQueryResult RLCompactionClient::QueryActions(const RLStateV2& state) {
   for (int a : actions) {
     if (a < 0 || a > 1) a = static_cast<int>(RLAction::kDoNothing);
     result.actions.push_back(static_cast<RLAction>(a));
-  }
-  if (state.protocol_version >= 3) {
-    bool decision_found = false;
-    bool epoch_found = false;
-    result.decision_id =
-        ParseUInt64Field(response, "decision_id", &decision_found);
-    result.snapshot_epoch =
-        ParseUInt64Field(response, "snapshot_epoch", &epoch_found);
-    result.candidate_file_numbers =
-        ParseUInt64ArrayField(response, "candidate_file_numbers");
-    if (!decision_found || result.decision_id == 0 || !epoch_found ||
-        result.snapshot_epoch != state.snapshot_epoch ||
-        result.candidate_file_numbers.size() != state.levels.size()) {
-      return RLMultiQueryResult();
-    }
-    size_t compact_actions = 0;
-    for (size_t i = 0; i < result.actions.size(); ++i) {
-      const uint64_t selected = result.candidate_file_numbers[i];
-      if (result.actions[i] == RLAction::kDoNothing) {
-        if (selected != 0) return RLMultiQueryResult();
-        continue;
-      }
-      ++compact_actions;
-      if (selected == 0) {
-        // The only non-candidate v3 action is the deterministic tuned-level
-        // safety fallback, and it is meaningful only for a due level.
-        if (!state.levels[i].default_needed) return RLMultiQueryResult();
-        continue;
-      }
-      bool previewed_and_valid = false;
-      for (const RLCandidateState& candidate : state.levels[i].candidates) {
-        if (candidate.source_file_number == selected && !candidate.conflict &&
-            candidate.snapshot_epoch == state.snapshot_epoch) {
-          previewed_and_valid = true;
-          break;
-        }
-      }
-      if (!previewed_and_valid) return RLMultiQueryResult();
-    }
-    if (compact_actions > 1) return RLMultiQueryResult();
-  } else {
-    result.candidate_file_numbers.assign(state.levels.size(), 0);
   }
   result.ok = true;
   return result;
