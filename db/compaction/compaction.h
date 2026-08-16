@@ -411,14 +411,24 @@ class Compaction {
   // Trigger attribution. A zero decision ID means this compaction came from a
   // RocksDB maintenance/fallback path rather than an RL level authorization.
   void SetRLDecisionAttribution(uint64_t decision_id, uint64_t snapshot_epoch,
-                                int override_reason) {
+                                int override_reason,
+                                uint64_t decision_generation = 0,
+                                uint64_t eligibility_generation = 0) {
     rl_decision_id_ = decision_id;
     rl_snapshot_epoch_ = snapshot_epoch;
     rl_override_reason_ = override_reason;
+    rl_decision_generation_ = decision_generation;
+    rl_eligibility_generation_ = eligibility_generation;
   }
   uint64_t rl_decision_id() const { return rl_decision_id_; }
   uint64_t rl_snapshot_epoch() const { return rl_snapshot_epoch_; }
   int rl_override_reason() const { return rl_override_reason_; }
+  uint64_t rl_decision_generation() const {
+    return rl_decision_generation_;
+  }
+  uint64_t rl_eligibility_generation() const {
+    return rl_eligibility_generation_;
+  }
 
   const std::vector<FileMetaData*>& grandparents() const {
     return grandparents_;
@@ -637,6 +647,8 @@ class Compaction {
   uint64_t rl_decision_id_ = 0;
   uint64_t rl_snapshot_epoch_ = 0;
   int rl_override_reason_ = 0;
+  uint64_t rl_decision_generation_ = 0;
+  uint64_t rl_eligibility_generation_ = 0;
 
   // Notify on compaction completion only if listener was notified on compaction
   // begin.

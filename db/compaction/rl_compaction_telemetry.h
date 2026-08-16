@@ -62,7 +62,17 @@ struct RLCompactionTelemetrySnapshot {
   // remainder came from the parent leveled picker and must not be attributed
   // to the agent as an effect of its own action.
   uint64_t compactions_forced_from_level[kRLTelemetryMaxLevels] = {};
+  // Trivial moves are compactions that relink a file into the next level
+  // without rewriting it. They drain a level at almost no write-amplification
+  // cost, so a decision that produced ten moves is not comparable to one that
+  // produced ten rewrites, and the aggregate byte counters cannot separate
+  // them.
+  uint64_t trivial_moves_from_level[kRLTelemetryMaxLevels] = {};
+  uint64_t trivial_move_bytes_from_level[kRLTelemetryMaxLevels] = {};
   uint64_t last_completed_decision_id[kRLTelemetryMaxLevels] = {};
+  uint64_t last_completed_decision_generation[kRLTelemetryMaxLevels] = {};
+  uint64_t last_completed_eligibility_generation[kRLTelemetryMaxLevels] = {};
+  int last_completed_override_reason[kRLTelemetryMaxLevels] = {};
   int last_completion_result[kRLTelemetryMaxLevels] = {};
 };
 
@@ -80,7 +90,11 @@ class RLCompactionTelemetry {
   void RecordCompactionCompleted(int base_input_level, int output_level,
                                  uint64_t bytes_read, uint64_t bytes_written,
                                  uint64_t decision_id = 0,
-                                 bool successful = true);
+                                 uint64_t decision_generation = 0,
+                                 uint64_t eligibility_generation = 0,
+                                 int override_reason = 0,
+                                 bool successful = true,
+                                 bool trivial_move = false);
   void RecordWriteStall(WriteStallCondition condition);
   void RecordForegroundOperation(ForegroundOperation operation,
                                  uint64_t latency_ns,
@@ -130,7 +144,15 @@ class RLCompactionTelemetry {
       compactions_scheduled_from_level_[kRLTelemetryMaxLevels] = {};
   std::atomic<uint64_t> compactions_forced_from_level_[kRLTelemetryMaxLevels] =
       {};
+  std::atomic<uint64_t> trivial_moves_from_level_[kRLTelemetryMaxLevels] = {};
+  std::atomic<uint64_t>
+      trivial_move_bytes_from_level_[kRLTelemetryMaxLevels] = {};
   std::atomic<uint64_t> last_completed_decision_id_[kRLTelemetryMaxLevels] = {};
+  std::atomic<uint64_t>
+      last_completed_decision_generation_[kRLTelemetryMaxLevels] = {};
+  std::atomic<uint64_t>
+      last_completed_eligibility_generation_[kRLTelemetryMaxLevels] = {};
+  std::atomic<int> last_completed_override_reason_[kRLTelemetryMaxLevels] = {};
   std::atomic<int> last_completion_result_[kRLTelemetryMaxLevels] = {};
 
   // steady_clock microseconds at the last Consume(); 0 until the first one.

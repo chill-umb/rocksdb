@@ -22,6 +22,7 @@
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_rl.h"
+#include "db/compaction/compaction_pressure_observer.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/compaction/rl_compaction_telemetry.h"
 #include "db/db_impl/db_impl.h"
@@ -663,6 +664,8 @@ ColumnFamilyData::ColumnFamilyData(
 
   // if _dummy_versions is nullptr, then this is a dummy column family.
   if (_dummy_versions != nullptr) {
+    compaction_pressure_observer_.reset(
+        new CompactionPressureObserver(ioptions_.num_levels, id_));
     internal_stats_.reset(
         new InternalStats(ioptions_.num_levels, ioptions_.clock, this));
     table_cache_.reset(new TableCache(ioptions_, file_options, _table_cache,
@@ -1220,6 +1223,18 @@ const FileOptions* ColumnFamilyData::soptions() const {
 
 void ColumnFamilyData::SetCurrent(Version* current_version) {
   current_ = current_version;
+  if (current_ != nullptr && compaction_pressure_observer_ != nullptr) {
+    current_->storage_info()->SetCompactionPressureObserver(
+        compaction_pressure_observer_.get());
+    compaction_pressure_observer_->Observe(current_->storage_info());
+  }
+}
+
+std::shared_ptr<CompactionPressureView>
+ColumnFamilyData::compaction_pressure_view() const {
+  return compaction_pressure_observer_ == nullptr
+             ? nullptr
+             : compaction_pressure_observer_->view();
 }
 
 uint64_t ColumnFamilyData::GetNumLiveVersions() const {
@@ -1482,6 +1497,14 @@ void ColumnFamilyData::InstallSuperVersion(
   }
   ++super_version_number_;
   super_version_->version_number = super_version_number_;
+  if (ioptions().compaction_style == kCompactionStyleRL) {
+    auto* rl_picker =
+        static_cast<RLCompactionPicker*>(compaction_picker_.get());
+    rl_picker->UpdateTriggerOptions(GetLatestMutableCFOptions());
+    rl_picker->OnStructuralChange(
+        current_->storage_info(),
+        current_->storage_info()->estimated_compaction_needed_bytes());
+  }
 }
 
 void ColumnFamilyData::ResetThreadLocalSuperVersions() {

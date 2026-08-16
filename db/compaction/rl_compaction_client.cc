@@ -60,10 +60,31 @@ void AppendLevelState(std::ostringstream& os, const RLLevelState& l) {
      << ",\"prev_scheduling_result\":" << l.prev_scheduling_result
      << ",\"prev_completion_result\":" << l.prev_completion_result
      << ",\"prev_completed_decision_id\":" << l.prev_completed_decision_id
+     << ",\"prev_completed_decision_generation\":"
+     << l.prev_completed_decision_generation
+     << ",\"prev_completed_eligibility_generation\":"
+     << l.prev_completed_eligibility_generation
+     << ",\"prev_completed_override_reason\":"
+     << l.prev_completed_override_reason
      << ",\"prev_override_reason\":" << l.prev_override_reason
      << ",\"prev_transition_valid\":"
      << (l.prev_transition_valid ? "true" : "false")
      << ",\"defer_count\":" << l.defer_count
+     << ",\"due_age_micros\":" << l.due_age_micros
+     << ",\"pressure_score_micros\":" << l.pressure_score_micros
+     << ",\"score_event_generation\":" << l.score_event_generation
+     << ",\"gate_open\":" << (l.gate_open ? "true" : "false")
+     << ",\"gate_mode\":" << l.gate_mode
+     << ",\"jobs_attempted\":" << l.jobs_attempted
+     << ",\"jobs_blocked\":" << l.jobs_blocked
+     << ",\"jobs_scheduled\":" << l.jobs_scheduled
+     << ",\"jobs_completed\":" << l.jobs_completed
+     << ",\"decision_to_first_schedule_micros\":"
+     << l.decision_to_first_schedule_micros
+     << ",\"trivial_move_jobs\":" << l.trivial_move_jobs
+     << ",\"trivial_move_bytes\":" << l.trivial_move_bytes
+     << ",\"consecutive_blocked\":" << l.consecutive_blocked
+     << ",\"in_backoff\":" << (l.in_backoff ? "true" : "false")
      << ",\"default_needed\":" << (l.default_needed ? "true" : "false")
      << ",\"is_last\":" << (l.is_last ? "true" : "false") << "}";
 }
@@ -87,6 +108,16 @@ std::string FormatStateV2(const RLStateV2& s) {
      << ",\"l0_stop_trigger\":" << s.l0_stop_trigger
      << ",\"l0_delay_trigger_count\":" << s.l0_delay_trigger_count
      << ",\"interval_micros\":" << s.interval_micros
+     << ",\"observation_micros\":" << s.observation_micros
+     << ",\"structural_snapshot_age_micros\":"
+     << s.structural_snapshot_age_micros
+     << ",\"structural_dirty_age_micros\":"
+     << s.structural_dirty_age_micros
+     << ",\"structural_source_generation\":"
+     << s.structural_source_generation
+     << ",\"structural_built_generation\":"
+     << s.structural_built_generation
+     << ",\"score_event_generation\":" << s.score_event_generation
      << ",\"keys_read\":" << s.keys_read << ",\"seeks\":" << s.seeks
      << ",\"get_hit_l0\":" << s.get_hit_l0 << ",\"get_hit_l1\":" << s.get_hit_l1
      << ",\"get_hit_l2_and_up\":" << s.get_hit_l2_and_up
@@ -100,6 +131,10 @@ std::string FormatStateV2(const RLStateV2& s) {
      << ",\"scan_sorted_run_seeks\":" << s.scan_sorted_run_seeks
      << ",\"physical_sst_bytes\":" << s.physical_sst_bytes
      << ",\"live_logical_bytes\":" << s.live_logical_bytes
+     << ",\"output_only_level_files\":" << s.output_only_level_files
+     << ",\"output_only_level_bytes\":" << s.output_only_level_bytes
+     << ",\"output_only_level_target_bytes\":"
+     << s.output_only_level_target_bytes
      << ",\"stall_duration_micros\":" << s.stall_duration_micros
      << ",\"get_latency_count\":" << s.get_latency_count
      << ",\"get_latency_avg_ns\":" << s.get_latency_avg_ns

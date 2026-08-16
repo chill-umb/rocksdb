@@ -13,6 +13,8 @@
 #include "db/compaction/compaction_picker_fifo.h"
 #include "db/compaction/compaction_picker_level.h"
 #include "db/compaction/compaction_picker_rl.h"
+#include "db/compaction/compaction_pressure_observer.h"
+#include "db/compaction/rl_safety_manifest.h"
 #include "db/compaction/compaction_picker_universal.h"
 #include "db/compaction/file_pri.h"
 #include "rocksdb/advanced_options.h"
@@ -315,22 +317,156 @@ class RLCompactionPickerTestPeer {
     picker->rl_available_.store(available, std::memory_order_release);
   }
 
-  static void ExhaustLevel(RLCompactionPicker* picker, int level) {
-    picker->defer_count_[level].store(picker->MaxDeferSteps(level),
-                                      std::memory_order_relaxed);
+  static void InstallPolicyPermit(RLCompactionPicker* picker, int level,
+                                  bool optional, uint64_t decision_id) {
+    std::lock_guard<std::mutex> lock(picker->permit_mu_);
+    auto& permit = picker->permits_[level];
+    permit.decision_id = decision_id;
+    permit.decision_generation = ++picker->decision_generation_;
+    permit.eligibility_generation =
+        ++picker->next_eligibility_generation_;
+    permit.installed_micros = CompactionPressureObserver::NowMicros();
+    permit.action = RLCompactionPicker::PolicyAction::kCompact;
+    permit.mode = optional ? RLCompactionPicker::PermitMode::kOptionalOpen
+                           : RLCompactionPicker::PermitMode::kDueOpen;
+    permit.reason = RLCompactionPicker::ActionReason::kPolicy;
+    permit.optional_token_available = optional;
+    permit.transition_valid = true;
   }
 
-  static void InstallPolicyLease(RLCompactionPicker* picker, int level,
-                                 uint64_t epoch, double score,
-                                 uint64_t decision_id) {
-    RLCompactionPicker::ActionLease lease;
-    lease.active = true;
-    lease.decision_id = decision_id;
-    lease.snapshot_epoch = epoch;
-    lease.level = level;
-    lease.score = score;
-    lease.reason = RLCompactionPicker::ActionReason::kPolicy;
-    picker->InstallLease(lease);
+  static std::shared_ptr<const RLCompactionPicker::RLStructuralSnapshot>
+  BuildStructural(RLCompactionPicker* picker,
+                  const VersionStorageInfo* vstorage) {
+    return picker->BuildStructuralSnapshot(
+        vstorage, vstorage->estimated_compaction_needed_bytes(),
+        /*built_generation=*/1);
+  }
+
+  static RLStateV2 BuildObservation(
+      RLCompactionPicker* picker,
+      const RLCompactionPicker::RLStructuralSnapshot& structural) {
+    RLStateV2 state;
+    picker->BuildObservation(structural, &state);
+    return state;
+  }
+
+  static uint64_t StructuralBuilds(const RLCompactionPicker& picker) {
+    return picker.rl_publish_calls_.load(std::memory_order_relaxed);
+  }
+
+  static uint64_t EligibilityGeneration(RLCompactionPicker* picker,
+                                        int level) {
+    std::lock_guard<std::mutex> lock(picker->permit_mu_);
+    return picker->permits_[level].eligibility_generation;
+  }
+
+  static uint64_t DecisionGeneration(RLCompactionPicker* picker, int level) {
+    std::lock_guard<std::mutex> lock(picker->permit_mu_);
+    return picker->permits_[level].decision_generation;
+  }
+
+  static void RecordBlocked(RLCompactionPicker* picker, int level,
+                            uint64_t eligibility_generation,
+                            uint64_t decision_generation) {
+    picker->RecordBlockedAttempt(level,
+                                 CompactionPressureObserver::NowMicros(),
+                                 eligibility_generation,
+                                 decision_generation);
+  }
+
+  static int ConsecutiveBlocked(RLCompactionPicker* picker, int level) {
+    std::lock_guard<std::mutex> lock(picker->permit_mu_);
+    return picker->permits_[level].consecutive_blocked;
+  }
+
+  static void SupersedeDecisionKeepEligibility(RLCompactionPicker* picker,
+                                               int level,
+                                               uint64_t decision_id) {
+    std::lock_guard<std::mutex> lock(picker->permit_mu_);
+    auto& permit = picker->permits_[level];
+    permit.decision_id = decision_id;
+    permit.decision_generation = ++picker->decision_generation_;
+  }
+
+  static int LastSchedulingResult(RLCompactionPicker* picker, int level) {
+    return picker->last_scheduling_result_[level].load(
+        std::memory_order_relaxed);
+  }
+
+  static void InstallOptionalFrame(RLCompactionPicker* picker, int level,
+                                   uint64_t decision_id) {
+    RLStateV2 state;
+    state.snapshot_epoch = decision_id;
+    RLLevelState observed;
+    observed.level = level;
+    observed.files = 1;
+    observed.score = 0.75;
+    state.levels.push_back(observed);
+    std::vector<RLCompactionPicker::SchedulingToken> wake_tokens;
+    picker->InstallPolicyFrame(
+        state, {RLAction::kCompactNow}, decision_id, &wake_tokens);
+  }
+
+  static bool RecordSuccessful(RLCompactionPicker* picker, int level,
+                               bool optional,
+                               uint64_t eligibility_generation,
+                               uint64_t decision_generation) {
+    return picker->RecordSuccessfulSchedule(
+        level, optional, eligibility_generation, decision_generation);
+  }
+
+  static bool OptionalTokenAvailable(RLCompactionPicker* picker, int level) {
+    std::lock_guard<std::mutex> lock(picker->permit_mu_);
+    return picker->permits_[level].optional_token_available;
+  }
+
+  static void SetDirtyDeadlineState(RLCompactionPicker* picker,
+                                    uint64_t source_generation,
+                                    uint64_t built_generation,
+                                    uint64_t dirty_since_micros,
+                                    uint64_t deadline_micros) {
+    std::lock_guard<std::mutex> lock(picker->snap_mu_);
+    picker->structural_source_generation_ = source_generation;
+    picker->structural_built_generation_ = built_generation;
+    picker->structural_dirty_since_micros_ = dirty_since_micros;
+    picker->structural_dirty_deadline_micros_ = deadline_micros;
+  }
+
+  static bool DirtyDeadlineMiss(RLCompactionPicker* picker,
+                                uint64_t now_micros) {
+    return picker->StructuralDirtyDeadlineMiss(now_micros);
+  }
+
+  static uint64_t DirtyDeadlineMisses(RLCompactionPicker* picker) {
+    return picker->dirty_deadline_misses_.load(std::memory_order_relaxed);
+  }
+
+  static std::unique_ptr<RLSafetyController> MakeSafetyController() {
+    std::unique_ptr<RLSafetyController> controller(new RLSafetyController());
+    controller->calibrated_ = true;
+    controller->minimum_samples_ = 2;
+    controller->rolling_window_count_ = 1;
+    controller->enter_windows_ = 3;
+    controller->exit_windows_ = 3;
+    controller->physical_sst_bytes_limit_ = 100;
+    controller->pending_debt_ratio_limit_ = 0.5;
+    controller->get_avg_limit_ns_ = 100.0;
+    controller->get_p95_limit_ns_ = 200;
+    controller->scan_avg_limit_ns_ = 100.0;
+    controller->scan_p95_limit_ns_ = 200;
+    controller->write_avg_limit_ns_ = 100.0;
+    controller->write_p95_limit_ns_ = 200;
+    return controller;
+  }
+
+  static void EvaluateSafety(RLCompactionPicker* picker,
+                             const RLStateV2& state) {
+    picker->EvaluateWorkerSafety(state);
+  }
+
+  static int PermitModeValue(RLCompactionPicker* picker, int level) {
+    std::lock_guard<std::mutex> lock(picker->permit_mu_);
+    return static_cast<int>(picker->permits_[level].mode);
   }
 };
 
@@ -353,10 +489,8 @@ TEST_F(CompactionPickerTest, RLTriggerUsesRocksDBNativeFilePriority) {
 
   RLCompactionPicker picker(ioptions_, &icmp_);
   RLCompactionPickerTestPeer::StopWorker(&picker);
-  const uint64_t epoch =
-      RLCompactionPickerTestPeer::SnapshotEpoch(picker, vstorage_.get());
-  RLCompactionPickerTestPeer::InstallPolicyLease(
-      &picker, /*level=*/1, epoch, /*score=*/2.0, /*decision_id=*/70);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/70);
 
   std::unique_ptr<Compaction> compaction(
       picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
@@ -375,6 +509,165 @@ TEST_F(CompactionPickerTest, RLTriggerUsesRocksDBNativeFilePriority) {
   picker.UnregisterCompaction(compaction.get());
 }
 
+TEST_F(CompactionPickerTest, PressureObserverUsesZeroOrderHold) {
+  NewVersionStorage(4, kCompactionStyleLevel);
+  mutable_cf_options_.max_bytes_for_level_base = 100;
+  Add(1, 11U, "a", "c", 1300);
+  UpdateVersionStorageInfo();
+
+  CompactionPressureObserver observer(/*num_levels=*/4);
+  observer.Observe(vstorage_.get(), /*now_micros=*/100);
+  auto first = observer.view()->Load();
+  ASSERT_NE(first, nullptr);
+  ASSERT_GE(first->levels[1].score_at_event, 1.0);
+  ASSERT_EQ(first->levels[1].due_since_micros, 100U);
+  ASSERT_DOUBLE_EQ(first->levels[1].pressure_at_event, 0.0);
+
+  file_map_[11].first->being_compacted = true;
+  vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_, "");
+  observer.Observe(vstorage_.get(), /*now_micros=*/200);
+  auto second = observer.view()->Load();
+  ASSERT_LT(second->levels[1].score_at_event, 1.0);
+  ASSERT_EQ(second->levels[1].due_since_micros, 0U);
+  ASSERT_DOUBLE_EQ(second->levels[1].pressure_at_event, 0.0);
+
+  // Extending at a worker tick charges the held score only after the last
+  // event. Since the new score is healthy, episode pressure remains zero.
+  CompactionPressureSnapshot extended =
+      CompactionPressureObserver::ExtendTo(*second, /*now_micros=*/300);
+  ASSERT_DOUBLE_EQ(extended.levels[1].pressure_at_event,
+                   second->levels[1].pressure_at_event);
+
+  // A later due episode starts from zero rather than inheriting lifetime
+  // pressure accumulated by the completed episode.
+  file_map_[11].first->being_compacted = false;
+  vstorage_->ComputeCompactionScore(ioptions_, mutable_cf_options_, "");
+  observer.Observe(vstorage_.get(), /*now_micros=*/400);
+  auto third = observer.view()->Load();
+  ASSERT_GE(third->levels[1].score_at_event, 1.0);
+  ASSERT_EQ(third->levels[1].due_since_micros, 400U);
+  ASSERT_DOUBLE_EQ(third->levels[1].pressure_at_event, 0.0);
+  extended = CompactionPressureObserver::ExtendTo(*third,
+                                                   /*now_micros=*/500);
+  ASSERT_DOUBLE_EQ(extended.levels[1].pressure_at_event,
+                   (third->levels[1].score_at_event - 1.0) * 100.0);
+}
+
+TEST_F(CompactionPickerTest, CachedStructuralSnapshotIsReusedPerTick) {
+  NewVersionStorage(4, kCompactionStyleLevel);
+  mutable_cf_options_.max_bytes_for_level_base = 100;
+  Add(1, 11U, "a", "c", 200);
+  UpdateVersionStorageInfo();
+
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  auto structural =
+      RLCompactionPickerTestPeer::BuildStructural(&picker, vstorage_.get());
+  ASSERT_NE(structural, nullptr);
+  const uint64_t builds =
+      RLCompactionPickerTestPeer::StructuralBuilds(picker);
+  for (int tick = 0; tick < 10; ++tick) {
+    RLStateV2 observation =
+        RLCompactionPickerTestPeer::BuildObservation(&picker, *structural);
+    ASSERT_FALSE(observation.levels.empty());
+    ASSERT_GE(observation.observation_micros, structural->build_micros);
+  }
+  ASSERT_EQ(RLCompactionPickerTestPeer::StructuralBuilds(picker), builds);
+}
+
+TEST_F(CompactionPickerTest, RLObservationUsesCurrentL0TriggerOptions) {
+  NewVersionStorage(4, kCompactionStyleLevel);
+  UpdateVersionStorageInfo();
+  mutable_cf_options_.level0_file_num_compaction_trigger = 8;
+  mutable_cf_options_.level0_slowdown_writes_trigger = 24;
+  mutable_cf_options_.level0_stop_writes_trigger = 40;
+
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  picker.UpdateTriggerOptions(mutable_cf_options_);
+  auto structural =
+      RLCompactionPickerTestPeer::BuildStructural(&picker, vstorage_.get());
+  RLStateV2 observation =
+      RLCompactionPickerTestPeer::BuildObservation(&picker, *structural);
+  ASSERT_EQ(observation.l0_compaction_trigger, 8);
+  ASSERT_EQ(observation.l0_slowdown_trigger, 24);
+  ASSERT_EQ(observation.l0_stop_trigger, 40);
+}
+
+TEST_F(CompactionPickerTest, RLSafetyManifestRequirementFailsConservatively) {
+  std::string error;
+  std::unique_ptr<RLSafetyController> bootstrap = RLSafetyController::Load(
+      /*path=*/"", /*expected_fingerprint=*/"", /*manifest_required=*/false,
+      &error);
+  ASSERT_NE(bootstrap, nullptr);
+  ASSERT_FALSE(bootstrap->calibrated());
+  ASSERT_FALSE(bootstrap->invalid());
+
+  std::unique_ptr<RLSafetyController> required = RLSafetyController::Load(
+      /*path=*/"", /*expected_fingerprint=*/"expected",
+      /*manifest_required=*/true, &error);
+  ASSERT_NE(required, nullptr);
+  ASSERT_TRUE(required->invalid());
+}
+
+TEST_F(CompactionPickerTest, RLSafetyUsesSamplesAndThreeWindowHysteresis) {
+  std::unique_ptr<RLSafetyController> controller =
+      RLCompactionPickerTestPeer::MakeSafetyController();
+  RLStateV2 state;
+  state.get_latency_count = 2;
+  state.get_latency_avg_ns = 101.0;
+  state.get_latency_p95_ns = 201;
+  state.physical_sst_bytes = 101;
+  ASSERT_FALSE(controller->Update(state).read);
+  ASSERT_FALSE(controller->Update(state).read);
+  RLSLOBreachState breached = controller->Update(state);
+  ASSERT_TRUE(breached.read);
+  ASSERT_TRUE(breached.space);
+
+  state.get_latency_avg_ns = 99.0;
+  state.get_latency_p95_ns = 199;
+  state.physical_sst_bytes = 99;
+  ASSERT_TRUE(controller->Update(state).read);
+  ASSERT_TRUE(controller->Update(state).read);
+  RLSLOBreachState recovered = controller->Update(state);
+  ASSERT_FALSE(recovered.read);
+  ASSERT_FALSE(recovered.space);
+}
+
+TEST_F(CompactionPickerTest, RLL0SlowdownOpensDueSupportingLevels) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLStateV2 state;
+  state.live_logical_bytes = 1000;
+  RLLevelState l0;
+  l0.level = 0;
+  l0.files = 20;
+  l0.score = 5.0;
+  state.levels.push_back(l0);
+  RLLevelState l1;
+  l1.level = 1;
+  l1.files = 1;
+  l1.score = 1.1;
+  state.levels.push_back(l1);
+
+  RLCompactionPickerTestPeer::EvaluateSafety(&picker, state);
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 0), 3);
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 3);
+}
+
+TEST_F(CompactionPickerTest, RLDirtyStructuralDeadlineIsEdgeCounted) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::SetDirtyDeadlineState(
+      &picker, /*source_generation=*/2, /*built_generation=*/1,
+      /*dirty_since_micros=*/100, /*deadline_micros=*/50);
+  ASSERT_FALSE(RLCompactionPickerTestPeer::DirtyDeadlineMiss(&picker, 149));
+  ASSERT_TRUE(RLCompactionPickerTestPeer::DirtyDeadlineMiss(&picker, 150));
+  ASSERT_TRUE(RLCompactionPickerTestPeer::DirtyDeadlineMiss(&picker, 200));
+  ASSERT_EQ(RLCompactionPickerTestPeer::DirtyDeadlineMisses(&picker), 1U);
+
+  RLCompactionPickerTestPeer::SetDirtyDeadlineState(
+      &picker, /*source_generation=*/2, /*built_generation=*/2,
+      /*dirty_since_micros=*/0, /*deadline_micros=*/50);
+  ASSERT_FALSE(RLCompactionPickerTestPeer::DirtyDeadlineMiss(&picker, 250));
+}
+
 TEST_F(CompactionPickerTest, RLLevelTriggerDoesNotAuthorizeAnotherLevel) {
   NewVersionStorage(4, kCompactionStyleLevel);
   mutable_cf_options_.max_bytes_for_level_base = 100;
@@ -385,10 +678,8 @@ TEST_F(CompactionPickerTest, RLLevelTriggerDoesNotAuthorizeAnotherLevel) {
 
   RLCompactionPicker picker(ioptions_, &icmp_);
   RLCompactionPickerTestPeer::StopWorker(&picker);
-  const uint64_t epoch =
-      RLCompactionPickerTestPeer::SnapshotEpoch(picker, vstorage_.get());
-  RLCompactionPickerTestPeer::InstallPolicyLease(
-      &picker, /*level=*/1, epoch, /*score=*/2.0, /*decision_id=*/71);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/71);
 
   std::unique_ptr<Compaction> first(picker.PickCompaction(
       cf_name_, mutable_cf_options_, mutable_db_options_,
@@ -407,7 +698,28 @@ TEST_F(CompactionPickerTest, RLLevelTriggerDoesNotAuthorizeAnotherLevel) {
   ASSERT_EQ(second, nullptr);
 }
 
-TEST_F(CompactionPickerTest, RLExhaustedLevelUsesItsOwnForcedPath) {
+TEST_F(CompactionPickerTest, RLOpenLevelsRetainNativeScoreOrdering) {
+  NewVersionStorage(4, kCompactionStyleLevel);
+  mutable_cf_options_.max_bytes_for_level_base = 100;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 10;
+  Add(1, 11U, "a", "c", 200);
+  Add(2, 21U, "d", "f", 3000);
+  UpdateVersionStorageInfo();
+
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/75);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/2, /*optional=*/false, /*decision_id=*/75);
+  std::unique_ptr<Compaction> compaction(picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
+      vstorage_.get(), &log_buffer_, ""));
+  ASSERT_NE(compaction, nullptr);
+  ASSERT_EQ(compaction->start_level(), 2);
+  picker.UnregisterCompaction(compaction.get());
+}
+
+TEST_F(CompactionPickerTest, RLHeldDuePermitSchedulesRepeatedly) {
   NewVersionStorage(4, kCompactionStyleLevel);
   mutable_cf_options_.max_bytes_for_level_base = 100;
   mutable_cf_options_.max_bytes_for_level_multiplier = 10;
@@ -418,17 +730,25 @@ TEST_F(CompactionPickerTest, RLExhaustedLevelUsesItsOwnForcedPath) {
   RLCompactionPicker picker(ioptions_, &icmp_);
   RLCompactionPickerTestPeer::StopWorker(&picker);
   RLCompactionPickerTestPeer::SetAvailable(&picker, true);
-  RLCompactionPickerTestPeer::ExhaustLevel(&picker, /*level=*/1);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/72);
   ASSERT_TRUE(picker.NeedsCompaction(vstorage_.get()));
 
-  std::unique_ptr<Compaction> compaction(picker.PickCompaction(
+  std::unique_ptr<Compaction> first(picker.PickCompaction(
       cf_name_, mutable_cf_options_, mutable_db_options_,
       /*existing_snapshots=*/{}, /*snapshot_checker=*/nullptr, vstorage_.get(),
       &log_buffer_, /*full_history_ts_low=*/""));
-  ASSERT_NE(compaction, nullptr);
-  ASSERT_EQ(compaction->start_level(), 1);
-  ASSERT_EQ(compaction->rl_override_reason(), 1);
-  picker.UnregisterCompaction(compaction.get());
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(first->start_level(), 1);
+  picker.UnregisterCompaction(first.get());
+
+  // The gate is a zero-order-held trigger signal, not a consumed pulse.
+  std::unique_ptr<Compaction> second(picker.PickCompaction(
+      cf_name_, mutable_cf_options_, mutable_db_options_, {}, nullptr,
+      vstorage_.get(), &log_buffer_, ""));
+  ASSERT_NE(second, nullptr);
+  ASSERT_EQ(second->start_level(), 1);
+  picker.UnregisterCompaction(second.get());
 }
 
 TEST_F(CompactionPickerTest, RLLevelTriggerUsesCurrentRocksDBState) {
@@ -438,10 +758,8 @@ TEST_F(CompactionPickerTest, RLLevelTriggerUsesCurrentRocksDBState) {
 
   RLCompactionPicker picker(ioptions_, &icmp_);
   RLCompactionPickerTestPeer::StopWorker(&picker);
-  const uint64_t epoch =
-      RLCompactionPickerTestPeer::SnapshotEpoch(picker, vstorage_.get());
-  RLCompactionPickerTestPeer::InstallPolicyLease(
-      &picker, /*level=*/1, epoch + 1, /*score=*/2.0, /*decision_id=*/72);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/74);
 
   std::unique_ptr<Compaction> first(
       picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
@@ -500,17 +818,16 @@ TEST_F(CompactionPickerTest, RLUnavailableServerFallbackIsLevelScoped) {
   picker.UnregisterCompaction(compaction.get());
 }
 
-TEST_F(CompactionPickerTest, RLPolicyLeaseActuatesExactlyOnce) {
+TEST_F(CompactionPickerTest, RLOptionalPermitActuatesExactlyOnce) {
   NewVersionStorage(4, kCompactionStyleLevel);
+  mutable_cf_options_.max_bytes_for_level_base = 1000;
   Add(1, 11U, "a", "c", 200);
   UpdateVersionStorageInfo();
 
   RLCompactionPicker picker(ioptions_, &icmp_);
   RLCompactionPickerTestPeer::StopWorker(&picker);
-  const uint64_t epoch =
-      RLCompactionPickerTestPeer::SnapshotEpoch(picker, vstorage_.get());
-  RLCompactionPickerTestPeer::InstallPolicyLease(
-      &picker, /*level=*/1, epoch, /*score=*/2.0, /*decision_id=*/73);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/true, /*decision_id=*/73);
 
   std::unique_ptr<Compaction> first(
       picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
@@ -523,6 +840,65 @@ TEST_F(CompactionPickerTest, RLPolicyLeaseActuatesExactlyOnce) {
       picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
                             {}, nullptr, vstorage_.get(), &log_buffer_, ""));
   ASSERT_EQ(second, nullptr);
+}
+
+TEST_F(CompactionPickerTest, RLBlockedResultCannotMutateSupersedingFrame) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/80);
+  const uint64_t old_generation =
+      RLCompactionPickerTestPeer::EligibilityGeneration(&picker, 1);
+  const uint64_t old_decision_generation =
+      RLCompactionPickerTestPeer::DecisionGeneration(&picker, 1);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/81);
+  ASSERT_NE(RLCompactionPickerTestPeer::EligibilityGeneration(&picker, 1),
+            old_generation);
+  RLCompactionPickerTestPeer::RecordBlocked(
+      &picker, 1, old_generation, old_decision_generation);
+  ASSERT_EQ(RLCompactionPickerTestPeer::ConsecutiveBlocked(&picker, 1), 0);
+}
+
+TEST_F(CompactionPickerTest,
+       RLHeldEligibilityDoesNotMisattributeOldDecisionOutcome) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/90);
+  const uint64_t eligibility =
+      RLCompactionPickerTestPeer::EligibilityGeneration(&picker, 1);
+  const uint64_t decision =
+      RLCompactionPickerTestPeer::DecisionGeneration(&picker, 1);
+
+  // Repeated due-open responses intentionally keep the eligibility interval,
+  // but an attempt admitted by decision 90 must not become decision 91's
+  // response-level result.
+  RLCompactionPickerTestPeer::SupersedeDecisionKeepEligibility(
+      &picker, /*level=*/1, /*decision_id=*/91);
+  RLCompactionPickerTestPeer::RecordBlocked(
+      &picker, 1, eligibility, decision);
+  ASSERT_EQ(RLCompactionPickerTestPeer::ConsecutiveBlocked(&picker, 1), 1);
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastSchedulingResult(&picker, 1), 0);
+}
+
+TEST_F(CompactionPickerTest,
+       RLOldAdmissionCannotConsumeSupersedingOptionalToken) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::InstallOptionalFrame(
+      &picker, /*level=*/1, /*decision_id=*/100);
+  const uint64_t old_eligibility =
+      RLCompactionPickerTestPeer::EligibilityGeneration(&picker, 1);
+  const uint64_t old_decision =
+      RLCompactionPickerTestPeer::DecisionGeneration(&picker, 1);
+
+  RLCompactionPickerTestPeer::InstallOptionalFrame(
+      &picker, /*level=*/1, /*decision_id=*/101);
+  ASSERT_NE(RLCompactionPickerTestPeer::EligibilityGeneration(&picker, 1),
+            old_eligibility);
+  ASSERT_FALSE(RLCompactionPickerTestPeer::RecordSuccessful(
+      &picker, /*level=*/1, /*optional=*/true, old_eligibility,
+      old_decision));
+  ASSERT_TRUE(
+      RLCompactionPickerTestPeer::OptionalTokenAvailable(&picker, 1));
 }
 
 class CompactionPickerU64TsTest : public CompactionPickerTestBase {

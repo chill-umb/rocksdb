@@ -42,6 +42,16 @@ class LevelCompactionPicker : public CompactionPicker {
       LogBuffer* log_buffer, const std::string& full_history_ts_low,
       int forced_start_level, double forced_start_level_score,
       CompactionReason compaction_reason);
+
+  // Run RocksDB's ordinary due-work builder while restricting only the set of
+  // legal source levels. The mask never contains file identities and does not
+  // alter native priority, clean-cut expansion, overlap, or conflict logic.
+  Compaction* PickCompactionFromAllowedLevels(
+      const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+      const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+      LogBuffer* log_buffer, const std::string& full_history_ts_low,
+      const std::vector<bool>& allowed_source_levels,
+      std::vector<int>* attempted_source_levels = nullptr);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

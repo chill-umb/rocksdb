@@ -710,11 +710,14 @@ set(SOURCES
         db/compaction/compaction_picker_fifo.cc
         db/compaction/compaction_picker_level.cc
         db/compaction/compaction_picker_rl.cc
+        db/compaction/compaction_pressure_observer.cc
         db/compaction/compaction_picker_universal.cc
         db/compaction/compaction_service_job.cc
         db/compaction/compaction_state.cc
         db/compaction/compaction_outputs.cc
         db/compaction/rl_compaction_client.cc
+        db/compaction/rl_control_coordinator.cc
+        db/compaction/rl_safety_manifest.cc
         db/compaction/rl_compaction_telemetry.cc
         db/compaction/sst_partitioner.cc
         db/compaction/subcompaction_state.cc

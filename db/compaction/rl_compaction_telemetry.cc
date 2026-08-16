@@ -54,20 +54,35 @@ void RLCompactionTelemetry::RecordCompactionScheduled(int level,
 
 void RLCompactionTelemetry::RecordCompactionCompleted(
     int base_input_level, int output_level, uint64_t bytes_read,
-    uint64_t bytes_written, uint64_t decision_id, bool successful) {
+    uint64_t bytes_written, uint64_t decision_id,
+    uint64_t decision_generation, uint64_t eligibility_generation,
+    int override_reason, bool successful, bool trivial_move) {
   const int in_idx = ClampLevel(base_input_level);
-  if (decision_id != 0) {
-    last_completed_decision_id_[in_idx].store(decision_id,
-                                              std::memory_order_relaxed);
-    last_completion_result_[in_idx].store(successful ? 1 : 2,
-                                          std::memory_order_relaxed);
-  }
+  // Decision zero is meaningful: it identifies an explicit maintenance,
+  // fallback, emergency, or drain bypass. Preserve that completion as well so
+  // the next observation cannot retain a stale policy completion record.
+  last_completed_decision_id_[in_idx].store(decision_id,
+                                            std::memory_order_relaxed);
+  last_completed_decision_generation_[in_idx].store(
+      decision_generation, std::memory_order_relaxed);
+  last_completed_eligibility_generation_[in_idx].store(
+      eligibility_generation, std::memory_order_relaxed);
+  last_completed_override_reason_[in_idx].store(
+      override_reason, std::memory_order_relaxed);
+  last_completion_result_[in_idx].store(successful ? 1 : 2,
+                                        std::memory_order_relaxed);
   if (!successful) return;
   compactions_completed_.fetch_add(1, std::memory_order_relaxed);
   compaction_bytes_read_.fetch_add(bytes_read, std::memory_order_relaxed);
   compaction_bytes_written_.fetch_add(bytes_written, std::memory_order_relaxed);
 
   const int out_idx = ClampLevel(output_level);
+  if (trivial_move) {
+    trivial_moves_from_level_[in_idx].fetch_add(1, std::memory_order_relaxed);
+    // A move rewrites nothing, so its progress is the input size.
+    trivial_move_bytes_from_level_[in_idx].fetch_add(
+        bytes_read, std::memory_order_relaxed);
+  }
   compactions_from_level_[in_idx].fetch_add(1, std::memory_order_relaxed);
   compaction_read_from_level_[in_idx].fetch_add(bytes_read,
                                                 std::memory_order_relaxed);
@@ -195,6 +210,14 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Snapshot() const {
         compactions_forced_from_level_[i].load(std::memory_order_acquire);
     snapshot.last_completed_decision_id[i] =
         last_completed_decision_id_[i].load(std::memory_order_acquire);
+    snapshot.last_completed_decision_generation[i] =
+        last_completed_decision_generation_[i].load(
+            std::memory_order_acquire);
+    snapshot.last_completed_eligibility_generation[i] =
+        last_completed_eligibility_generation_[i].load(
+            std::memory_order_acquire);
+    snapshot.last_completed_override_reason[i] =
+        last_completed_override_reason_[i].load(std::memory_order_acquire);
     snapshot.last_completion_result[i] =
         last_completion_result_[i].load(std::memory_order_acquire);
   }
@@ -274,8 +297,22 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Consume() {
     snapshot.compactions_forced_from_level[i] =
         compactions_forced_from_level_[i].exchange(0,
                                                    std::memory_order_acq_rel);
+    snapshot.trivial_moves_from_level[i] =
+        trivial_moves_from_level_[i].exchange(0, std::memory_order_acq_rel);
+    snapshot.trivial_move_bytes_from_level[i] =
+        trivial_move_bytes_from_level_[i].exchange(0,
+                                                   std::memory_order_acq_rel);
     snapshot.last_completed_decision_id[i] =
         last_completed_decision_id_[i].exchange(0, std::memory_order_acq_rel);
+    snapshot.last_completed_decision_generation[i] =
+        last_completed_decision_generation_[i].exchange(
+            0, std::memory_order_acq_rel);
+    snapshot.last_completed_eligibility_generation[i] =
+        last_completed_eligibility_generation_[i].exchange(
+            0, std::memory_order_acq_rel);
+    snapshot.last_completed_override_reason[i] =
+        last_completed_override_reason_[i].exchange(
+            0, std::memory_order_acq_rel);
     snapshot.last_completion_result[i] =
         last_completion_result_[i].exchange(0, std::memory_order_acq_rel);
   }

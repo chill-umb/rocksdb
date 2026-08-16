@@ -9,6 +9,8 @@
 
 #include "db/version_set.h"
 
+#include "db/compaction/compaction_pressure_observer.h"
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -3990,6 +3992,9 @@ void VersionStorageInfo::ComputeCompactionScore(
       mutable_cf_options.enable_blob_garbage_collection);
 
   EstimateCompactionBytesNeeded(mutable_cf_options);
+  if (compaction_pressure_observer_ != nullptr) {
+    compaction_pressure_observer_->Observe(this);
+  }
 }
 
 void VersionStorageInfo::ComputeFilesMarkedForCompaction(int last_level) {
@@ -5827,6 +5832,7 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
   assert(v != current);
   if (current != nullptr) {
     assert(current->refs_ > 0);
+    current->storage_info()->SetCompactionPressureObserver(nullptr);
     current->Unref();
   }
   column_family_data->SetCurrent(v);

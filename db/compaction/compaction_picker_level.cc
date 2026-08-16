@@ -63,7 +63,10 @@ class LevelCompactionBuilder {
       const MutableDBOptions& mutable_db_options,
       const std::string& full_history_ts_low, int forced_start_level = -1,
       double forced_start_level_score = 0,
-      CompactionReason forced_compaction_reason = CompactionReason::kUnknown)
+      CompactionReason forced_compaction_reason = CompactionReason::kUnknown,
+      const std::vector<bool>* allowed_source_levels = nullptr,
+      bool due_levels_only = false,
+      std::vector<int>* attempted_source_levels = nullptr)
       : cf_name_(cf_name),
         vstorage_(vstorage),
         compaction_picker_(compaction_picker),
@@ -74,7 +77,10 @@ class LevelCompactionBuilder {
         full_history_ts_low_(full_history_ts_low),
         forced_start_level_(forced_start_level),
         forced_start_level_score_(forced_start_level_score),
-        forced_compaction_reason_(forced_compaction_reason) {}
+        forced_compaction_reason_(forced_compaction_reason),
+        allowed_source_levels_(allowed_source_levels),
+        due_levels_only_(due_levels_only),
+        attempted_source_levels_(attempted_source_levels) {}
 
   // Pick and return a compaction.
   Compaction* PickCompaction();
@@ -165,6 +171,9 @@ class LevelCompactionBuilder {
   const int forced_start_level_;
   const double forced_start_level_score_;
   const CompactionReason forced_compaction_reason_;
+  const std::vector<bool>* const allowed_source_levels_;
+  const bool due_levels_only_;
+  std::vector<int>* const attempted_source_levels_;
   // Pick a path ID to place a newly generated file, with its level
   static uint32_t GetPathId(const ImmutableCFOptions& ioptions,
                             const MutableCFOptions& mutable_cf_options,
@@ -232,6 +241,13 @@ void LevelCompactionBuilder::SetupInitialFiles() {
     start_level_ = vstorage_->CompactionScoreLevel(i);
     assert(i == 0 || start_level_score_ <= vstorage_->CompactionScore(i - 1));
     if (start_level_score_ >= 1) {
+      if (allowed_source_levels_ != nullptr &&
+          (start_level_ < 0 ||
+           start_level_ >=
+               static_cast<int>(allowed_source_levels_->size()) ||
+           !(*allowed_source_levels_)[start_level_])) {
+        continue;
+      }
       if (skipped_l0_to_base && start_level_ == vstorage_->base_level()) {
         // If L0->base_level compaction is pending, don't schedule further
         // compaction from base level. Otherwise L0->base_level compaction
@@ -240,6 +256,9 @@ void LevelCompactionBuilder::SetupInitialFiles() {
       }
       output_level_ =
           (start_level_ == 0) ? vstorage_->base_level() : start_level_ + 1;
+      if (attempted_source_levels_ != nullptr) {
+        attempted_source_levels_->push_back(start_level_);
+      }
       bool picked_file_to_compact = PickFileToCompact();
       TEST_SYNC_POINT_CALLBACK("PostPickFileToCompact",
                                &picked_file_to_compact);
@@ -281,6 +300,10 @@ void LevelCompactionBuilder::SetupInitialFiles() {
   if (!start_level_inputs_.empty()) {
     return;
   }
+
+  // The allowed-level adapter is strictly for score-triggered due work.
+  // Maintenance is handled through the explicit parent-picker bypass.
+  if (due_levels_only_) return;
 
   // if we didn't find a compaction, check if there are any files marked for
   // compaction
@@ -1029,6 +1052,21 @@ Compaction* LevelCompactionPicker::PickCompactionFromLevel(
       cf_name, vstorage, this, log_buffer, mutable_cf_options, ioptions_,
       mutable_db_options, full_history_ts_low, forced_start_level,
       forced_start_level_score, compaction_reason);
+  return builder.PickCompaction();
+}
+
+Compaction* LevelCompactionPicker::PickCompactionFromAllowedLevels(
+    const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
+    const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
+    LogBuffer* log_buffer, const std::string& full_history_ts_low,
+    const std::vector<bool>& allowed_source_levels,
+    std::vector<int>* attempted_source_levels) {
+  LevelCompactionBuilder builder(
+      cf_name, vstorage, this, log_buffer, mutable_cf_options, ioptions_,
+      mutable_db_options, full_history_ts_low,
+      /*forced_start_level=*/-1, /*forced_start_level_score=*/0,
+      CompactionReason::kUnknown, &allowed_source_levels,
+      /*due_levels_only=*/true, attempted_source_levels);
   return builder.PickCompaction();
 }
 }  // namespace ROCKSDB_NAMESPACE

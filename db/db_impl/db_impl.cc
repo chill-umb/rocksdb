@@ -8,6 +8,9 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "db/db_impl/db_impl.h"
 
+#include "db/compaction/compaction_picker_rl.h"
+#include "db/compaction/rl_control_coordinator.h"
+
 #include <cstdint>
 #ifdef OS_SOLARIS
 #include <alloca.h>
@@ -262,6 +265,7 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
       table_cache_.get(), write_buffer_manager_, &write_controller_,
       &block_cache_tracer_, io_tracer_, db_id_, db_session_id_,
       options.daily_offpeak_time_utc, &error_handler_, read_only));
+  rl_control_coordinator_ = std::make_shared<RLControlCoordinator>(this);
   column_family_memtables_.reset(
       new ColumnFamilyMemTablesImpl(versions_->GetColumnFamilySet()));
 
@@ -276,6 +280,53 @@ DBImpl::DBImpl(const DBOptions& options, const std::string& dbname,
   if (write_buffer_manager_) {
     wbm_stall_.reset(new WBMStallInterface());
   }
+}
+
+void DBImpl::AttachRLCompactionControl(ColumnFamilyData* cfd) {
+  mutex_.AssertHeld();
+  if (cfd == nullptr || cfd->IsDropped() ||
+      cfd->ioptions().compaction_style != kCompactionStyleRL) {
+    return;
+  }
+  // Recovery and dynamic-CF installation use the same attach helper. Keep it
+  // idempotent so a repeated lifecycle callback cannot replace a live
+  // coordinator registration while the picker still holds the old handle.
+  if (rl_control_coordinator_->RegistrationGeneration(cfd->GetID()) != 0) {
+    return;
+  }
+  auto* picker = static_cast<RLCompactionPicker*>(cfd->compaction_picker());
+  const uint64_t generation =
+      rl_control_coordinator_->RegisterColumnFamily(cfd->GetID());
+  picker->AttachControl(
+      cfd->GetID(), generation, rl_control_coordinator_,
+      cfd->compaction_pressure_view(), cfd->GetLatestMutableCFOptions(),
+      cfd->current()->storage_info(),
+      cfd->current()->storage_info()->estimated_compaction_needed_bytes());
+}
+
+RLCompactionPicker* DBImpl::DetachRLCompactionControl(ColumnFamilyData* cfd) {
+  mutex_.AssertHeld();
+  if (cfd == nullptr ||
+      cfd->ioptions().compaction_style != kCompactionStyleRL) {
+    return nullptr;
+  }
+  const uint64_t generation =
+      rl_control_coordinator_->RegistrationGeneration(cfd->GetID());
+  if (generation == 0) return nullptr;
+  auto* picker = static_cast<RLCompactionPicker*>(cfd->compaction_picker());
+  rl_control_coordinator_->UnregisterColumnFamily(cfd->GetID(), generation);
+  picker->DetachControl(generation);
+  return picker;
+}
+
+std::vector<RLCompactionPicker*> DBImpl::DetachAllRLCompactionControls() {
+  mutex_.AssertHeld();
+  std::vector<RLCompactionPicker*> pickers;
+  for (ColumnFamilyData* cfd : *versions_->GetColumnFamilySet()) {
+    RLCompactionPicker* picker = DetachRLCompactionControl(cfd);
+    if (picker != nullptr) pickers.push_back(picker);
+  }
+  return pickers;
 }
 
 Status DBImpl::Resume() {
@@ -568,6 +619,34 @@ Status DBImpl::CloseHelper() {
     TEST_SYNC_POINT("DBImpl::~DBImpl:WaitJob");
     bg_cv_.Wait();
   }
+
+  // Close all producer registrations while tree state is still protected,
+  // then release mutex_ before joining workers or the coordinator executor.
+  // VersionSet and its ColumnFamilyData objects remain alive throughout.
+  std::vector<RLCompactionPicker*> rl_pickers =
+      DetachAllRLCompactionControls();
+  mutex_.Unlock();
+  for (RLCompactionPicker* picker : rl_pickers) {
+    picker->StopWorker();
+  }
+  rl_control_coordinator_->Stop();
+  ROCKS_LOG_INFO(
+      immutable_db_options_.info_log,
+      "RL control coordinator diagnostics: coalesced=%" PRIu64
+      " dropped_registrations=%" PRIu64 " refresh_dispatches=%" PRIu64
+      " refresh_total_delay_us=%" PRIu64 " refresh_max_delay_us=%" PRIu64
+      " scheduling_dispatches=%" PRIu64
+      " scheduling_total_delay_us=%" PRIu64
+      " scheduling_max_delay_us=%" PRIu64,
+      rl_control_coordinator_->coalesced_requests(),
+      rl_control_coordinator_->dropped_registrations(),
+      rl_control_coordinator_->refresh_dispatches(),
+      rl_control_coordinator_->refresh_total_delay_micros(),
+      rl_control_coordinator_->refresh_max_delay_micros(),
+      rl_control_coordinator_->scheduling_dispatches(),
+      rl_control_coordinator_->scheduling_total_delay_micros(),
+      rl_control_coordinator_->scheduling_max_delay_micros());
+  mutex_.Lock();
 
   // Ensure subclasses don't forget to schedule async file opening
   assert(!immutable_db_options_.open_files_async || !opened_successfully_ ||
@@ -3818,6 +3897,7 @@ Status DBImpl::CreateColumnFamilyImpl(const ReadOptions& read_options,
           versions_->GetColumnFamilySet()->GetColumnFamily(column_family_name);
       assert(cfd != nullptr);
       InstallSuperVersionForConfigChange(cfd, &sv_context);
+      AttachRLCompactionControl(cfd);
 
       if (!cfd->mem()->IsSnapshotSupported()) {
         is_snapshot_supported_ = false;
@@ -3899,6 +3979,7 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
   edit.SetColumnFamily(cfd->GetID());
 
   Status s;
+  RLCompactionPicker* detached_rl_picker = nullptr;
   // Save re-aquiring lock for RegisterRecordSeqnoTimeWorker when not
   // applicable
   MinAndMaxPreserveSeconds preserve_info;
@@ -3920,6 +4001,7 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
       max_total_in_memory_state_ -=
           moptions.write_buffer_size * moptions.max_write_buffer_number;
       preserve_info.Combine(moptions);
+      detached_rl_picker = DetachRLCompactionControl(cfd);
     }
 
     if (!cf_support_snapshot) {
@@ -3935,6 +4017,13 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
       is_snapshot_supported_ = new_is_snapshot_supported;
     }
     bg_cv_.SignalAll();
+  }
+
+  // The picker worker can be in socket I/O or the coordinator can be waiting
+  // for mutex_. Never join either while holding mutex_. The CF handle keeps
+  // cfd and its picker alive across this phase.
+  if (detached_rl_picker != nullptr) {
+    detached_rl_picker->StopWorker();
   }
 
   if (preserve_info.IsEnabled()) {

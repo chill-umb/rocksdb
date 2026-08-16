@@ -40,6 +40,8 @@ class MemTable;
 class MemTableListVersion;
 class CompactionPicker;
 class Compaction;
+class CompactionPressureObserver;
+class CompactionPressureView;
 class InternalKey;
 class InternalStats;
 class ColumnFamilyData;
@@ -460,6 +462,7 @@ class ColumnFamilyData {
                            const std::string& trim_ts);
 
   CompactionPicker* compaction_picker() { return compaction_picker_.get(); }
+  std::shared_ptr<CompactionPressureView> compaction_pressure_view() const;
   // thread-safe
   const Comparator* user_comparator() const {
     return internal_comparator_.user_comparator();
@@ -650,6 +653,11 @@ class ColumnFamilyData {
   std::unique_ptr<BlobSource> blob_source_;
 
   std::unique_ptr<InternalStats> internal_stats_;
+
+  // The same event-driven observer is attached to regular leveled and
+  // RL-trigger column families so baseline and controller due episodes use
+  // identical clocks.
+  std::unique_ptr<CompactionPressureObserver> compaction_pressure_observer_;
 
   WriteBufferManager* write_buffer_manager_;
 

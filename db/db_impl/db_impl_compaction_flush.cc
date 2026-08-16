@@ -1856,7 +1856,9 @@ void DBImpl::NotifyOnCompactionCompleted(
     RLCompactionTelemetry::Get().RecordCompactionCompleted(
         c->start_level(), c->output_level(),
         compaction_job_stats.total_input_bytes,
-        compaction_job_stats.total_output_bytes, c->rl_decision_id(), st.ok());
+        compaction_job_stats.total_output_bytes, c->rl_decision_id(),
+        c->rl_decision_generation(), c->rl_eligibility_generation(),
+        c->rl_override_reason(), st.ok(), c->is_trivial_move());
   }
 
   if (immutable_db_options_.listeners.size() == 0U) {

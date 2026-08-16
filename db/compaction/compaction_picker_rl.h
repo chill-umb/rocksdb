@@ -3,7 +3,10 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <fstream>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -14,14 +17,47 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// Trigger-only leveled picker. The socket worker can authorize at most one
-// source level per actuation. RocksDB's native leveled picker retains sole
-// authority over which SSTs that level's compaction consumes.
+class CompactionPressureView;
+class RLControlHandle;
+class RLSafetyController;
+
+// Trigger-only leveled picker. Each response atomically opens or closes a
+// per-level trigger gate for one control interval. RocksDB's native leveled
+// picker retains sole authority over which SSTs every compaction consumes.
 class RLCompactionPicker : public LevelCompactionPicker {
  public:
   RLCompactionPicker(const ImmutableOptions& ioptions,
                      const InternalKeyComparator* icmp);
   ~RLCompactionPicker() override;
+
+  // DBImpl attaches after the recovered/dynamically-created CF is visible and
+  // has an active version. Construction alone never starts a worker.
+  void AttachControl(
+      uint32_t cf_id, uint64_t registration_generation,
+      std::shared_ptr<RLControlHandle> control_handle,
+      std::shared_ptr<CompactionPressureView> pressure_view,
+      const MutableCFOptions& mutable_cf_options,
+      const VersionStorageInfo* vstorage, uint64_t pcb);
+  void DetachControl(uint64_t registration_generation);
+  void StopWorker();
+
+  // Called under DBImpl's mutex at structural change points. A rate-limited
+  // change is coalesced by the DB-owned coordinator, never discarded.
+  void OnStructuralChange(const VersionStorageInfo* vstorage,
+                          uint64_t pcb) const;
+  void RefreshDeferredSnapshot(const VersionStorageInfo* vstorage,
+                               uint64_t pcb,
+                               uint64_t requested_source_generation,
+                               uint64_t registration_generation) const;
+  bool ValidateSchedulingRequest(const VersionStorageInfo* vstorage,
+                                 uint64_t eligibility_generation,
+                                 uint64_t retry_generation) const;
+  // The coordinator stamps the moment it hands a wake to RocksDB's scheduler,
+  // so the picker can measure the remaining scheduler-admission delay when
+  // PickCompaction is finally entered.
+  void NotifyWakeDispatched(uint64_t dispatch_micros,
+                            uint64_t queue_delay_micros) const;
+  void UpdateTriggerOptions(const MutableCFOptions& mutable_cf_options);
 
   bool NeedsCompaction(const VersionStorageInfo* vstorage) const override;
 
@@ -37,7 +73,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
   friend class RLCompactionPickerTestPeer;
 
   static constexpr int kMaxRLLevels = kRLTelemetryMaxLevels;
-  static constexpr uint64_t kPcbHardCap = 10ULL * 1024 * 1024 * 1024;
 
   enum class ActionReason : int {
     kPolicy = 0,
@@ -46,42 +81,171 @@ class RLCompactionPicker : public LevelCompactionPicker {
     kEmergency = 3,
     kFallback = 4,
     kDrain = 5,
+    kSLO = 6,
+    kManifest = 7,
+    kStaleStructure = 8,
+    // Configured control posture rather than a reaction to state: during
+    // bridge validation L0 is held non-deferring so it matches native leveled
+    // behavior while deeper-level control is evaluated.
+    kPosture = 9,
   };
 
-  struct ActionLease {
-    bool active = false;
+  enum class PolicyAction : int { kDefer = 0, kCompact = 1 };
+  enum class PermitMode : int {
+    kClosed = 0,
+    kDueOpen = 1,
+    kOptionalOpen = 2,
+    kForcedOpen = 3,
+  };
+
+  struct LevelPermit {
     uint64_t decision_id = 0;
-    uint64_t snapshot_epoch = 0;
-    int level = -1;
-    double score = 0.0;
+    uint64_t decision_generation = 0;
+    uint64_t eligibility_generation = 0;
+    uint64_t structural_generation = 0;
+    uint64_t installed_micros = 0;
+    PolicyAction action = PolicyAction::kDefer;
+    PermitMode mode = PermitMode::kClosed;
     ActionReason reason = ActionReason::kPolicy;
+    bool optional_token_available = false;
+    bool transition_valid = true;
+    int consecutive_blocked = 0;
+    uint64_t backoff_until_micros = 0;
+    uint64_t retry_generation = 0;
+    // Start of the current eligibility interval, and the first successful
+    // native schedule inside it. Together they separate "the gate opened" from
+    // "the plant actually admitted work", which aggregate counters cannot.
+    uint64_t eligibility_opened_micros = 0;
+    uint64_t first_schedule_micros = 0;
+  };
+
+  struct SchedulingToken {
+    uint64_t eligibility_generation = 0;
+    uint64_t retry_generation = 0;
+  };
+
+  struct RLStructuralLevel {
+    int level = 0;
+    int files = 0;
+    uint64_t bytes = 0;
+    uint64_t target_bytes = 0;
+    int next_level_files = 0;
+    uint64_t next_level_bytes = 0;
+    uint64_t next_level_target_bytes = 0;
+    uint64_t overlap_bytes = 0;
+    bool is_last = false;
+  };
+
+  struct RLStructuralSnapshot {
+    uint64_t snapshot_epoch = 0;
+    uint64_t build_micros = 0;
+    uint64_t built_generation = 0;
+    uint64_t pending_compaction_bytes = 0;
+    uint64_t physical_sst_bytes = 0;
+    uint64_t live_logical_bytes = 0;
+    int output_only_level_files = 0;
+    uint64_t output_only_level_bytes = 0;
+    uint64_t output_only_level_target_bytes = 0;
+    int l0_delay_trigger_count = 0;
+    std::vector<RLStructuralLevel> levels;
   };
 
   int decision_interval_ms_;
   int observe_interval_ms_;
-  int max_defer_steps_;
-  int max_defer_steps_l0_;
-  bool allow_defer_;
+  int blocked_attempt_limit_;
+  int blocked_backoff_ms_;
+  double optional_min_score_;
+  bool oracle_mode_;
+  bool safety_enabled_;
+  // Review decision 6: no learned L0 deferral during bridge validation. L0 is
+  // the level whose deferral most directly changes stall behavior, so holding
+  // it at native semantics isolates deeper-level control while the bridge is
+  // being validated. Set RL_L0_ALLOW_DEFER=1 to hand L0 to the policy.
+  bool l0_allow_defer_;
+  // Measured admission-latency budget. `epsilon` in the repair plan is the sum
+  // of score-event publication, worker tick, control-queue and scheduler
+  // admission delay; a zero bound disables the violation counter but never
+  // the measurement.
+  uint64_t epsilon_bound_micros_;
+  uint64_t safety_due_age_micros_;
+  double safety_pressure_score_micros_;
+  double safety_score_cap_;
+  double safety_debt_ratio_cap_;
+  uint64_t structural_dirty_deadline_micros_;
+  std::unique_ptr<RLSafetyController> slo_safety_;
+  std::string trigger_trace_path_;
+  mutable std::ofstream trigger_trace_;
 
-  int MaxDeferSteps(int level) const {
-    return level == 0 ? max_defer_steps_l0_ : max_defer_steps_;
-  }
-
-  // Snapshot handoff. Structural preview is built while DBImpl holds its
-  // mutex; network I/O and learning remain on worker_.
+  // Immutable structural cache. It is built while DBImpl holds its mutex;
+  // network I/O, overlay construction, and learning remain on worker_.
   mutable std::mutex snap_mu_;
   mutable std::condition_variable snap_cv_;
-  mutable RLStateV2 pending_snapshot_;
-  mutable bool snapshot_valid_{false};
+  mutable std::shared_ptr<const RLStructuralSnapshot> structural_snapshot_;
   mutable std::vector<int> last_sent_levels_;
-  mutable std::atomic<uint64_t> last_publish_micros_{0};
+  mutable uint64_t structural_source_generation_{0};
+  mutable uint64_t structural_built_generation_{0};
+  mutable uint64_t structural_dirty_since_micros_{0};
+  mutable uint64_t last_structural_epoch_{0};
+  mutable uint64_t last_build_micros_{0};
+  mutable uint64_t registration_generation_{0};
+  mutable uint32_t cf_id_{0};
+  mutable std::shared_ptr<RLControlHandle> control_handle_;
+  std::shared_ptr<CompactionPressureView> pressure_view_;
   std::thread worker_;
   std::atomic<bool> worker_stop_{false};
+  std::atomic<bool> worker_started_{false};
+  std::atomic<bool> attached_{false};
 
-  // Per-level leases and outcome attribution cross the worker/DB threads.
-  mutable std::mutex lease_mu_;
-  mutable ActionLease leases_[kMaxRLLevels];
-  mutable std::atomic<int> defer_count_[kMaxRLLevels] = {};
+  // Whole response frames are installed atomically under permit_mu_. A due
+  // open permit is held across multiple native jobs; an optional token is
+  // consumed after one successful below-threshold schedule.
+  mutable std::mutex permit_mu_;
+  mutable LevelPermit permits_[kMaxRLLevels];
+  mutable uint64_t decision_generation_{0};
+  mutable uint64_t next_eligibility_generation_{0};
+  mutable uint64_t next_retry_generation_{0};
+  mutable uint64_t last_valid_response_micros_{0};
+  mutable std::deque<uint64_t> response_spacings_micros_;
+  mutable std::atomic<uint64_t> watchdog_expiries_{0};
+  mutable std::atomic<uint64_t> blocked_attempts_{0};
+  mutable std::atomic<uint64_t> blocked_windows_{0};
+  mutable std::atomic<uint64_t> scheduling_wakes_{0};
+  mutable std::atomic<uint64_t> slo_masked_windows_{0};
+  mutable std::atomic<uint64_t> dirty_deadline_misses_{0};
+  mutable std::atomic<bool> dirty_deadline_active_{false};
+  mutable std::atomic<bool> slo_read_breach_{false};
+  mutable std::atomic<bool> slo_write_breach_{false};
+  mutable std::atomic<bool> slo_space_breach_{false};
+  mutable std::atomic<bool> slo_manifest_invalid_{false};
+  mutable std::atomic<uint64_t> pick_attempts_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> pick_blocked_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> pick_scheduled_[kMaxRLLevels] = {};
+  // Cumulative per-level plant outcomes. Telemetry deltas are consumed once
+  // per decision cycle, so these accumulate them for the observation.
+  mutable std::atomic<uint64_t> jobs_completed_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> trivial_move_jobs_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> trivial_move_bytes_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> first_schedule_latency_micros_[kMaxRLLevels] =
+      {};
+
+  // Continuous audit that every accepted active-score recomputation reached
+  // the shared pressure observer. A production path that changes the active
+  // score without publishing shows up here as a divergence between the
+  // observer's held score and the score the scheduler is admitting against.
+  mutable std::atomic<uint64_t> pressure_audit_attempts_{0};
+  mutable std::atomic<uint64_t> pressure_checks_{0};
+  mutable std::atomic<uint64_t> pressure_divergences_{0};
+  mutable std::atomic<uint64_t> pressure_max_divergence_milli_{0};
+
+  // epsilon components, in microseconds.
+  mutable std::atomic<uint64_t> tick_gap_max_micros_{0};
+  mutable std::atomic<uint64_t> control_queue_max_micros_{0};
+  mutable std::atomic<uint64_t> admission_max_micros_{0};
+  mutable std::atomic<uint64_t> wake_dispatch_micros_{0};
+  mutable std::atomic<uint64_t> epsilon_max_micros_{0};
+  mutable std::atomic<uint64_t> epsilon_violations_{0};
+
+  // Per-level outcome attribution crosses the worker/DB threads.
   mutable std::atomic<int> last_effective_action_[kMaxRLLevels] = {};
   mutable std::atomic<bool> last_action_overridden_[kMaxRLLevels] = {};
   mutable std::atomic<bool> compaction_picked_[kMaxRLLevels] = {};
@@ -92,9 +256,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<bool> last_transition_valid_[kMaxRLLevels] = {};
 
   mutable std::atomic<bool> rl_available_{false};
-  // Only maintenance and drain use the ordinary parent picker. The reason is
-  // consumed by PickCompaction and stamped on the resulting Compaction.
-  mutable std::atomic<int> parent_bypass_reason_{-1};
   std::atomic<int> rl_l0_trigger_{4};
   std::atomic<int> rl_l0_slowdown_trigger_{20};
   std::atomic<int> rl_l0_stop_trigger_{36};
@@ -109,6 +270,7 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<uint64_t> rl_nc_nanos_{0};
   mutable std::atomic<uint64_t> rl_publish_calls_{0};
   mutable std::atomic<uint64_t> rl_publish_nanos_{0};
+  mutable std::atomic<uint64_t> rl_publish_max_nanos_{0};
 
   static constexpr int kNumReadTickers = 9;
   uint64_t prev_read_tickers_[kNumReadTickers] = {};
@@ -120,21 +282,50 @@ class RLCompactionPicker : public LevelCompactionPicker {
   void LogDiagnostics(bool final) const;
   void SendDoneMessage();
 
-  void BuildSnapshot(const VersionStorageInfo* vstorage, uint64_t pcb,
-                     RLStateV2* state) const;
-  void PublishSnapshot(const VersionStorageInfo* vstorage, uint64_t pcb) const;
+  void InstallPolicyFrame(const RLStateV2& state,
+                          const std::vector<RLAction>& actions,
+                          uint64_t decision_id,
+                          std::vector<SchedulingToken>* wake_tokens);
+  void InstallFallbackFrame(const RLStateV2& state,
+                            std::vector<SchedulingToken>* wake_tokens);
+  bool IsPermitEligible(const LevelPermit& permit, double current_score,
+                        uint64_t now_micros) const;
+  std::vector<bool> BuildDueAllowedMask(
+      const VersionStorageInfo* vstorage, uint64_t now_micros) const;
+  void RequestScheduling(const SchedulingToken& token,
+                         uint64_t not_before_micros) const;
+  void RecordBlockedAttempt(int level, uint64_t now_micros,
+                            uint64_t eligibility_generation,
+                            uint64_t decision_generation) const;
+  bool RecordSuccessfulSchedule(int level, bool optional,
+                                uint64_t eligibility_generation,
+                                uint64_t decision_generation) const;
+  void ForceOpenLevel(const VersionStorageInfo* vstorage, int level,
+                      ActionReason reason) const;
+  uint64_t ResponseWatchdogMicros() const;
+  // Normalized pending debt against the manifest limit, or the configured
+  // bootstrap cap. A byte-valued cap cannot serve 1M and 50M workloads with
+  // the same number, so there is no absolute byte threshold anywhere.
+  bool DebtRatioBreach(uint64_t pending_compaction_bytes) const;
+  void CheckPressureDivergence(const VersionStorageInfo* vstorage) const;
+  void RecordEpsilonSample(uint64_t admission_micros) const;
+  void EvaluateWorkerSafety(const RLStateV2& state);
+  void TraceControlState(const RLStateV2& state) const;
+  bool StructuralDirtyDeadlineMiss(uint64_t now_micros) const;
+  bool HasMaintenanceWork(const VersionStorageInfo* vstorage) const;
+
+  std::shared_ptr<const RLStructuralSnapshot> BuildStructuralSnapshot(
+      const VersionStorageInfo* vstorage, uint64_t pcb,
+      uint64_t built_generation) const;
+  void BuildObservation(const RLStructuralSnapshot& structural,
+                        RLStateV2* state) const;
+  void InstallStructuralSnapshot(
+      std::shared_ptr<const RLStructuralSnapshot> snapshot) const;
   uint64_t SnapshotEpoch(const VersionStorageInfo* vstorage) const;
   double LevelScore(const VersionStorageInfo* vstorage, int level) const;
   uint64_t NextLevelOverlapBytes(const VersionStorageInfo* vstorage,
                                  int level) const;
 
-  bool HasActiveLease() const;
-  void ExpireLeasesAtActuation() const;
-  void InstallLease(const ActionLease& lease) const;
-  bool TakeLease(ActionLease* lease) const;
-  int HighestDueLevel(const VersionStorageInfo* vstorage) const;
-  void InstallLocalLease(const VersionStorageInfo* vstorage, int level,
-                         ActionReason reason) const;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -79,6 +79,8 @@ class MemTable;
 class PersistentStatsHistoryIterator;
 class TableCache;
 class TaskLimiterToken;
+class RLCompactionPicker;
+class RLControlCoordinator;
 class Version;
 class VersionEdit;
 class VersionSet;
@@ -1133,6 +1135,12 @@ class DBImpl : public DB {
 
   VersionSet* GetVersionSet() const { return versions_.get(); }
 
+  // RL trigger-control lifecycle. Locked variants require mutex_. Worker joins
+  // are deliberately separate and must run outside mutex_.
+  void AttachRLCompactionControl(ColumnFamilyData* cfd);
+  RLCompactionPicker* DetachRLCompactionControl(ColumnFamilyData* cfd);
+  std::vector<RLCompactionPicker*> DetachAllRLCompactionControls();
+
   Status WaitForCompact(
       const WaitForCompactOptions& wait_for_compact_options) override;
 
@@ -1373,6 +1381,7 @@ class DBImpl : public DB {
   // every time the DB is opened
   std::string db_session_id_;
   std::unique_ptr<VersionSet> versions_;
+  std::shared_ptr<RLControlCoordinator> rl_control_coordinator_;
   // Flag to check whether we allocated and own the info log file
   bool own_info_log_;
   Status init_logger_creation_s_;
@@ -1748,6 +1757,7 @@ class DBImpl : public DB {
   friend class DBImplSecondary;
   friend class ErrorHandler;
   friend class InternalStats;
+  friend class RLControlCoordinator;
   friend class PessimisticTransaction;
   friend class TransactionBaseImpl;
   friend class WriteCommittedTxn;

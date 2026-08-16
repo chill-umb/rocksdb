@@ -23,6 +23,7 @@
 #include "db/builder.h"
 #include "db/compaction/clipping_iterator.h"
 #include "db/compaction/compaction_state.h"
+#include "db/compaction/rl_compaction_telemetry.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
 #include "db/error_handler.h"
@@ -1253,7 +1254,7 @@ Status CompactionJob::Install(bool* compaction_released) {
          << "compaction_time_cpu_micros" << stats.cpu_micros << "output_level"
          << compact_->compaction->output_level() << "num_output_files"
          << stats.num_output_files << "total_output_size"
-         << stats.bytes_written;
+         << stats.bytes_written << "rl_drain" << RLDrainMode();
 
   if (stats.num_output_files_blob > 0) {
     stream << "num_blob_output_files" << stats.num_output_files_blob
@@ -2795,7 +2796,13 @@ void CompactionJob::LogCompaction() {
       stream.EndArray();
     }
     stream << "score" << compaction->score() << "input_data_size"
-           << compaction->CalculateTotalInputSize() << "oldest_snapshot_seqno"
+           << compaction->CalculateTotalInputSize() << "rl_decision_id"
+           << compaction->rl_decision_id() << "rl_decision_generation"
+           << compaction->rl_decision_generation()
+           << "rl_eligibility_generation"
+           << compaction->rl_eligibility_generation() << "rl_override_reason"
+           << compaction->rl_override_reason() << "rl_drain"
+           << RLDrainMode() << "oldest_snapshot_seqno"
            << (job_context_->snapshot_seqs.empty()
                    ? int64_t{-1}  // Use -1 for "none"
                    : static_cast<int64_t>(

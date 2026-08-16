@@ -3876,6 +3876,13 @@ class Benchmark {
         CacheReportProblems();
       } else if (name == "stats") {
         PrintStats("rocksdb.stats");
+        // Machine-readable denominators for the workload-aware compaction
+        // experiment. A post-run full compaction size is a useful diagnostic,
+        // but it is not the live logical byte estimate used by the formal
+        // space-amplification definition.
+        PrintStats(std::vector<std::string>{
+            DB::Properties::kEstimateLiveDataSize,
+            DB::Properties::kTotalSstFilesSize});
       } else if (name == "resetstats") {
         ResetStats();
       } else if (name == "verify") {
@@ -8913,9 +8920,21 @@ class Benchmark {
     fprintf(stdout, "waitforcompaction(%s): started\n",
             db.db->GetName().c_str());
 
+    uint64_t pending_before = 0;
+    db.db->GetAggregatedIntProperty(
+        DB::Properties::kEstimatePendingCompactionBytes, &pending_before);
+    fprintf(stdout, "RL_DRAIN_DB_PENDING_BEFORE_BYTES %" PRIu64 "\n",
+            pending_before);
+
     WaitForCompactOptions options;
     options.flush = true;
     Status s = db.db->WaitForCompact(options);
+
+    uint64_t pending_after = 0;
+    db.db->GetAggregatedIntProperty(
+        DB::Properties::kEstimatePendingCompactionBytes, &pending_after);
+    fprintf(stdout, "RL_DRAIN_DB_PENDING_AFTER_BYTES %" PRIu64 "\n",
+            pending_after);
 
     fprintf(stdout, "waitforcompaction(%s): finished with status (%s)\n",
             db.db->GetName().c_str(), s.ToString().c_str());
@@ -8926,8 +8945,8 @@ class Benchmark {
     // Enter the same explicit drain mode as db_runner before waiting so a low
     // WAF cannot be manufactured by leaving compaction debt unpaid at exit.
     SetRLDrainMode(true);
-    // Give background threads a chance to wake
-    FLAGS_env->SleepForMicroseconds(5 * 1000000);
+    fprintf(stdout, "RL_DRAIN_START_MICROS %" PRIu64 "\n",
+            FLAGS_env->NowMicros());
 
     if (db_.db != nullptr) {
       WaitForCompactionHelper(db_);
@@ -8936,6 +8955,8 @@ class Benchmark {
         WaitForCompactionHelper(db_with_cfh);
       }
     }
+    fprintf(stdout, "RL_DRAIN_END_MICROS %" PRIu64 "\n",
+            FLAGS_env->NowMicros());
     SetRLDrainMode(false);
   }
 

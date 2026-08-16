@@ -60,11 +60,38 @@ struct RLLevelState {
   // 0=not observed, 1=completed, 2=job failed.
   int prev_completion_result = 0;
   uint64_t prev_completed_decision_id = 0;
-  // 0=policy, 1=budget, 2=maintenance, 3=emergency, 4=fallback, 5=drain.
+  uint64_t prev_completed_decision_generation = 0;
+  uint64_t prev_completed_eligibility_generation = 0;
+  int prev_completed_override_reason = 0;
+  // 0=policy, 1=budget, 2=maintenance, 3=emergency, 4=fallback, 5=drain,
+  // 6=latency/space SLO, 7=invalid/mismatched manifest,
+  // 8=structural refresh deadline missed.
   int prev_override_reason = 0;
   bool prev_transition_valid = true;
   // Consecutive decisions this level has been deferred while due (score>=1).
   int defer_count = 0;
+  // Shadow safety clocks from the accepted active score-event stream. Phase
+  // 1a exports these without changing admission behavior.
+  uint64_t due_age_micros = 0;
+  double pressure_score_micros = 0.0;
+  uint64_t score_event_generation = 0;
+  bool gate_open = false;
+  int gate_mode = 0;
+  uint64_t jobs_attempted = 0;
+  uint64_t jobs_blocked = 0;
+  uint64_t jobs_scheduled = 0;
+  uint64_t jobs_completed = 0;
+  // Time from the current eligibility interval opening to its first successful
+  // native schedule. Zero while the gate is closed or nothing has been
+  // admitted yet; it separates "the gate opened" from "the plant responded".
+  uint64_t decision_to_first_schedule_micros = 0;
+  // Native trivial moves attributed to this source level. A level drained by
+  // moves costs almost no write amplification, so a policy comparison that
+  // cannot see them misreads cheap progress as expensive progress.
+  uint64_t trivial_move_jobs = 0;
+  uint64_t trivial_move_bytes = 0;
+  int consecutive_blocked = 0;
+  bool in_backoff = false;
 };
 
 // Full request: global state + one entry per observable input level.
@@ -89,6 +116,12 @@ struct RLStateV2 {
   // delta-valued field is a total over an unknown window, and two identical
   // feature vectors can describe completely different physical situations.
   uint64_t interval_micros = 0;
+  uint64_t observation_micros = 0;
+  uint64_t structural_snapshot_age_micros = 0;
+  uint64_t structural_dirty_age_micros = 0;
+  uint64_t structural_source_generation = 0;
+  uint64_t structural_built_generation = 0;
+  uint64_t score_event_generation = 0;
   // --- Read-path telemetry (deltas over interval_micros) -----------------
   // Sourced from the Statistics object RocksDB already maintains, so these
   // cost nothing on the read hot path. Compaction exists to bound read
@@ -109,6 +142,10 @@ struct RLStateV2 {
   uint64_t scan_sorted_run_seeks = 0;
   uint64_t physical_sst_bytes = 0;
   uint64_t live_logical_bytes = 0;
+  // Bottom output level is tree state, not an action-bearing source level.
+  int output_only_level_files = 0;
+  uint64_t output_only_level_bytes = 0;
+  uint64_t output_only_level_target_bytes = 0;
   uint64_t stall_duration_micros = 0;
   uint64_t get_latency_count = 0;
   double get_latency_avg_ns = 0.0;

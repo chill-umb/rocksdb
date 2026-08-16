@@ -2583,6 +2583,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
         impl->NewThreadStatusCfInfo(cfd);
         SuperVersionContext sv_context(/* create_superversion */ true);
         impl->InstallSuperVersionForConfigChange(cfd, &sv_context);
+        impl->AttachRLCompactionControl(cfd);
         sv_context.Clean();
       } else {
         if (db_options.create_missing_column_families) {

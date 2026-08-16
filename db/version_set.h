@@ -73,6 +73,7 @@ class Writer;
 
 class BlobIndex;
 class Compaction;
+class CompactionPressureObserver;
 class LogBuffer;
 class LookupKey;
 class MemTable;
@@ -202,6 +203,12 @@ class VersionStorageInfo {
   void ComputeCompactionScore(const ImmutableOptions& immutable_options,
                               const MutableCFOptions& mutable_cf_options,
                               const std::string& full_history_ts_low);
+
+  // Only an accepted active VersionStorageInfo has an observer. Temporary or
+  // not-yet-committed versions compute scores without publishing them.
+  void SetCompactionPressureObserver(CompactionPressureObserver* observer) {
+    compaction_pressure_observer_ = observer;
+  }
 
   // Estimate est_comp_needed_bytes_
   void EstimateCompactionBytesNeeded(
@@ -810,6 +817,8 @@ class VersionStorageInfo {
   EpochNumberRequirement epoch_number_requirement_;
 
   OffpeakTimeOption offpeak_time_option_;
+
+  CompactionPressureObserver* compaction_pressure_observer_ = nullptr;
 
   friend class Version;
   friend class VersionSet;
