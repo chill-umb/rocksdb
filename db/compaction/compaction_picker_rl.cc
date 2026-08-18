@@ -91,6 +91,8 @@ RLCompactionPicker::RLCompactionPicker(const ImmutableOptions& ioptions,
       oracle_mode_(EnvBool("RL_TRIGGER_ORACLE", false)),
       safety_enabled_(EnvBool("RL_SAFETY_ENFORCEMENT", true)),
       l0_allow_defer_(EnvBool("RL_L0_ALLOW_DEFER", false)),
+      crossing_posture_compact_(
+          EnvString("RL_CROSSING_POSTURE") != "defer"),
       epsilon_bound_micros_(
           static_cast<uint64_t>(std::max(EnvInt("RL_EPSILON_BOUND_MS", 0), 0)) *
           1000),
@@ -554,6 +556,120 @@ bool RLCompactionPicker::IsPermitEligible(const LevelPermit& permit,
          permit.optional_token_available;
 }
 
+bool RLCompactionPicker::ApplyCrossingPosture(int level, LevelPermit& permit,
+                                              double current_score,
+                                              uint64_t now_micros) const {
+  // Callers hold permit_mu_.
+  //
+  // D3a. The permit deferred a level that was below its trigger when the frame
+  // was installed, so it expressed no judgement about a due level at all. The
+  // level has since crossed. Binding the stale answer is what makes trigger
+  // latency track the decision interval: RocksDB has already woken its
+  // scheduler on this crossing, and this picker would otherwise answer that
+  // nothing is eligible until the next frame arrives.
+  if (!crossing_posture_compact_) return false;
+  if (current_score < 1.0) return false;
+  if (!permit.issued_below_threshold) return false;
+  if (permit.action == PolicyAction::kCompact ||
+      permit.mode == PermitMode::kForcedOpen) {
+    return false;
+  }
+  if (permit.mode == PermitMode::kDueOpen &&
+      permit.reason == ActionReason::kPosture) {
+    return false;  // already promoted for this crossing
+  }
+  permit.action = PolicyAction::kCompact;
+  permit.mode = PermitMode::kDueOpen;
+  permit.reason = ActionReason::kPosture;
+  permit.optional_token_available = false;
+  permit.eligibility_generation = ++next_eligibility_generation_;
+  permit.consecutive_blocked = 0;
+  permit.backoff_until_micros = 0;
+  permit.retry_generation = 0;
+  permit.eligibility_opened_micros = now_micros;
+  permit.first_schedule_micros = 0;
+  // Unlike ForceOpenLevel, the transition stays VALID for replay. This is a
+  // fixed, declared property of the environment — the same treatment
+  // RL_L0_ALLOW_DEFER=0 already receives — not a reactive safety intervention,
+  // and the learner keys its sample on the executed action.
+  permit.transition_valid = true;
+  last_effective_action_[level].store(1, std::memory_order_relaxed);
+  last_action_overridden_[level].store(true, std::memory_order_relaxed);
+  last_override_reason_[level].store(static_cast<int>(ActionReason::kPosture),
+                                     std::memory_order_relaxed);
+  posture_admissions_[level].fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void RLCompactionPicker::RecordDueAdmission(int level,
+                                            uint64_t due_since_micros,
+                                            uint64_t now_micros) const {
+  if (level < 0 || level >= kMaxRLLevels || due_since_micros == 0 ||
+      now_micros < due_since_micros) {
+    return;
+  }
+  // One sample per due episode. The episode's own start timestamp is its
+  // identity, so a gate that stays open across many PickCompaction calls
+  // contributes exactly once.
+  uint64_t recorded =
+      recorded_due_since_[level].load(std::memory_order_relaxed);
+  if (recorded == due_since_micros) return;
+  if (!recorded_due_since_[level].compare_exchange_strong(
+          recorded, due_since_micros, std::memory_order_relaxed)) {
+    return;
+  }
+  const uint64_t latency = now_micros - due_since_micros;
+  int bucket = 0;
+  uint64_t value = latency;
+  while (value > 0 && bucket < kLatencyBuckets - 1) {
+    value >>= 1;
+    ++bucket;
+  }
+  due_admission_buckets_[bucket].fetch_add(1, std::memory_order_relaxed);
+  due_admission_count_.fetch_add(1, std::memory_order_relaxed);
+  UpdateMaximum(&due_admission_max_micros_, latency);
+}
+
+void RLCompactionPicker::ObserveDueEpisodeTransitions() const {
+  if (pressure_view_ == nullptr) return;
+  std::shared_ptr<const CompactionPressureSnapshot> snapshot =
+      pressure_view_->Load();
+  if (snapshot == nullptr) return;
+  const int levels =
+      std::min(static_cast<int>(snapshot->levels.size()), kMaxRLLevels);
+  for (int level = 0; level < levels; ++level) {
+    const uint64_t due_since = snapshot->levels[level].due_since_micros;
+    const uint64_t previous =
+        last_seen_due_since_[level].exchange(due_since,
+                                            std::memory_order_relaxed);
+    if (previous == 0 || previous == due_since) continue;
+    // The previous due episode ended. If it never reached the admission
+    // recorder, the controller held that level closed for its whole life.
+    if (recorded_due_since_[level].load(std::memory_order_relaxed) !=
+        previous) {
+      due_never_admitted_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
+uint64_t RLCompactionPicker::DueAdmissionPercentileMicros(
+    double fraction) const {
+  const uint64_t total = due_admission_count_.load(std::memory_order_relaxed);
+  if (total == 0) return 0;
+  const uint64_t target =
+      static_cast<uint64_t>(fraction * static_cast<double>(total));
+  uint64_t cumulative = 0;
+  for (int bucket = 0; bucket < kLatencyBuckets; ++bucket) {
+    cumulative += due_admission_buckets_[bucket].load(std::memory_order_relaxed);
+    if (cumulative > target) {
+      // Upper bound of the bucket: never understates the latency, which is the
+      // safe direction for a threshold that is supposed to catch a regression.
+      return bucket == 0 ? 0 : ((1ULL << bucket) - 1);
+    }
+  }
+  return due_admission_max_micros_.load(std::memory_order_relaxed);
+}
+
 void RLCompactionPicker::RequestScheduling(
     const SchedulingToken& token, uint64_t not_before_micros) const {
   std::shared_ptr<RLControlHandle> handle;
@@ -605,6 +721,11 @@ void RLCompactionPicker::InstallPolicyFrame(
     next.action = actions[index] == RLAction::kCompactNow
                       ? PolicyAction::kCompact
                       : PolicyAction::kDefer;
+    // Record the band this action was chosen against, so a `defer` selected
+    // over a level that was not yet due can be told apart from a `defer` that
+    // deliberately held a due level back. Only the latter is a deferral
+    // decision; see ApplyCrossingPosture.
+    next.issued_below_threshold = observed.score < 1.0;
     const bool safety_held =
         previous.mode == PermitMode::kForcedOpen && observed.score >= 1.0 &&
         (previous.reason == ActionReason::kBudget ||
@@ -769,13 +890,27 @@ void RLCompactionPicker::InstallFallbackFrame(
 std::vector<bool> RLCompactionPicker::BuildDueAllowedMask(
     const VersionStorageInfo* vstorage, uint64_t now_micros) const {
   std::vector<bool> allowed(vstorage->num_levels(), false);
-  std::lock_guard<std::mutex> lock(permit_mu_);
-  const int max_level = std::min(vstorage->MaxInputLevel(), kMaxRLLevels - 1);
-  for (int level = 0; level <= max_level; ++level) {
-    const double score = LevelScore(vstorage, level);
-    if (score >= 1.0 && IsPermitEligible(permits_[level], score, now_micros)) {
-      allowed[level] = true;
+  std::shared_ptr<const CompactionPressureSnapshot> pressure =
+      pressure_view_ == nullptr ? nullptr : pressure_view_->Load();
+  {
+    std::lock_guard<std::mutex> lock(permit_mu_);
+    const int max_level = std::min(vstorage->MaxInputLevel(), kMaxRLLevels - 1);
+    for (int level = 0; level <= max_level; ++level) {
+      const double score = LevelScore(vstorage, level);
+      ApplyCrossingPosture(level, permits_[level], score, now_micros);
+      if (score >= 1.0 &&
+          IsPermitEligible(permits_[level], score, now_micros)) {
+        allowed[level] = true;
+      }
     }
+  }
+  for (int level = 0; level < static_cast<int>(allowed.size()); ++level) {
+    if (!allowed[level] || pressure == nullptr ||
+        level >= static_cast<int>(pressure->levels.size())) {
+      continue;
+    }
+    RecordDueAdmission(level, pressure->levels[level].due_since_micros,
+                       now_micros);
   }
   return allowed;
 }
@@ -1448,6 +1583,10 @@ void RLCompactionPicker::WorkerLoop() {
     if (actuate) next_actuation = next_tick + actuation_interval;
     RunDecisionCycle(state, actuate);
     EvaluateWorkerSafety(state);
+    // Close out due episodes that ended without ever being admitted, so the
+    // admission-latency histogram has a visible denominator rather than
+    // silently describing only the episodes that were served.
+    ObserveDueEpisodeTransitions();
     {
       std::lock_guard<std::mutex> lock(snap_mu_);
       last_sent_levels_ = std::move(levels);
@@ -1506,6 +1645,11 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
       snapshot_age_micros = now - structural_snapshot_->build_micros;
     }
   }
+  uint64_t posture_admissions_total = 0;
+  for (int level = 0; level < kMaxRLLevels; ++level) {
+    posture_admissions_total +=
+        posture_admissions_[level].load(std::memory_order_relaxed);
+  }
   ROCKS_LOG_INFO(ioptions_.logger,
                  "RL trigger diagnostics: protocol=2 queries=%" PRIu64
                  " actuations=%" PRIu64 " bypasses=%" PRIu64
@@ -1526,7 +1670,13 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                  " epsilon_publish_us=%" PRIu64 " epsilon_tick_us=%" PRIu64
                  " epsilon_queue_us=%" PRIu64 " epsilon_admission_us=%" PRIu64
                  " epsilon_max_us=%" PRIu64 " epsilon_bound_us=%" PRIu64
-                 " epsilon_violations=%" PRIu64,
+                 " epsilon_violations=%" PRIu64
+                 " posture_admissions=%" PRIu64
+                 " due_to_admission_micros_p50=%" PRIu64
+                 " due_to_admission_micros_p90=%" PRIu64
+                 " due_to_admission_micros_max=%" PRIu64
+                 " due_admission_samples=%" PRIu64
+                 " due_never_admitted=%" PRIu64,
                  queries, rl_actuation_count_.load(std::memory_order_relaxed),
                  rl_bypass_count_.load(std::memory_order_relaxed),
                  rl_skipped_ticks_.load(std::memory_order_relaxed),
@@ -1559,7 +1709,13 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                  admission_max_micros_.load(std::memory_order_relaxed),
                  epsilon_max_micros_.load(std::memory_order_relaxed),
                  epsilon_bound_micros_,
-                 epsilon_violations_.load(std::memory_order_relaxed));
+                 epsilon_violations_.load(std::memory_order_relaxed),
+                 posture_admissions_total,
+                 DueAdmissionPercentileMicros(0.50),
+                 DueAdmissionPercentileMicros(0.90),
+                 due_admission_max_micros_.load(std::memory_order_relaxed),
+                 due_admission_count_.load(std::memory_order_relaxed),
+                 due_never_admitted_.load(std::memory_order_relaxed));
   if (final) {
     for (int level = 0; level < kMaxRLLevels; ++level) {
       const uint64_t attempted =
@@ -1723,6 +1879,8 @@ Compaction* RLCompactionPicker::PickCompaction(
   }
   std::vector<bool> due_allowed(vstorage->num_levels(), false);
   LevelPermit admission[kMaxRLLevels];
+  std::shared_ptr<const CompactionPressureSnapshot> pressure =
+      pressure_view_ == nullptr ? nullptr : pressure_view_->Load();
   {
     // This is the linearization point for admission. A later response may
     // close the held gate, but it cannot retroactively cancel native work that
@@ -1731,11 +1889,19 @@ Compaction* RLCompactionPicker::PickCompaction(
     const int max_level =
         std::min(vstorage->MaxInputLevel(), kMaxRLLevels - 1);
     for (int level = 0; level <= max_level; ++level) {
-      admission[level] = permits_[level];
       const double score = LevelScore(vstorage, level);
+      ApplyCrossingPosture(level, permits_[level], score, now);
+      admission[level] = permits_[level];
       due_allowed[level] =
           score >= 1.0 && IsPermitEligible(admission[level], score, now);
     }
+  }
+  for (int level = 0; level < static_cast<int>(due_allowed.size()); ++level) {
+    if (!due_allowed[level] || pressure == nullptr ||
+        level >= static_cast<int>(pressure->levels.size())) {
+      continue;
+    }
+    RecordDueAdmission(level, pressure->levels[level].due_since_micros, now);
   }
 
   bool have_due = false;

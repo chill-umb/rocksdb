@@ -109,6 +109,11 @@ class RLCompactionPicker : public LevelCompactionPicker {
     ActionReason reason = ActionReason::kPolicy;
     bool optional_token_available = false;
     bool transition_valid = true;
+    // True when this permit's action was selected against a level observed
+    // BELOW its trigger. Such a `defer` is not a decision to defer anything —
+    // nothing was due — so binding it once the level crosses applies a permit
+    // outside the state it was issued against. See crossing_posture_compact_.
+    bool issued_below_threshold = false;
     int consecutive_blocked = 0;
     uint64_t backoff_until_micros = 0;
     uint64_t retry_generation = 0;
@@ -162,6 +167,19 @@ class RLCompactionPicker : public LevelCompactionPicker {
   // it at native semantics isolates deeper-level control while the bridge is
   // being validated. Set RL_L0_ALLOW_DEFER=1 to hand L0 to the policy.
   bool l0_allow_defer_;
+  // D3a. When a level crosses its trigger between two decisions it carries the
+  // previous frame's action, which is `defer` precisely because the level was
+  // not yet due. RocksDB already wakes its scheduler on that crossing
+  // (EnqueuePendingCompaction after ComputeCompactionScore), so the whole
+  // observed trigger latency is this picker answering `false` to a
+  // NeedsCompaction query that native leveled would have answered `true`.
+  //
+  // With the posture enabled, such a permit does not bind and the level is
+  // admitted under kPosture — a fixed property of the environment, like
+  // RL_L0_ALLOW_DEFER=0, rather than a reactive safety intervention, so the
+  // transition stays valid for replay. Set RL_CROSSING_POSTURE=defer to
+  // reproduce the binding behaviour for ablation.
+  bool crossing_posture_compact_;
   // Measured admission-latency budget. `epsilon` in the repair plan is the sum
   // of score-event publication, worker tick, control-queue and scheduler
   // admission delay; a zero bound disables the violation counter but never
@@ -237,6 +255,27 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<uint64_t> pressure_divergences_{0};
   mutable std::atomic<uint64_t> pressure_max_divergence_milli_{0};
 
+  // D3a attribution: admissions granted because a below-threshold permit did
+  // not bind across the due crossing.
+  mutable std::atomic<uint64_t> posture_admissions_[kMaxRLLevels] = {};
+
+  // D7 item 5. Event-time due->admission latency, in microseconds.
+  //
+  // The trace-derived figure in 09_evaluate_oracle_parity.py is reconstructed
+  // from a log written once per worker tick, so it is quantised to the
+  // observation interval and cannot express an acceptance threshold below one
+  // tick. Both endpoints are available here at microsecond resolution: the
+  // pressure observer stamps due_since_micros on the crossing, and this picker
+  // knows when it first admits the level. Log-scale buckets keep the recording
+  // path lock-free on a hot admission check.
+  static constexpr int kLatencyBuckets = 32;
+  mutable std::atomic<uint64_t> due_admission_buckets_[kLatencyBuckets] = {};
+  mutable std::atomic<uint64_t> due_admission_count_{0};
+  mutable std::atomic<uint64_t> due_admission_max_micros_{0};
+  mutable std::atomic<uint64_t> due_never_admitted_{0};
+  mutable std::atomic<uint64_t> recorded_due_since_[kMaxRLLevels] = {};
+  mutable std::atomic<uint64_t> last_seen_due_since_[kMaxRLLevels] = {};
+
   // epsilon components, in microseconds.
   mutable std::atomic<uint64_t> tick_gap_max_micros_{0};
   mutable std::atomic<uint64_t> control_queue_max_micros_{0};
@@ -290,6 +329,15 @@ class RLCompactionPicker : public LevelCompactionPicker {
                             std::vector<SchedulingToken>* wake_tokens);
   bool IsPermitEligible(const LevelPermit& permit, double current_score,
                         uint64_t now_micros) const;
+  // Promotes a permit whose `defer` was selected below the trigger once the
+  // level has crossed it. Callers must hold permit_mu_. Returns true when the
+  // permit was promoted by this call.
+  bool ApplyCrossingPosture(int level, LevelPermit& permit,
+                            double current_score, uint64_t now_micros) const;
+  void RecordDueAdmission(int level, uint64_t due_since_micros,
+                          uint64_t now_micros) const;
+  void ObserveDueEpisodeTransitions() const;
+  uint64_t DueAdmissionPercentileMicros(double fraction) const;
   std::vector<bool> BuildDueAllowedMask(
       const VersionStorageInfo* vstorage, uint64_t now_micros) const;
   void RequestScheduling(const SchedulingToken& token,

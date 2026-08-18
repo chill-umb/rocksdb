@@ -3,6 +3,8 @@
 #include <chrono>
 #include <limits>
 
+#include "db/compaction/compaction_pressure_observer.h"
+
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
@@ -24,6 +26,19 @@ std::atomic<bool> g_rl_drain_mode{false};
 }  // namespace
 
 void SetRLDrainMode(bool enabled) {
+  if (enabled) {
+    // Close every open due episode at the workload/drain boundary. Drain hands
+    // the tree back to the parent leveled picker, so an episode spanning this
+    // instant would mix policy-governed pressure with settle-up pressure in one
+    // calibration record.
+    //
+    // Deliberately unconditional on compaction style: db_bench calls this from
+    // WaitForCompaction() for every arm, and both regular and RL column
+    // families construct a pressure observer. Gating it would give the two arms
+    // differently segmented episode logs, which is the same class of defect as
+    // comparing arms through instruments only one of them has.
+    CompactionPressureObserver::FlushAllOpenEpisodes("workload_end");
+  }
   g_rl_drain_mode.store(enabled, std::memory_order_release);
 }
 

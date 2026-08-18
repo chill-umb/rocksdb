@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <unordered_set>
 #include <utility>
 
 #include "db/version_set.h"
@@ -23,6 +24,20 @@ std::mutex& EpisodeLogMutex() {
 std::atomic<uint64_t>& MaxObserveMicrosSlot() {
   static std::atomic<uint64_t> slot{0};
   return slot;
+}
+
+// Registry of live observers, so a phase boundary reached without a column
+// family handle can still flush. Held only while iterating; the destructor
+// deregisters before touching level state, so a concurrent flush can never
+// observe a dying object.
+std::mutex& RegistryMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_set<CompactionPressureObserver*>& Registry() {
+  static std::unordered_set<CompactionPressureObserver*> registry;
+  return registry;
 }
 
 }  // namespace
@@ -52,10 +67,26 @@ CompactionPressureObserver::CompactionPressureObserver(int num_levels,
   auto initial = std::make_shared<CompactionPressureSnapshot>();
   initial->levels.resize(levels_.size());
   view_->Publish(std::move(initial));
+  {
+    std::lock_guard<std::mutex> lock(RegistryMutex());
+    Registry().insert(this);
+  }
+}
+
+CompactionPressureObserver::~CompactionPressureObserver() {
+  // Deregister first. A concurrent FlushAllOpenEpisodes() holds the registry
+  // mutex while it iterates, so this blocks until it finishes and no flush can
+  // reach a partially destroyed observer afterwards.
+  {
+    std::lock_guard<std::mutex> lock(RegistryMutex());
+    Registry().erase(this);
+  }
+  FlushOpenEpisodes("teardown");
 }
 
 void CompactionPressureObserver::ExportCompletedEpisode(
-    int level, const MutableLevelState& state, uint64_t end_micros) const {
+    int level, const MutableLevelState& state, uint64_t end_micros,
+    bool truncated, const char* phase) const {
   if (episode_log_path_.empty() || state.due_since_micros == 0 ||
       end_micros < state.due_since_micros) {
     return;
@@ -66,7 +97,11 @@ void CompactionPressureObserver::ExportCompletedEpisode(
   std::lock_guard<std::mutex> lock(EpisodeLogMutex());
   std::ofstream output(episode_log_path_, std::ios::out | std::ios::app);
   if (!output) return;
-  output << "{\"schema_version\":1,\"cf_id\":" << cf_id_
+  // schema_version 2 adds `truncated` and `phase`. A truncated record is a
+  // right-censored observation: its duration and integrated pressure are lower
+  // bounds, not samples, and 06_select_baseline_slo.py must not rank them
+  // alongside completed episodes when computing an upper tolerance bound.
+  output << "{\"schema_version\":2,\"cf_id\":" << cf_id_
          << ",\"level\":" << level
          << ",\"start_micros\":" << state.due_since_micros
          << ",\"end_micros\":" << end_micros
@@ -76,7 +111,42 @@ void CompactionPressureObserver::ExportCompletedEpisode(
          << ",\"integrated_excess_score_micros\":"
          << (state.pressure - state.episode_start_pressure)
          << ",\"max_pending_debt_ratio\":"
-         << state.episode_max_pending_debt_ratio << "}\n";
+         << state.episode_max_pending_debt_ratio
+         << ",\"truncated\":" << (truncated ? "true" : "false")
+         << ",\"phase\":\"" << phase << "\"}\n";
+}
+
+void CompactionPressureObserver::FlushOpenEpisodes(const char* phase) {
+  if (episode_log_path_.empty()) return;
+  const uint64_t now = NowMicros();
+  std::lock_guard<std::mutex> lock(state_mu_);
+  for (size_t level = 0; level < levels_.size(); ++level) {
+    MutableLevelState& current = levels_[level];
+    if (current.due_since_micros == 0) continue;
+    // Charge the interval since the last score event with the same zero-order
+    // hold Observe() uses, so a censored episode still reports the pressure it
+    // genuinely accumulated.
+    if (now >= current.event_micros) {
+      current.pressure += std::max(0.0, current.score - 1.0) *
+                          static_cast<double>(now - current.event_micros);
+      current.event_micros = now;
+    }
+    ExportCompletedEpisode(static_cast<int>(level), current, now, true, phase);
+    // Re-open rather than close. The level is still due; leaving
+    // due_since_micros at zero would make the eventual due->healthy export hit
+    // its own guard and silently drop the following episode too.
+    current.due_since_micros = now;
+    current.episode_start_pressure = current.pressure;
+    current.episode_max_score = current.score;
+    current.episode_max_pending_debt_ratio = 0.0;
+  }
+}
+
+void CompactionPressureObserver::FlushAllOpenEpisodes(const char* phase) {
+  std::lock_guard<std::mutex> lock(RegistryMutex());
+  for (CompactionPressureObserver* observer : Registry()) {
+    observer->FlushOpenEpisodes(phase);
+  }
 }
 
 uint64_t CompactionPressureObserver::NowMicros() {
@@ -90,6 +160,7 @@ void CompactionPressureObserver::Observe(const VersionStorageInfo* vstorage,
                                          uint64_t now_micros) {
   if (vstorage == nullptr) return;
   if (now_micros == 0) now_micros = NowMicros();
+  std::lock_guard<std::mutex> state_lock(state_mu_);
 
   std::vector<double> new_scores(levels_.size(), 0.0);
   const int max_rank = std::min(vstorage->MaxInputLevel(),
@@ -128,7 +199,8 @@ void CompactionPressureObserver::Observe(const VersionStorageInfo* vstorage,
       current.episode_max_score = new_scores[level];
       current.episode_max_pending_debt_ratio = pending_debt_ratio;
     } else if (was_due && !is_due) {
-      ExportCompletedEpisode(static_cast<int>(level), current, now_micros);
+      ExportCompletedEpisode(static_cast<int>(level), current, now_micros,
+                             false, "workload");
       current.due_since_micros = 0;
       current.episode_start_pressure = current.pressure;
       current.episode_max_score = 0.0;
