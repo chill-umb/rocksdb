@@ -20,6 +20,7 @@ namespace ROCKSDB_NAMESPACE {
 class CompactionPressureView;
 class RLControlHandle;
 class RLSafetyController;
+struct RLSLOBreachState;
 
 // Trigger-only leveled picker. Each response atomically opens or closes a
 // per-level trigger gate for one control interval. RocksDB's native leveled
@@ -129,6 +130,25 @@ class RLCompactionPicker : public LevelCompactionPicker {
     uint64_t retry_generation = 0;
   };
 
+  struct SafetyLevelEvaluation {
+    bool observed = false;
+    bool due = false;
+    bool revoke_optional = false;
+    bool force = false;
+    ActionReason force_reason = ActionReason::kBudget;
+  };
+
+  struct SafetyFrameEvaluation {
+    uint64_t now_micros = 0;
+    bool guard_ready = false;
+    bool dirty_deadline_miss = false;
+    bool slo_force_due = false;
+    bool prohibit_optional = false;
+    bool would_invalidate_frame = false;
+    uint64_t reason_mask = 0;
+    SafetyLevelEvaluation levels[kMaxRLLevels];
+  };
+
   struct RLStructuralLevel {
     int level = 0;
     int files = 0;
@@ -191,8 +211,13 @@ class RLCompactionPicker : public LevelCompactionPicker {
   double safety_debt_ratio_cap_;
   uint64_t structural_dirty_deadline_micros_;
   std::unique_ptr<RLSafetyController> slo_safety_;
+  std::string experiment_fingerprint_;
   std::string trigger_trace_path_;
   mutable std::ofstream trigger_trace_;
+  std::string latency_window_log_path_;
+  mutable std::ofstream latency_window_log_;
+  std::string safety_shadow_log_path_;
+  mutable std::ofstream safety_shadow_log_;
 
   // Immutable structural cache. It is built while DBImpl holds its mutex;
   // network I/O, overlay construction, and learning remain on worker_.
@@ -229,6 +254,8 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<uint64_t> blocked_windows_{0};
   mutable std::atomic<uint64_t> scheduling_wakes_{0};
   mutable std::atomic<uint64_t> slo_masked_windows_{0};
+  mutable std::atomic<uint64_t> safety_would_override_windows_{0};
+  mutable std::atomic<uint64_t> safety_applied_override_windows_{0};
   mutable std::atomic<uint64_t> dirty_deadline_misses_{0};
   mutable std::atomic<bool> dirty_deadline_active_{false};
   mutable std::atomic<bool> slo_read_breach_{false};
@@ -357,8 +384,18 @@ class RLCompactionPicker : public LevelCompactionPicker {
   bool DebtRatioBreach(uint64_t pending_compaction_bytes) const;
   void CheckPressureDivergence(const VersionStorageInfo* vstorage) const;
   void RecordEpsilonSample(uint64_t admission_micros) const;
-  void EvaluateWorkerSafety(const RLStateV2& state);
+  SafetyFrameEvaluation ClassifyWorkerSafety(
+      const RLStateV2& state, const RLSLOBreachState& slo,
+      bool dirty_deadline_miss, uint64_t now_micros) const;
+  bool ApplyWorkerSafety(const RLStateV2& state,
+                         const SafetyFrameEvaluation& evaluation);
+  void EvaluateWorkerSafety(const RLStateV2& state, bool actuate);
   void TraceControlState(const RLStateV2& state) const;
+  void TraceLatencyWindow(
+      const RLCompactionTelemetrySnapshot& telemetry) const;
+  void TraceSafetyShadow(const RLStateV2& state,
+                         const SafetyFrameEvaluation& evaluation,
+                         bool actuate, bool intervention_applied) const;
   bool StructuralDirtyDeadlineMiss(uint64_t now_micros) const;
   bool HasMaintenanceWork(const VersionStorageInfo* vstorage) const;
 

@@ -131,7 +131,12 @@ std::unique_ptr<RLSafetyController> RLSafetyController::Load(
     controller->invalid_ = true;
     return controller;
   }
-  controller->calibrated_ = true;
+  if (manifest_required && !controller->calibrated_) {
+    controller->invalid_ = true;
+    if (error != nullptr) {
+      *error = "baseline SLO live guard is not calibrated";
+    }
+  }
   return controller;
 }
 
@@ -144,30 +149,26 @@ bool RLSafetyController::Parse(const std::string& json,
   uint64_t rolling = 0;
   uint64_t enter = 0;
   uint64_t exit = 0;
-  if (!UintField(json, "schema_version", &schema) || schema != 1 ||
+  bool guard_calibrated = false;
+  std::string p95_method;
+  if (!UintField(json, "schema_version", &schema) || schema != 2 ||
       !StringField(json, "metric_definitions_version", &definitions) ||
-      definitions != "trigger-v2-logical-v1" ||
+      definitions != "trigger-v2-logical-v2" ||
       !StringField(json, "experiment_fingerprint", &manifest_fingerprint) ||
       fingerprint.empty() || manifest_fingerprint != fingerprint ||
-      !UintField(json, "minimum_samples", &minimum_samples_) ||
-      !UintField(json, "rolling_window_count", &rolling) ||
-      !UintField(json, "hysteresis_enter_windows", &enter) ||
-      !UintField(json, "hysteresis_exit_windows", &exit) ||
+      !BoolField(json, "guard_calibrated", &guard_calibrated) ||
+      !UintField(json, "guard_minimum_samples", &minimum_samples_) ||
+      !UintField(json, "guard_rolling_window_count", &rolling) ||
+      !UintField(json, "guard_hysteresis_enter_windows", &enter) ||
+      !UintField(json, "guard_hysteresis_exit_windows", &exit) ||
+      !StringField(json, "guard_p95_method", &p95_method) ||
+      p95_method != "merged_log2_histogram" ||
       !UintField(json, "allowed_physical_sst_bytes",
                  &physical_sst_bytes_limit_) ||
       !NumberField(json, "allowed_pending_debt_ratio",
                    &pending_debt_ratio_limit_) ||
-      !NumberField(json, "get_latency_avg_ns_limit", &get_avg_limit_ns_) ||
-      !UintField(json, "get_latency_p95_ns_limit", &get_p95_limit_ns_) ||
-      !NumberField(json, "scan_latency_avg_ns_limit", &scan_avg_limit_ns_) ||
-      !UintField(json, "scan_latency_p95_ns_limit", &scan_p95_limit_ns_) ||
-      !NumberField(json, "write_latency_avg_ns_limit", &write_avg_limit_ns_) ||
-      !UintField(json, "write_latency_p95_ns_limit", &write_p95_limit_ns_) ||
       minimum_samples_ == 0 || rolling == 0 || enter == 0 || exit == 0 ||
-      physical_sst_bytes_limit_ == 0 || pending_debt_ratio_limit_ <= 0.0 ||
-      get_avg_limit_ns_ <= 0.0 || get_p95_limit_ns_ == 0 ||
-      scan_avg_limit_ns_ <= 0.0 || scan_p95_limit_ns_ == 0 ||
-      write_avg_limit_ns_ <= 0.0 || write_p95_limit_ns_ == 0) {
+      physical_sst_bytes_limit_ == 0 || pending_debt_ratio_limit_ <= 0.0) {
     if (error != nullptr) {
       *error = "baseline SLO schema, fingerprint, or required limits mismatch";
     }
@@ -176,6 +177,26 @@ bool RLSafetyController::Parse(const std::string& json,
   rolling_window_count_ = static_cast<size_t>(rolling);
   enter_windows_ = static_cast<int>(enter);
   exit_windows_ = static_cast<int>(exit);
+  calibrated_ = guard_calibrated;
+  if (calibrated_ &&
+      (!NumberField(json, "guard_get_latency_avg_ns_limit",
+                    &get_avg_limit_ns_) ||
+       !UintField(json, "guard_get_latency_p95_ns_limit",
+                  &get_p95_limit_ns_) ||
+       !NumberField(json, "guard_scan_latency_avg_ns_limit",
+                    &scan_avg_limit_ns_) ||
+       !UintField(json, "guard_scan_latency_p95_ns_limit",
+                  &scan_p95_limit_ns_) ||
+       !NumberField(json, "guard_write_latency_avg_ns_limit",
+                    &write_avg_limit_ns_) ||
+       !UintField(json, "guard_write_latency_p95_ns_limit",
+                  &write_p95_limit_ns_) ||
+       get_avg_limit_ns_ <= 0.0 || get_p95_limit_ns_ == 0 ||
+       scan_avg_limit_ns_ <= 0.0 || scan_p95_limit_ns_ == 0 ||
+       write_avg_limit_ns_ <= 0.0 || write_p95_limit_ns_ == 0)) {
+    if (error != nullptr) *error = "invalid calibrated live-guard limits";
+    return false;
+  }
 
   for (const std::string& object : ArrayObjects(json, "level_limits")) {
     uint64_t level = 0;
@@ -228,24 +249,33 @@ void RLSafetyController::UpdateHysteresis(bool classifiable, bool above,
 
 bool RLSafetyController::UpdateLatency(
     std::deque<LatencySample>* samples, Hysteresis* hysteresis,
-    uint64_t count, double avg_ns, uint64_t p95_ns, double avg_limit_ns,
-    uint64_t p95_limit_ns, uint64_t* sample_count) {
-  samples->push_back({count, avg_ns * static_cast<double>(count), p95_ns});
+    uint64_t count, double avg_ns, const RLLatencyHistogram& buckets,
+    double avg_limit_ns, uint64_t p95_limit_ns, uint64_t* sample_count,
+    bool* classifiable, double* rolling_average_ns,
+    uint64_t* rolling_p95_ns) {
+  samples->push_back({count, avg_ns * static_cast<double>(count), buckets});
   while (samples->size() > rolling_window_count_) samples->pop_front();
   uint64_t total_count = 0;
   double total_sum = 0.0;
-  uint64_t conservative_p95 = 0;
+  RLLatencyHistogram merged{};
   for (const LatencySample& sample : *samples) {
     total_count += sample.count;
     total_sum += sample.sum_ns;
-    conservative_p95 = std::max(conservative_p95, sample.p95_ns);
+    for (size_t bucket = 0; bucket < merged.size(); ++bucket) {
+      merged[bucket] += sample.buckets[bucket];
+    }
   }
-  *sample_count = total_count;
-  const bool classifiable = total_count >= minimum_samples_;
+  const uint64_t histogram_count = RLLatencyHistogramCount(merged);
+  *sample_count = std::min(total_count, histogram_count);
+  *classifiable = total_count >= minimum_samples_ &&
+                  histogram_count >= minimum_samples_;
   const double average =
       total_count == 0 ? 0.0 : total_sum / static_cast<double>(total_count);
-  UpdateHysteresis(classifiable,
-                   average > avg_limit_ns || conservative_p95 > p95_limit_ns,
+  const uint64_t p95 = RLLatencyP95(merged);
+  *rolling_average_ns = average;
+  *rolling_p95_ns = p95;
+  UpdateHysteresis(*classifiable,
+                   average > avg_limit_ns || p95 > p95_limit_ns,
                    hysteresis);
   return hysteresis->breached;
 }
@@ -256,17 +286,23 @@ RLSLOBreachState RLSafetyController::Update(const RLStateV2& state) {
   if (!calibrated_) return result;
   const bool get = UpdateLatency(
       &get_samples_, &get_hysteresis_, state.get_latency_count,
-      state.get_latency_avg_ns, state.get_latency_p95_ns, get_avg_limit_ns_,
-      get_p95_limit_ns_, &result.get_samples);
+      state.get_latency_avg_ns, state.get_latency_buckets, get_avg_limit_ns_,
+      get_p95_limit_ns_, &result.get_samples, &result.get_classifiable,
+      &result.get_average_ns, &result.get_p95_ns);
   const bool scan = UpdateLatency(
       &scan_samples_, &scan_hysteresis_, state.scan_latency_count,
-      state.scan_latency_avg_ns, state.scan_latency_p95_ns,
-      scan_avg_limit_ns_, scan_p95_limit_ns_, &result.scan_samples);
+      state.scan_latency_avg_ns, state.scan_latency_buckets, scan_avg_limit_ns_,
+      scan_p95_limit_ns_, &result.scan_samples, &result.scan_classifiable,
+      &result.scan_average_ns, &result.scan_p95_ns);
   result.write = UpdateLatency(
       &write_samples_, &write_hysteresis_, state.write_latency_count,
-      state.write_latency_avg_ns, state.write_latency_p95_ns,
-      write_avg_limit_ns_, write_p95_limit_ns_, &result.write_samples);
+      state.write_latency_avg_ns, state.write_latency_buckets,
+      write_avg_limit_ns_, write_p95_limit_ns_, &result.write_samples,
+      &result.write_classifiable, &result.write_average_ns,
+      &result.write_p95_ns);
   result.read = get || scan;
+  result.guard_ready = result.get_classifiable && result.scan_classifiable &&
+                       result.write_classifiable;
   const bool space_above = state.physical_sst_bytes > physical_sst_bytes_limit_;
   UpdateHysteresis(true, space_above, &space_hysteresis_);
   result.space = space_hysteresis_.breached;

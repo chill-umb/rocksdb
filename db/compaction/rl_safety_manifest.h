@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "db/compaction/rl_latency_histogram.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -28,9 +29,19 @@ struct RLSLOBreachState {
   bool write = false;
   bool space = false;
   bool simultaneous_read_write = false;
+  bool guard_ready = false;
+  bool get_classifiable = false;
+  bool scan_classifiable = false;
+  bool write_classifiable = false;
   uint64_t get_samples = 0;
   uint64_t scan_samples = 0;
   uint64_t write_samples = 0;
+  double get_average_ns = 0.0;
+  double scan_average_ns = 0.0;
+  double write_average_ns = 0.0;
+  uint64_t get_p95_ns = 0;
+  uint64_t scan_p95_ns = 0;
+  uint64_t write_p95_ns = 0;
 };
 
 // Validates the workload-specific baseline manifest and applies its rolling
@@ -58,7 +69,7 @@ class RLSafetyController {
   struct LatencySample {
     uint64_t count = 0;
     double sum_ns = 0.0;
-    uint64_t p95_ns = 0;
+    RLLatencyHistogram buckets{};
   };
   struct Hysteresis {
     bool breached = false;
@@ -71,8 +82,10 @@ class RLSafetyController {
              std::string* error);
   bool UpdateLatency(std::deque<LatencySample>* samples,
                      Hysteresis* hysteresis, uint64_t count, double avg_ns,
-                     uint64_t p95_ns, double avg_limit_ns,
-                     uint64_t p95_limit_ns, uint64_t* sample_count);
+                     const RLLatencyHistogram& buckets, double avg_limit_ns,
+                     uint64_t p95_limit_ns, uint64_t* sample_count,
+                     bool* classifiable, double* rolling_average_ns,
+                     uint64_t* rolling_p95_ns);
   void UpdateHysteresis(bool classifiable, bool above, Hysteresis* state);
 
   bool calibrated_ = false;

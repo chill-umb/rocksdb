@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "db/compaction/rl_latency_histogram.h"
 #include "rocksdb/rocksdb_namespace.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -156,6 +157,12 @@ struct RLStateV2 {
   uint64_t write_latency_count = 0;
   double write_latency_avg_ns = 0.0;
   uint64_t write_latency_p95_ns = 0;
+  // Internal safety inputs. The socket serializer deliberately continues to
+  // send only count/average/p95 to Python; the bucket arrays are used by the
+  // in-process live guard and optional compact calibration log.
+  RLLatencyHistogram get_latency_buckets{};
+  RLLatencyHistogram scan_latency_buckets{};
+  RLLatencyHistogram write_latency_buckets{};
   bool done = false;
   std::vector<RLLevelState> levels;
 };

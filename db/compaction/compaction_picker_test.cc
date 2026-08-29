@@ -3,6 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <fstream>
 #include <limits>
 #include <string>
 #include <utility>
@@ -441,11 +442,12 @@ class RLCompactionPickerTestPeer {
     return picker->dirty_deadline_misses_.load(std::memory_order_relaxed);
   }
 
-  static std::unique_ptr<RLSafetyController> MakeSafetyController() {
+  static std::unique_ptr<RLSafetyController> MakeSafetyController(
+      size_t rolling_windows = 1) {
     std::unique_ptr<RLSafetyController> controller(new RLSafetyController());
     controller->calibrated_ = true;
     controller->minimum_samples_ = 2;
-    controller->rolling_window_count_ = 1;
+    controller->rolling_window_count_ = rolling_windows;
     controller->enter_windows_ = 3;
     controller->exit_windows_ = 3;
     controller->physical_sst_bytes_limit_ = 100;
@@ -461,12 +463,26 @@ class RLCompactionPickerTestPeer {
 
   static void EvaluateSafety(RLCompactionPicker* picker,
                              const RLStateV2& state) {
-    picker->EvaluateWorkerSafety(state);
+    picker->EvaluateWorkerSafety(state, /*actuate=*/true);
   }
 
   static int PermitModeValue(RLCompactionPicker* picker, int level) {
     std::lock_guard<std::mutex> lock(picker->permit_mu_);
     return static_cast<int>(picker->permits_[level].mode);
+  }
+
+  static void SetSafetyEnabled(RLCompactionPicker* picker, bool enabled) {
+    picker->safety_enabled_ = enabled;
+  }
+
+  static uint64_t SafetyWouldOverrideWindows(RLCompactionPicker* picker) {
+    return picker->safety_would_override_windows_.load(
+        std::memory_order_relaxed);
+  }
+
+  static uint64_t SafetyAppliedOverrideWindows(RLCompactionPicker* picker) {
+    return picker->safety_applied_override_windows_.load(
+        std::memory_order_relaxed);
   }
 };
 
@@ -608,6 +624,50 @@ TEST_F(CompactionPickerTest, RLSafetyManifestRequirementFailsConservatively) {
   ASSERT_TRUE(required->invalid());
 }
 
+TEST_F(CompactionPickerTest, RLSafetyManifestV2RequiresCalibratedGuard) {
+  const std::string path = test::PerThreadDBPath("rl_safety_manifest_v2.json");
+  const std::string prefix = R"json({
+    "schema_version":2,
+    "metric_definitions_version":"trigger-v2-logical-v2",
+    "experiment_fingerprint":"fp",
+    "guard_minimum_samples":2,
+    "guard_rolling_window_count":1,
+    "guard_hysteresis_enter_windows":3,
+    "guard_hysteresis_exit_windows":3,
+    "guard_p95_method":"merged_log2_histogram",
+    "allowed_physical_sst_bytes":100,
+    "allowed_pending_debt_ratio":0.5,
+    "level_limits":[{"level":0,"calibrated":true,
+      "due_age_limit_micros":1,"pressure_limit_score_micros":1.0,
+      "score_limit":1.0}],
+  )json";
+  {
+    std::ofstream output(path);
+    output << prefix << R"json("guard_calibrated":false})json";
+  }
+  std::string error;
+  std::unique_ptr<RLSafetyController> provisional = RLSafetyController::Load(
+      path, "fp", /*manifest_required=*/true, &error);
+  ASSERT_TRUE(provisional->invalid());
+
+  {
+    std::ofstream output(path);
+    output << prefix << R"json(
+      "guard_calibrated":true,
+      "guard_get_latency_avg_ns_limit":100.0,
+      "guard_get_latency_p95_ns_limit":200,
+      "guard_scan_latency_avg_ns_limit":100.0,
+      "guard_scan_latency_p95_ns_limit":200,
+      "guard_write_latency_avg_ns_limit":100.0,
+      "guard_write_latency_p95_ns_limit":200})json";
+  }
+  std::unique_ptr<RLSafetyController> calibrated = RLSafetyController::Load(
+      path, "fp", /*manifest_required=*/true, &error);
+  ASSERT_FALSE(calibrated->invalid()) << error;
+  ASSERT_TRUE(calibrated->calibrated());
+  ASSERT_OK(Env::Default()->DeleteFile(path));
+}
+
 TEST_F(CompactionPickerTest, RLSafetyUsesSamplesAndThreeWindowHysteresis) {
   std::unique_ptr<RLSafetyController> controller =
       RLCompactionPickerTestPeer::MakeSafetyController();
@@ -615,6 +675,7 @@ TEST_F(CompactionPickerTest, RLSafetyUsesSamplesAndThreeWindowHysteresis) {
   state.get_latency_count = 2;
   state.get_latency_avg_ns = 101.0;
   state.get_latency_p95_ns = 201;
+  state.get_latency_buckets[6] = 2;  // [64, 127] ns
   state.physical_sst_bytes = 101;
   ASSERT_FALSE(controller->Update(state).read);
   ASSERT_FALSE(controller->Update(state).read);
@@ -630,6 +691,51 @@ TEST_F(CompactionPickerTest, RLSafetyUsesSamplesAndThreeWindowHysteresis) {
   RLSLOBreachState recovered = controller->Update(state);
   ASSERT_FALSE(recovered.read);
   ASSERT_FALSE(recovered.space);
+}
+
+TEST_F(CompactionPickerTest, RLSafetyP95UsesMergedRollingHistogram) {
+  std::unique_ptr<RLSafetyController> controller =
+      RLCompactionPickerTestPeer::MakeSafetyController(/*rolling_windows=*/2);
+  RLStateV2 state;
+  state.get_latency_count = 10;
+  state.get_latency_avg_ns = 50.0;
+  state.get_latency_buckets[10] = 10;
+  RLSLOBreachState first = controller->Update(state);
+  ASSERT_EQ(first.get_p95_ns, RLLatencyBucketUpperBound(10));
+
+  state.get_latency_count = 190;
+  state.get_latency_avg_ns = 50.0;
+  state.get_latency_buckets.fill(0);
+  state.get_latency_buckets[5] = 190;
+  RLSLOBreachState merged = controller->Update(state);
+  // The ten slow samples are exactly five percent of the combined population;
+  // the merged p95 is therefore in bucket 5, not max(interval p95)=bucket 10.
+  ASSERT_EQ(merged.get_p95_ns, RLLatencyBucketUpperBound(5));
+}
+
+TEST_F(CompactionPickerTest, RLLatencyTelemetryPreservesAndResetsBuckets) {
+  RLCompactionTelemetry& telemetry = RLCompactionTelemetry::Get();
+  telemetry.Consume();
+  telemetry.RecordForegroundOperation(
+      RLCompactionTelemetry::ForegroundOperation::kGet, 8);
+  telemetry.RecordForegroundOperation(
+      RLCompactionTelemetry::ForegroundOperation::kGet, 16);
+
+  RLCompactionTelemetrySnapshot snapshot = telemetry.Snapshot();
+  ASSERT_EQ(snapshot.foreground_count[0], 2U);
+  ASSERT_EQ(snapshot.foreground_latency_sum_ns[0], 24U);
+  ASSERT_EQ(RLLatencyHistogramCount(snapshot.foreground_latency_buckets[0]),
+            2U);
+  ASSERT_EQ(snapshot.foreground_latency_p95_ns[0],
+            RLLatencyBucketUpperBound(4));
+
+  snapshot = telemetry.Consume();
+  ASSERT_EQ(RLLatencyHistogramCount(snapshot.foreground_latency_buckets[0]),
+            2U);
+  snapshot = telemetry.Snapshot();
+  ASSERT_EQ(snapshot.foreground_count[0], 0U);
+  ASSERT_EQ(RLLatencyHistogramCount(snapshot.foreground_latency_buckets[0]),
+            0U);
 }
 
 TEST_F(CompactionPickerTest, RLL0SlowdownOpensDueSupportingLevels) {
@@ -650,6 +756,25 @@ TEST_F(CompactionPickerTest, RLL0SlowdownOpensDueSupportingLevels) {
   RLCompactionPickerTestPeer::EvaluateSafety(&picker, state);
   ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 0), 3);
   ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 3);
+}
+
+TEST_F(CompactionPickerTest, RLSafetyShadowClassificationDoesNotMutatePermits) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::SetSafetyEnabled(&picker, false);
+  RLStateV2 state;
+  state.live_logical_bytes = 1000;
+  RLLevelState l0;
+  l0.level = 0;
+  l0.files = 20;
+  l0.score = 5.0;
+  state.levels.push_back(l0);
+
+  RLCompactionPickerTestPeer::EvaluateSafety(&picker, state);
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 0), 0);
+  ASSERT_EQ(RLCompactionPickerTestPeer::SafetyWouldOverrideWindows(&picker),
+            1U);
+  ASSERT_EQ(RLCompactionPickerTestPeer::SafetyAppliedOverrideWindows(&picker),
+            0U);
 }
 
 TEST_F(CompactionPickerTest, RLDirtyStructuralDeadlineIsEdgeCounted) {

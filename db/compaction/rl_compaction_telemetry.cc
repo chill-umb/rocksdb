@@ -1,7 +1,6 @@
 #include "db/compaction/rl_compaction_telemetry.h"
 
 #include <chrono>
-#include <limits>
 
 #include "db/compaction/compaction_pressure_observer.h"
 
@@ -15,10 +14,6 @@ uint64_t NowMicros() {
           .count());
 }
 
-uint64_t LatencyBucketUpperBound(int bucket) {
-  return bucket >= 63 ? std::numeric_limits<uint64_t>::max()
-                      : (1ULL << (bucket + 1)) - 1;
-}
 }  // namespace
 
 namespace {
@@ -144,7 +139,8 @@ void RLCompactionTelemetry::RecordForegroundOperation(
                                               std::memory_order_relaxed);
   int bucket = 0;
   uint64_t value = latency_ns;
-  while (value > 1 && bucket + 1 < kLatencyBuckets) {
+  while (value > 1 &&
+         bucket + 1 < static_cast<int>(kRLLatencyBucketCount)) {
     value >>= 1;
     ++bucket;
   }
@@ -200,13 +196,15 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Snapshot() const {
         foreground_latency_sum_ns_[op].load(std::memory_order_acquire);
     const uint64_t rank = (snapshot.foreground_count[op] * 95 + 99) / 100;
     uint64_t seen = 0;
-    for (int bucket = 0; bucket < kLatencyBuckets; ++bucket) {
-      seen += foreground_latency_buckets_[op][bucket].load(
-          std::memory_order_acquire);
-      if (rank != 0 && seen >= rank) {
+    for (size_t bucket = 0; bucket < kRLLatencyBucketCount; ++bucket) {
+      snapshot.foreground_latency_buckets[op][bucket] =
+          foreground_latency_buckets_[op][bucket].load(
+              std::memory_order_acquire);
+      seen += snapshot.foreground_latency_buckets[op][bucket];
+      if (snapshot.foreground_latency_p95_ns[op] == 0 && rank != 0 &&
+          seen >= rank) {
         snapshot.foreground_latency_p95_ns[op] =
-            LatencyBucketUpperBound(bucket);
-        break;
+            RLLatencyBucketUpperBound(bucket);
       }
     }
   }
@@ -286,13 +284,15 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Consume() {
         foreground_latency_sum_ns_[op].exchange(0, std::memory_order_acq_rel);
     const uint64_t rank = (snapshot.foreground_count[op] * 95 + 99) / 100;
     uint64_t seen = 0;
-    for (int bucket = 0; bucket < kLatencyBuckets; ++bucket) {
-      seen += foreground_latency_buckets_[op][bucket].exchange(
-          0, std::memory_order_acq_rel);
+    for (size_t bucket = 0; bucket < kRLLatencyBucketCount; ++bucket) {
+      snapshot.foreground_latency_buckets[op][bucket] =
+          foreground_latency_buckets_[op][bucket].exchange(
+              0, std::memory_order_acq_rel);
+      seen += snapshot.foreground_latency_buckets[op][bucket];
       if (snapshot.foreground_latency_p95_ns[op] == 0 && rank != 0 &&
           seen >= rank) {
         snapshot.foreground_latency_p95_ns[op] =
-            LatencyBucketUpperBound(bucket);
+            RLLatencyBucketUpperBound(bucket);
       }
     }
   }

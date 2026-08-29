@@ -70,6 +70,33 @@ void UpdateMaximum(std::atomic<uint64_t>* maximum, uint64_t value) {
   }
 }
 
+void WriteJSONString(std::ostream& output, const std::string& value) {
+  output << '"';
+  for (unsigned char character : value) {
+    switch (character) {
+      case '"':
+        output << "\\\"";
+        break;
+      case '\\':
+        output << "\\\\";
+        break;
+      case '\n':
+        output << "\\n";
+        break;
+      case '\r':
+        output << "\\r";
+        break;
+      case '\t':
+        output << "\\t";
+        break;
+      default:
+        output << static_cast<char>(character);
+        break;
+    }
+  }
+  output << '"';
+}
+
 }  // namespace
 
 RLCompactionPicker::RLCompactionPicker(const ImmutableOptions& ioptions,
@@ -113,14 +140,25 @@ RLCompactionPicker::RLCompactionPicker(const ImmutableOptions& ioptions,
         "%d ms instead of RL_OBSERVE_INTERVAL_MS=%d",
         decision_interval_ms_, requested_observe_interval);
   }
+  experiment_fingerprint_ = EnvString("RL_EXPERIMENT_FINGERPRINT");
   trigger_trace_path_ = EnvString("RL_TRIGGER_TRACE_PATH");
   if (!trigger_trace_path_.empty()) {
     trigger_trace_.open(trigger_trace_path_, std::ios::out | std::ios::app);
   }
+  latency_window_log_path_ = EnvString("RL_LATENCY_WINDOW_LOG");
+  if (!latency_window_log_path_.empty()) {
+    latency_window_log_.open(latency_window_log_path_,
+                             std::ios::out | std::ios::app);
+  }
+  safety_shadow_log_path_ = EnvString("RL_SAFETY_SHADOW_LOG");
+  if (!safety_shadow_log_path_.empty()) {
+    safety_shadow_log_.open(safety_shadow_log_path_,
+                            std::ios::out | std::ios::app);
+  }
   std::string manifest_error;
   slo_safety_ = RLSafetyController::Load(
       EnvString("RL_BASELINE_SLO_PATH"),
-      EnvString("RL_EXPERIMENT_FINGERPRINT"),
+      experiment_fingerprint_,
       EnvBool("RL_REQUIRE_BASELINE_SLO", false), &manifest_error);
   if (slo_safety_->invalid()) {
     slo_manifest_invalid_.store(true, std::memory_order_relaxed);
@@ -1140,9 +1178,146 @@ void RLCompactionPicker::RecordEpsilonSample(uint64_t admission_micros) const {
   }
 }
 
-void RLCompactionPicker::EvaluateWorkerSafety(const RLStateV2& state) {
+RLCompactionPicker::SafetyFrameEvaluation
+RLCompactionPicker::ClassifyWorkerSafety(
+    const RLStateV2& state, const RLSLOBreachState& slo,
+    bool dirty_deadline_miss, uint64_t now_micros) const {
+  SafetyFrameEvaluation evaluation{};
+  evaluation.now_micros = now_micros;
+  evaluation.guard_ready = slo.guard_ready && !slo.manifest_invalid;
+  evaluation.dirty_deadline_miss = dirty_deadline_miss;
+  const bool global_debt_breach =
+      state.live_logical_bytes > 0 &&
+      DebtRatioBreach(state.pending_compaction_bytes);
+  evaluation.slo_force_due =
+      slo.manifest_invalid || slo.read || slo.space ||
+      slo.simultaneous_read_write || dirty_deadline_miss;
+  evaluation.prohibit_optional =
+      slo.manifest_invalid || slo.write || dirty_deadline_miss;
+  const bool l0_slowdown = !state.levels.empty() &&
+      state.levels.front().level == 0 &&
+      state.levels.front().files >=
+          rl_l0_slowdown_trigger_.load(std::memory_order_relaxed);
+
+  std::lock_guard<std::mutex> lock(permit_mu_);
+  for (const RLLevelState& observed : state.levels) {
+    const int level = observed.level;
+    if (level < 0 || level >= kMaxRLLevels) continue;
+    const LevelPermit& permit = permits_[level];
+    SafetyLevelEvaluation& item = evaluation.levels[level];
+    item.observed = true;
+    item.due = observed.score >= 1.0;
+    item.revoke_optional = evaluation.prohibit_optional &&
+                           permit.mode == PermitMode::kOptionalOpen;
+    uint64_t due_age_limit = safety_due_age_micros_;
+    double pressure_limit = safety_pressure_score_micros_;
+    double score_limit = safety_score_cap_;
+    if (const RLSafetyLevelLimit* limit = slo_safety_->LevelLimit(level)) {
+      due_age_limit = limit->due_age_limit_micros;
+      pressure_limit = limit->pressure_limit_score_micros;
+      score_limit = limit->score_limit;
+    }
+    item.force =
+        item.due &&
+        (observed.due_age_micros >= due_age_limit ||
+         observed.pressure_score_micros >= pressure_limit ||
+         observed.score >= score_limit || global_debt_breach ||
+         evaluation.slo_force_due || l0_slowdown);
+    if (slo.manifest_invalid) {
+      item.force_reason = ActionReason::kManifest;
+    } else if (dirty_deadline_miss) {
+      item.force_reason = ActionReason::kStaleStructure;
+    } else if (evaluation.slo_force_due) {
+      item.force_reason = ActionReason::kSLO;
+    } else if (level == 0 &&
+               observed.files >= rl_l0_stop_trigger_.load(
+                                     std::memory_order_relaxed)) {
+      item.force_reason = ActionReason::kEmergency;
+    }
+    if (item.revoke_optional || item.force) {
+      evaluation.would_invalidate_frame = true;
+      const ActionReason reason =
+          item.force ? item.force_reason : ActionReason::kSLO;
+      evaluation.reason_mask |=
+          1ULL << static_cast<unsigned int>(reason);
+    }
+  }
+  return evaluation;
+}
+
+bool RLCompactionPicker::ApplyWorkerSafety(
+    const RLStateV2& state, const SafetyFrameEvaluation& evaluation) {
   std::vector<SchedulingToken> wake_tokens;
   bool tree_transition_overridden = false;
+  {
+    std::lock_guard<std::mutex> lock(permit_mu_);
+    for (const RLLevelState& observed : state.levels) {
+      const int level = observed.level;
+      if (level < 0 || level >= kMaxRLLevels) continue;
+      const SafetyLevelEvaluation& item = evaluation.levels[level];
+      LevelPermit& permit = permits_[level];
+      if (item.revoke_optional) {
+        permit = LevelPermit();
+        permit.eligibility_generation = ++next_eligibility_generation_;
+        last_transition_valid_[level].store(false,
+                                             std::memory_order_relaxed);
+        tree_transition_overridden = true;
+      }
+      if (item.force) {
+        const bool new_force_interval =
+            permit.mode != PermitMode::kForcedOpen ||
+            permit.reason != item.force_reason;
+        if (new_force_interval) {
+          permit.eligibility_generation = ++next_eligibility_generation_;
+          permit.consecutive_blocked = 0;
+          permit.backoff_until_micros = 0;
+          permit.retry_generation = 0;
+          permit.eligibility_opened_micros = evaluation.now_micros;
+          permit.first_schedule_micros = 0;
+          wake_tokens.push_back(
+              {permit.eligibility_generation, permit.retry_generation});
+        }
+        permit.action = PolicyAction::kCompact;
+        permit.mode = PermitMode::kForcedOpen;
+        permit.reason = item.force_reason;
+        permit.optional_token_available = false;
+        permit.transition_valid = false;
+        permit.installed_micros = evaluation.now_micros;
+        last_action_overridden_[level].store(true,
+                                             std::memory_order_relaxed);
+        last_override_reason_[level].store(static_cast<int>(permit.reason),
+                                           std::memory_order_relaxed);
+        last_transition_valid_[level].store(false,
+                                             std::memory_order_relaxed);
+        tree_transition_overridden = true;
+      } else if (permit.mode == PermitMode::kForcedOpen &&
+                 ((!item.due &&
+                   (permit.reason == ActionReason::kBudget ||
+                    permit.reason == ActionReason::kEmergency)) ||
+                  (permit.reason == ActionReason::kSLO &&
+                   !evaluation.slo_force_due) ||
+                  (permit.reason == ActionReason::kStaleStructure &&
+                   !evaluation.dirty_deadline_miss))) {
+        permit = LevelPermit();
+        permit.eligibility_generation = ++next_eligibility_generation_;
+      }
+    }
+  }
+
+  if (tree_transition_overridden) {
+    for (int level = 0; level < kMaxRLLevels; ++level) {
+      last_transition_valid_[level].store(false, std::memory_order_relaxed);
+    }
+  }
+  for (const SchedulingToken& token : wake_tokens) {
+    RequestScheduling(token, evaluation.now_micros);
+  }
+  return tree_transition_overridden;
+}
+
+void RLCompactionPicker::EvaluateWorkerSafety(const RLStateV2& state,
+                                              bool actuate) {
+  std::vector<SchedulingToken> watchdog_wakes;
   const uint64_t now = NowMicros();
   const RLSLOBreachState slo = slo_safety_->Update(state);
   slo_read_breach_.store(slo.read, std::memory_order_relaxed);
@@ -1166,112 +1341,25 @@ void RLCompactionPicker::EvaluateWorkerSafety(const RLStateV2& state) {
         now - last_response > ResponseWatchdogMicros()) {
       rl_available_.store(false, std::memory_order_release);
       watchdog_expiries_.fetch_add(1, std::memory_order_relaxed);
-      InstallFallbackFrame(state, &wake_tokens);
+      InstallFallbackFrame(state, &watchdog_wakes);
     }
   }
-
-  if (safety_enabled_) {
-    const bool global_debt_breach =
-        state.live_logical_bytes > 0 &&
-        DebtRatioBreach(state.pending_compaction_bytes);
-    const bool slo_force_due =
-        slo.manifest_invalid || slo.read || slo.space ||
-        slo.simultaneous_read_write || dirty_deadline_miss;
-    const bool prohibit_optional =
-        slo.manifest_invalid || slo.write || dirty_deadline_miss;
-    const bool l0_slowdown = !state.levels.empty() &&
-        state.levels.front().level == 0 &&
-        state.levels.front().files >=
-            rl_l0_slowdown_trigger_.load(std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(permit_mu_);
-    for (const RLLevelState& observed : state.levels) {
-      const int level = observed.level;
-      if (level < 0 || level >= kMaxRLLevels) continue;
-      LevelPermit& permit = permits_[level];
-      const bool due = observed.score >= 1.0;
-      uint64_t due_age_limit = safety_due_age_micros_;
-      double pressure_limit = safety_pressure_score_micros_;
-      double score_limit = safety_score_cap_;
-      if (const RLSafetyLevelLimit* limit =
-              slo_safety_->LevelLimit(level)) {
-        due_age_limit = limit->due_age_limit_micros;
-        pressure_limit = limit->pressure_limit_score_micros;
-        score_limit = limit->score_limit;
-      }
-      const bool force =
-          due &&
-          (observed.due_age_micros >= due_age_limit ||
-           observed.pressure_score_micros >= pressure_limit ||
-           observed.score >= score_limit || global_debt_breach ||
-           slo_force_due || l0_slowdown);
-      if (prohibit_optional && permit.mode == PermitMode::kOptionalOpen) {
-        permit = LevelPermit();
-        permit.eligibility_generation = ++next_eligibility_generation_;
-        last_transition_valid_[level].store(false,
-                                             std::memory_order_relaxed);
-        tree_transition_overridden = true;
-      }
-      if (force) {
-        ActionReason force_reason = ActionReason::kBudget;
-        if (slo.manifest_invalid) {
-          force_reason = ActionReason::kManifest;
-        } else if (dirty_deadline_miss) {
-          force_reason = ActionReason::kStaleStructure;
-        } else if (slo_force_due) {
-          force_reason = ActionReason::kSLO;
-        } else if (level == 0 &&
-                   observed.files >= rl_l0_stop_trigger_.load(
-                                         std::memory_order_relaxed)) {
-          force_reason = ActionReason::kEmergency;
-        }
-        const bool new_force_interval =
-            permit.mode != PermitMode::kForcedOpen ||
-            permit.reason != force_reason;
-        if (new_force_interval) {
-          permit.eligibility_generation = ++next_eligibility_generation_;
-          permit.consecutive_blocked = 0;
-          permit.backoff_until_micros = 0;
-          permit.retry_generation = 0;
-          permit.eligibility_opened_micros = now;
-          permit.first_schedule_micros = 0;
-          wake_tokens.push_back(
-              {permit.eligibility_generation, permit.retry_generation});
-        }
-        permit.action = PolicyAction::kCompact;
-        permit.mode = PermitMode::kForcedOpen;
-        permit.reason = force_reason;
-        permit.optional_token_available = false;
-        permit.transition_valid = false;
-        permit.installed_micros = now;
-        last_action_overridden_[level].store(true,
-                                             std::memory_order_relaxed);
-        last_override_reason_[level].store(static_cast<int>(permit.reason),
-                                           std::memory_order_relaxed);
-        last_transition_valid_[level].store(false,
-                                             std::memory_order_relaxed);
-        tree_transition_overridden = true;
-      } else if (permit.mode == PermitMode::kForcedOpen &&
-                  ((!due && (permit.reason == ActionReason::kBudget ||
-                            permit.reason == ActionReason::kEmergency)) ||
-                  (permit.reason == ActionReason::kSLO && !slo_force_due) ||
-                  (permit.reason == ActionReason::kStaleStructure &&
-                   !dirty_deadline_miss))) {
-        permit = LevelPermit();
-        permit.eligibility_generation = ++next_eligibility_generation_;
-      }
-    }
-  }
-
-  if (tree_transition_overridden) {
-    for (int level = 0; level < kMaxRLLevels; ++level) {
-      last_transition_valid_[level].store(false, std::memory_order_relaxed);
-    }
-  }
-
-  // The control queue is called after permit_mu_ has been released.
-  for (const SchedulingToken& token : wake_tokens) {
+  for (const SchedulingToken& token : watchdog_wakes) {
     RequestScheduling(token, now);
   }
+
+  const SafetyFrameEvaluation evaluation =
+      ClassifyWorkerSafety(state, slo, dirty_deadline_miss, now);
+  if (evaluation.would_invalidate_frame) {
+    safety_would_override_windows_.fetch_add(1, std::memory_order_relaxed);
+  }
+  const bool intervention_applied =
+      safety_enabled_ ? ApplyWorkerSafety(state, evaluation) : false;
+  if (intervention_applied) {
+    safety_applied_override_windows_.fetch_add(1,
+                                               std::memory_order_relaxed);
+  }
+  TraceSafetyShadow(state, evaluation, actuate, intervention_applied);
   TraceControlState(state);
 }
 
@@ -1373,6 +1461,56 @@ void RLCompactionPicker::TraceControlState(const RLStateV2& state) const {
   trigger_trace_.flush();
 }
 
+void RLCompactionPicker::TraceLatencyWindow(
+    const RLCompactionTelemetrySnapshot& telemetry) const {
+  if (!latency_window_log_ || telemetry.interval_micros == 0) return;
+  latency_window_log_ << "{\"schema_version\":1,\"experiment_fingerprint\":";
+  WriteJSONString(latency_window_log_, experiment_fingerprint_);
+  latency_window_log_ << ",\"time_micros\":" << NowMicros()
+                      << ",\"interval_micros\":"
+                      << telemetry.interval_micros;
+  const char* names[3] = {"get", "scan", "write"};
+  for (int operation = 0; operation < 3; ++operation) {
+    latency_window_log_ << ",\"" << names[operation]
+                        << "\":{\"count\":"
+                        << telemetry.foreground_count[operation]
+                        << ",\"sum_ns\":"
+                        << telemetry.foreground_latency_sum_ns[operation]
+                        << ",\"buckets\":[";
+    for (size_t bucket = 0; bucket < kRLLatencyBucketCount; ++bucket) {
+      if (bucket != 0) latency_window_log_ << ',';
+      latency_window_log_
+          << telemetry.foreground_latency_buckets[operation][bucket];
+    }
+    latency_window_log_ << "]}";
+  }
+  latency_window_log_ << "}\n";
+  latency_window_log_.flush();
+}
+
+void RLCompactionPicker::TraceSafetyShadow(
+    const RLStateV2& state, const SafetyFrameEvaluation& evaluation,
+    bool actuate, bool intervention_applied) const {
+  if (!safety_shadow_log_ || state.interval_micros == 0) return;
+  safety_shadow_log_ << "{\"schema_version\":1,\"experiment_fingerprint\":";
+  WriteJSONString(safety_shadow_log_, experiment_fingerprint_);
+  safety_shadow_log_ << ",\"time_micros\":" << evaluation.now_micros
+                     << ",\"interval_micros\":" << state.interval_micros
+                     << ",\"guard_ready\":"
+                     << (evaluation.guard_ready ? "true" : "false")
+                     << ",\"actuation_frame\":"
+                     << (actuate ? "true" : "false")
+                     << ",\"would_invalidate_frame\":"
+                     << (evaluation.would_invalidate_frame ? "true" : "false")
+                     << ",\"reason_mask\":" << evaluation.reason_mask
+                     << ",\"observed_levels\":" << state.levels.size()
+                     << ",\"enforcement_enabled\":"
+                     << (safety_enabled_ ? "true" : "false")
+                     << ",\"intervention_applied\":"
+                     << (intervention_applied ? "true" : "false") << "}\n";
+  safety_shadow_log_.flush();
+}
+
 void RLCompactionPicker::PopulateReadStats(RLStateV2& state) {
   Statistics* stats = ioptions_.stats;
   if (stats == nullptr) return;
@@ -1406,6 +1544,7 @@ void RLCompactionPicker::PopulateReadStats(RLStateV2& state) {
 void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
   const RLCompactionTelemetrySnapshot telemetry =
       RLCompactionTelemetry::Get().Consume();
+  TraceLatencyWindow(telemetry);
   state.flushed_bytes = telemetry.flushed_bytes;
   state.compaction_bytes_read = telemetry.compaction_bytes_read;
   state.compaction_bytes_written = telemetry.compaction_bytes_written;
@@ -1425,6 +1564,7 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
           : static_cast<double>(telemetry.foreground_latency_sum_ns[0]) /
                 telemetry.foreground_count[0];
   state.get_latency_p95_ns = telemetry.foreground_latency_p95_ns[0];
+  state.get_latency_buckets = telemetry.foreground_latency_buckets[0];
   state.scan_latency_count = telemetry.foreground_count[1];
   state.scan_latency_avg_ns =
       telemetry.foreground_count[1] == 0
@@ -1432,6 +1572,7 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
           : static_cast<double>(telemetry.foreground_latency_sum_ns[1]) /
                 telemetry.foreground_count[1];
   state.scan_latency_p95_ns = telemetry.foreground_latency_p95_ns[1];
+  state.scan_latency_buckets = telemetry.foreground_latency_buckets[1];
   state.write_latency_count = telemetry.foreground_count[2];
   state.write_latency_avg_ns =
       telemetry.foreground_count[2] == 0
@@ -1439,6 +1580,7 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
           : static_cast<double>(telemetry.foreground_latency_sum_ns[2]) /
                 telemetry.foreground_count[2];
   state.write_latency_p95_ns = telemetry.foreground_latency_p95_ns[2];
+  state.write_latency_buckets = telemetry.foreground_latency_buckets[2];
   state.fallback_count = rl_fallback_count_.load(std::memory_order_relaxed);
   PopulateReadStats(state);
 
@@ -1582,7 +1724,7 @@ void RLCompactionPicker::WorkerLoop() {
     const bool actuate = next_tick >= next_actuation;
     if (actuate) next_actuation = next_tick + actuation_interval;
     RunDecisionCycle(state, actuate);
-    EvaluateWorkerSafety(state);
+    EvaluateWorkerSafety(state, actuate);
     // Close out due episodes that ended without ever being admitted, so the
     // admission-latency histogram has a visible denominator rather than
     // silently describing only the episodes that were served.
@@ -1662,6 +1804,8 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                  " scheduling_wakes=%" PRIu64 " blocked_attempts=%" PRIu64
                  " blocked_windows=%" PRIu64 " watchdog_expiries=%" PRIu64
                  " slo_masked_windows=%" PRIu64
+                 " safety_would_override_windows=%" PRIu64
+                 " safety_applied_override_windows=%" PRIu64
                  " dirty_deadline_misses=%" PRIu64
                  " dirty_deadline_active=%d slo_read=%d slo_write=%d"
                  " slo_space=%d manifest_invalid=%d"
@@ -1694,6 +1838,10 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                  blocked_windows_.load(std::memory_order_relaxed),
                  watchdog_expiries_.load(std::memory_order_relaxed),
                  slo_masked_windows_.load(std::memory_order_relaxed),
+                 safety_would_override_windows_.load(
+                     std::memory_order_relaxed),
+                 safety_applied_override_windows_.load(
+                     std::memory_order_relaxed),
                  dirty_deadline_misses_.load(std::memory_order_relaxed),
                  dirty_deadline_active_.load(std::memory_order_relaxed) ? 1 : 0,
                  slo_read_breach_.load(std::memory_order_relaxed) ? 1 : 0,

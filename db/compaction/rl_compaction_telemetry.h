@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 
+#include "db/compaction/rl_latency_histogram.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/types.h"
 
@@ -43,6 +44,7 @@ struct RLCompactionTelemetrySnapshot {
   uint64_t foreground_count[3] = {};
   uint64_t foreground_latency_sum_ns[3] = {};
   uint64_t foreground_latency_p95_ns[3] = {};
+  RLLatencyHistogram foreground_latency_buckets[3] = {};
 
   // Wall-clock span these deltas cover, measured between successive Consume()
   // calls. Every counter above is a delta, so without this they are totals
@@ -132,8 +134,8 @@ class RLCompactionTelemetry {
   std::atomic<uint64_t> foreground_count_[3] = {};
   std::atomic<uint64_t> foreground_latency_sum_ns_[3] = {};
   // Log2 nanosecond buckets provide a bounded, lock-free rolling p95.
-  static constexpr int kLatencyBuckets = 64;
-  std::atomic<uint64_t> foreground_latency_buckets_[3][kLatencyBuckets] = {};
+  std::atomic<uint64_t>
+      foreground_latency_buckets_[3][kRLLatencyBucketCount] = {};
 
   std::atomic<uint64_t> bytes_into_level_[kRLTelemetryMaxLevels] = {};
   std::atomic<uint64_t> compaction_read_from_level_[kRLTelemetryMaxLevels] = {};
