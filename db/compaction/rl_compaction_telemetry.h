@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 #include "db/compaction/rl_latency_histogram.h"
 #include "rocksdb/rocksdb_namespace.h"
@@ -127,15 +128,21 @@ class RLCompactionTelemetry {
   std::atomic<uint64_t> stop_count_{0};
   std::atomic<uint64_t> stall_duration_micros_{0};
   std::atomic<uint64_t> stall_started_micros_{0};
-  std::atomic<uint64_t> user_logical_write_bytes_{0};
-  std::atomic<uint64_t> scan_returned_entries_{0};
-  std::atomic<uint64_t> scan_internal_skipped_{0};
-  std::atomic<uint64_t> scan_sorted_run_seeks_{0};
-  std::atomic<uint64_t> foreground_count_[3] = {};
-  std::atomic<uint64_t> foreground_latency_sum_ns_[3] = {};
-  // Log2 nanosecond buckets provide a bounded, lock-free rolling p95.
-  std::atomic<uint64_t>
-      foreground_latency_buckets_[3][kRLLatencyBucketCount] = {};
+  // RecordForegroundOperation updates a count, latency sum, one histogram
+  // bucket, and operation-specific byte/scan counters. Consume must cut all
+  // of those fields at the same boundary; independent atomic exchanges can
+  // otherwise split one completed operation across adjacent windows. The
+  // mutex is deliberately limited to foreground-operation telemetry and is
+  // mutable so Snapshot() can take a coherent read without changing state.
+  mutable std::mutex foreground_mu_;
+  uint64_t user_logical_write_bytes_ = 0;
+  uint64_t scan_returned_entries_ = 0;
+  uint64_t scan_internal_skipped_ = 0;
+  uint64_t scan_sorted_run_seeks_ = 0;
+  uint64_t foreground_count_[3] = {};
+  uint64_t foreground_latency_sum_ns_[3] = {};
+  // Log2 nanosecond buckets provide a bounded rolling p95.
+  uint64_t foreground_latency_buckets_[3][kRLLatencyBucketCount] = {};
 
   std::atomic<uint64_t> bytes_into_level_[kRLTelemetryMaxLevels] = {};
   std::atomic<uint64_t> compaction_read_from_level_[kRLTelemetryMaxLevels] = {};

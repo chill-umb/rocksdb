@@ -134,9 +134,10 @@ void RLCompactionTelemetry::RecordForegroundOperation(
     uint64_t scan_internal_skipped, uint64_t scan_sorted_run_seeks) {
   const int index = static_cast<int>(operation);
   if (index < 0 || index >= 3) return;
-  foreground_count_[index].fetch_add(1, std::memory_order_relaxed);
-  foreground_latency_sum_ns_[index].fetch_add(latency_ns,
-                                              std::memory_order_relaxed);
+  // Consume() resets these fields to form one telemetry window. Keep the
+  // complete operation tuple on one side of that boundary: separate atomic
+  // updates allowed a concurrent Consume() to take the count while leaving
+  // its histogram bucket (or latency sum) for the next window.
   int bucket = 0;
   uint64_t value = latency_ns;
   while (value > 1 &&
@@ -144,16 +145,14 @@ void RLCompactionTelemetry::RecordForegroundOperation(
     value >>= 1;
     ++bucket;
   }
-  foreground_latency_buckets_[index][bucket].fetch_add(
-      1, std::memory_order_relaxed);
-  user_logical_write_bytes_.fetch_add(logical_write_bytes,
-                                      std::memory_order_relaxed);
-  scan_returned_entries_.fetch_add(scan_returned_entries,
-                                   std::memory_order_relaxed);
-  scan_internal_skipped_.fetch_add(scan_internal_skipped,
-                                   std::memory_order_relaxed);
-  scan_sorted_run_seeks_.fetch_add(scan_sorted_run_seeks,
-                                   std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(foreground_mu_);
+  ++foreground_count_[index];
+  foreground_latency_sum_ns_[index] += latency_ns;
+  ++foreground_latency_buckets_[index][bucket];
+  user_logical_write_bytes_ += logical_write_bytes;
+  scan_returned_entries_ += scan_returned_entries;
+  scan_internal_skipped_ += scan_internal_skipped;
+  scan_sorted_run_seeks_ += scan_sorted_run_seeks;
 }
 
 RLCompactionTelemetrySnapshot RLCompactionTelemetry::Snapshot() const {
@@ -181,30 +180,27 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Snapshot() const {
       snapshot.stall_duration_micros += now - active_stall_started;
     }
   }
-  snapshot.user_logical_write_bytes =
-      user_logical_write_bytes_.load(std::memory_order_acquire);
-  snapshot.scan_returned_entries =
-      scan_returned_entries_.load(std::memory_order_acquire);
-  snapshot.scan_internal_skipped =
-      scan_internal_skipped_.load(std::memory_order_acquire);
-  snapshot.scan_sorted_run_seeks =
-      scan_sorted_run_seeks_.load(std::memory_order_acquire);
-  for (int op = 0; op < 3; ++op) {
-    snapshot.foreground_count[op] =
-        foreground_count_[op].load(std::memory_order_acquire);
-    snapshot.foreground_latency_sum_ns[op] =
-        foreground_latency_sum_ns_[op].load(std::memory_order_acquire);
-    const uint64_t rank = (snapshot.foreground_count[op] * 95 + 99) / 100;
-    uint64_t seen = 0;
-    for (size_t bucket = 0; bucket < kRLLatencyBucketCount; ++bucket) {
-      snapshot.foreground_latency_buckets[op][bucket] =
-          foreground_latency_buckets_[op][bucket].load(
-              std::memory_order_acquire);
-      seen += snapshot.foreground_latency_buckets[op][bucket];
-      if (snapshot.foreground_latency_p95_ns[op] == 0 && rank != 0 &&
-          seen >= rank) {
-        snapshot.foreground_latency_p95_ns[op] =
-            RLLatencyBucketUpperBound(bucket);
+  {
+    std::lock_guard<std::mutex> lock(foreground_mu_);
+    snapshot.user_logical_write_bytes = user_logical_write_bytes_;
+    snapshot.scan_returned_entries = scan_returned_entries_;
+    snapshot.scan_internal_skipped = scan_internal_skipped_;
+    snapshot.scan_sorted_run_seeks = scan_sorted_run_seeks_;
+    for (int op = 0; op < 3; ++op) {
+      snapshot.foreground_count[op] = foreground_count_[op];
+      snapshot.foreground_latency_sum_ns[op] =
+          foreground_latency_sum_ns_[op];
+      const uint64_t rank = (snapshot.foreground_count[op] * 95 + 99) / 100;
+      uint64_t seen = 0;
+      for (size_t bucket = 0; bucket < kRLLatencyBucketCount; ++bucket) {
+        snapshot.foreground_latency_buckets[op][bucket] =
+            foreground_latency_buckets_[op][bucket];
+        seen += snapshot.foreground_latency_buckets[op][bucket];
+        if (snapshot.foreground_latency_p95_ns[op] == 0 && rank != 0 &&
+            seen >= rank) {
+          snapshot.foreground_latency_p95_ns[op] =
+              RLLatencyBucketUpperBound(bucket);
+        }
       }
     }
   }
@@ -269,30 +265,34 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Consume() {
   if (active_stall_started != 0 && stall_window_end >= active_stall_started) {
     snapshot.stall_duration_micros += stall_window_end - active_stall_started;
   }
-  snapshot.user_logical_write_bytes =
-      user_logical_write_bytes_.exchange(0, std::memory_order_acq_rel);
-  snapshot.scan_returned_entries =
-      scan_returned_entries_.exchange(0, std::memory_order_acq_rel);
-  snapshot.scan_internal_skipped =
-      scan_internal_skipped_.exchange(0, std::memory_order_acq_rel);
-  snapshot.scan_sorted_run_seeks =
-      scan_sorted_run_seeks_.exchange(0, std::memory_order_acq_rel);
-  for (int op = 0; op < 3; ++op) {
-    snapshot.foreground_count[op] =
-        foreground_count_[op].exchange(0, std::memory_order_acq_rel);
-    snapshot.foreground_latency_sum_ns[op] =
-        foreground_latency_sum_ns_[op].exchange(0, std::memory_order_acq_rel);
-    const uint64_t rank = (snapshot.foreground_count[op] * 95 + 99) / 100;
-    uint64_t seen = 0;
-    for (size_t bucket = 0; bucket < kRLLatencyBucketCount; ++bucket) {
-      snapshot.foreground_latency_buckets[op][bucket] =
-          foreground_latency_buckets_[op][bucket].exchange(
-              0, std::memory_order_acq_rel);
-      seen += snapshot.foreground_latency_buckets[op][bucket];
-      if (snapshot.foreground_latency_p95_ns[op] == 0 && rank != 0 &&
-          seen >= rank) {
-        snapshot.foreground_latency_p95_ns[op] =
-            RLLatencyBucketUpperBound(bucket);
+  {
+    std::lock_guard<std::mutex> lock(foreground_mu_);
+    snapshot.user_logical_write_bytes = user_logical_write_bytes_;
+    snapshot.scan_returned_entries = scan_returned_entries_;
+    snapshot.scan_internal_skipped = scan_internal_skipped_;
+    snapshot.scan_sorted_run_seeks = scan_sorted_run_seeks_;
+    user_logical_write_bytes_ = 0;
+    scan_returned_entries_ = 0;
+    scan_internal_skipped_ = 0;
+    scan_sorted_run_seeks_ = 0;
+    for (int op = 0; op < 3; ++op) {
+      snapshot.foreground_count[op] = foreground_count_[op];
+      snapshot.foreground_latency_sum_ns[op] =
+          foreground_latency_sum_ns_[op];
+      foreground_count_[op] = 0;
+      foreground_latency_sum_ns_[op] = 0;
+      const uint64_t rank = (snapshot.foreground_count[op] * 95 + 99) / 100;
+      uint64_t seen = 0;
+      for (size_t bucket = 0; bucket < kRLLatencyBucketCount; ++bucket) {
+        snapshot.foreground_latency_buckets[op][bucket] =
+            foreground_latency_buckets_[op][bucket];
+        foreground_latency_buckets_[op][bucket] = 0;
+        seen += snapshot.foreground_latency_buckets[op][bucket];
+        if (snapshot.foreground_latency_p95_ns[op] == 0 && rank != 0 &&
+            seen >= rank) {
+          snapshot.foreground_latency_p95_ns[op] =
+              RLLatencyBucketUpperBound(bucket);
+        }
       }
     }
   }
