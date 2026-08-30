@@ -301,6 +301,8 @@ class CompactionPickerTest : public CompactionPickerTestBase {
 
 class RLCompactionPickerTestPeer {
  public:
+  using SafetyFrameEvaluation = RLCompactionPicker::SafetyFrameEvaluation;
+
   static void StopWorker(RLCompactionPicker* picker) {
     picker->worker_stop_.store(true, std::memory_order_release);
     picker->snap_cv_.notify_all();
@@ -421,6 +423,19 @@ class RLCompactionPickerTestPeer {
     return picker->permits_[level].optional_token_available;
   }
 
+  static void SetSafetyEvaluationPending(RLCompactionPicker* picker,
+                                         bool pending) {
+    picker->safety_evaluation_pending_.store(pending,
+                                             std::memory_order_release);
+  }
+
+  static bool PermitEligible(RLCompactionPicker* picker, int level,
+                             double score) {
+    std::lock_guard<std::mutex> lock(picker->permit_mu_);
+    return picker->IsPermitEligible(picker->permits_[level], score,
+                                    CompactionPressureObserver::NowMicros());
+  }
+
   static void SetDirtyDeadlineState(RLCompactionPicker* picker,
                                     uint64_t source_generation,
                                     uint64_t built_generation,
@@ -473,6 +488,27 @@ class RLCompactionPickerTestPeer {
 
   static void SetSafetyEnabled(RLCompactionPicker* picker, bool enabled) {
     picker->safety_enabled_ = enabled;
+  }
+
+  static SafetyFrameEvaluation ClassifyWriteBreach(RLCompactionPicker* picker,
+                                                   const RLStateV2& state) {
+    RLSLOBreachState breach;
+    breach.guard_ready = true;
+    breach.write = true;
+    return ClassifySafety(picker, state, breach);
+  }
+
+  static SafetyFrameEvaluation ClassifySafety(RLCompactionPicker* picker,
+                                              const RLStateV2& state,
+                                              const RLSLOBreachState& breach) {
+    return picker->ClassifyWorkerSafety(
+        state, breach, /*dirty_deadline_miss=*/false,
+        CompactionPressureObserver::NowMicros());
+  }
+
+  static bool ApplySafety(RLCompactionPicker* picker, const RLStateV2& state,
+                          const SafetyFrameEvaluation& evaluation) {
+    return picker->ApplyWorkerSafety(state, evaluation);
   }
 
   static uint64_t SafetyWouldOverrideWindows(RLCompactionPicker* picker) {
@@ -668,6 +704,55 @@ TEST_F(CompactionPickerTest, RLSafetyManifestV2RequiresCalibratedGuard) {
   ASSERT_OK(Env::Default()->DeleteFile(path));
 }
 
+TEST_F(CompactionPickerTest,
+       RLSafetyManifestRejectsFractionalCountersAndDuplicateLevels) {
+  const std::string path =
+      test::PerThreadDBPath("rl_safety_manifest_strict.json");
+  const std::string prefix = R"json({
+    "schema_version":2,
+    "metric_definitions_version":"trigger-v2-logical-v2",
+    "experiment_fingerprint":"fp",
+    "guard_calibrated":true,
+    "guard_minimum_samples":2,
+    "guard_rolling_window_count":)json";
+  const std::string suffix = R"json(,
+    "guard_hysteresis_enter_windows":3,
+    "guard_hysteresis_exit_windows":3,
+    "guard_p95_method":"merged_log2_histogram",
+    "allowed_physical_sst_bytes":100,
+    "allowed_pending_debt_ratio":0.5,
+    "guard_get_latency_avg_ns_limit":100.0,
+    "guard_get_latency_p95_ns_limit":200,
+    "guard_scan_latency_avg_ns_limit":100.0,
+    "guard_scan_latency_p95_ns_limit":200,
+    "guard_write_latency_avg_ns_limit":100.0,
+    "guard_write_latency_p95_ns_limit":200,
+    "level_limits":[
+      {"level":0,"calibrated":true,"due_age_limit_micros":1,
+       "pressure_limit_score_micros":1.0,"score_limit":1.0},
+      {"level":0,"calibrated":false,"due_age_limit_micros":1,
+       "pressure_limit_score_micros":1.0,"score_limit":1.0}
+    ]})json";
+
+  {
+    std::ofstream output(path);
+    output << prefix << "1.5" << suffix;
+  }
+  std::string error;
+  std::unique_ptr<RLSafetyController> fractional =
+      RLSafetyController::Load(path, "fp", /*manifest_required=*/true, &error);
+  ASSERT_TRUE(fractional->invalid());
+
+  {
+    std::ofstream output(path);
+    output << prefix << "1" << suffix;
+  }
+  std::unique_ptr<RLSafetyController> duplicate =
+      RLSafetyController::Load(path, "fp", /*manifest_required=*/true, &error);
+  ASSERT_TRUE(duplicate->invalid());
+  ASSERT_OK(Env::Default()->DeleteFile(path));
+}
+
 TEST_F(CompactionPickerTest, RLSafetyUsesSamplesAndThreeWindowHysteresis) {
   std::unique_ptr<RLSafetyController> controller =
       RLCompactionPickerTestPeer::MakeSafetyController();
@@ -758,7 +843,7 @@ TEST_F(CompactionPickerTest, RLL0SlowdownOpensDueSupportingLevels) {
   ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 3);
 }
 
-TEST_F(CompactionPickerTest, RLSafetyShadowClassificationDoesNotMutatePermits) {
+TEST_F(CompactionPickerTest, RLSafetyDisabledPathSkipsUnusedClassification) {
   RLCompactionPicker picker(ioptions_, &icmp_);
   RLCompactionPickerTestPeer::SetSafetyEnabled(&picker, false);
   RLStateV2 state;
@@ -772,9 +857,104 @@ TEST_F(CompactionPickerTest, RLSafetyShadowClassificationDoesNotMutatePermits) {
   RLCompactionPickerTestPeer::EvaluateSafety(&picker, state);
   ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 0), 0);
   ASSERT_EQ(RLCompactionPickerTestPeer::SafetyWouldOverrideWindows(&picker),
-            1U);
+            0U);
   ASSERT_EQ(RLCompactionPickerTestPeer::SafetyAppliedOverrideWindows(&picker),
             0U);
+}
+
+TEST_F(CompactionPickerTest,
+       RLSafetyShadowClassifiesOptionalBandWithoutOraclePermit) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+  RLStateV2 state;
+  RLLevelState level;
+  level.level = 1;
+  level.files = 1;
+  level.score = 0.75;
+  state.levels.push_back(level);
+
+  const auto evaluation =
+      RLCompactionPickerTestPeer::ClassifyWriteBreach(&picker, state);
+  ASSERT_TRUE(evaluation.would_invalidate_frame);
+  ASSERT_TRUE(evaluation.levels[1].revoke_optional);
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 0);
+}
+
+TEST_F(CompactionPickerTest, RLSafetyRevalidatesOptionalRevokeAtApplyTime) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+  RLStateV2 state;
+  RLLevelState level;
+  level.level = 1;
+  level.files = 1;
+  level.score = 0.75;
+  state.levels.push_back(level);
+
+  const auto stale =
+      RLCompactionPickerTestPeer::ClassifyWriteBreach(&picker, state);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/91);
+  ASSERT_FALSE(RLCompactionPickerTestPeer::ApplySafety(&picker, state, stale));
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 1);
+
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/true, /*decision_id=*/92);
+  const auto current =
+      RLCompactionPickerTestPeer::ClassifyWriteBreach(&picker, state);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::ApplySafety(&picker, state, current));
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 0);
+}
+
+TEST_F(CompactionPickerTest,
+       RLSafetyKeepsNewPolicyPermitsClosedUntilClassification) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/true, /*decision_id=*/93);
+
+  RLCompactionPickerTestPeer::SetSafetyEvaluationPending(&picker, true);
+  ASSERT_FALSE(RLCompactionPickerTestPeer::PermitEligible(&picker, /*level=*/1,
+                                                          /*score=*/0.75));
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/94);
+  ASSERT_FALSE(RLCompactionPickerTestPeer::PermitEligible(&picker, /*level=*/1,
+                                                          /*score=*/1.10));
+  RLCompactionPickerTestPeer::SetSafetyEvaluationPending(&picker, false);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::PermitEligible(&picker, /*level=*/1,
+                                                         /*score=*/1.10));
+}
+
+TEST_F(CompactionPickerTest, RLSafetyShadowIncludesHeldAndReleaseFrames) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+  RLStateV2 state;
+  RLLevelState level;
+  level.level = 1;
+  level.files = 1;
+  level.score = 1.1;
+  state.levels.push_back(level);
+
+  RLSLOBreachState breach;
+  breach.guard_ready = true;
+  breach.read = true;
+  const auto forced =
+      RLCompactionPickerTestPeer::ClassifySafety(&picker, state, breach);
+  ASSERT_TRUE(forced.levels[1].force);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::ApplySafety(&picker, state, forced));
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 3);
+
+  RLSLOBreachState recovered;
+  recovered.guard_ready = true;
+  const auto release =
+      RLCompactionPickerTestPeer::ClassifySafety(&picker, state, recovered);
+  ASSERT_TRUE(release.would_invalidate_frame);
+  ASSERT_TRUE(release.levels[1].release_forced);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::ApplySafety(&picker, state, release));
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 0);
+
+  const auto after_release =
+      RLCompactionPickerTestPeer::ClassifySafety(&picker, state, recovered);
+  ASSERT_FALSE(after_release.would_invalidate_frame);
 }
 
 TEST_F(CompactionPickerTest, RLDirtyStructuralDeadlineIsEdgeCounted) {

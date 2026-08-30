@@ -135,6 +135,7 @@ class RLCompactionPicker : public LevelCompactionPicker {
     bool due = false;
     bool revoke_optional = false;
     bool force = false;
+    bool release_forced = false;
     ActionReason force_reason = ActionReason::kBudget;
   };
 
@@ -212,6 +213,7 @@ class RLCompactionPicker : public LevelCompactionPicker {
   uint64_t structural_dirty_deadline_micros_;
   std::unique_ptr<RLSafetyController> slo_safety_;
   std::string experiment_fingerprint_;
+  std::string baseline_slo_sha256_;
   std::string trigger_trace_path_;
   mutable std::ofstream trigger_trace_;
   std::string latency_window_log_path_;
@@ -262,6 +264,14 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<bool> slo_write_breach_{false};
   mutable std::atomic<bool> slo_space_breach_{false};
   mutable std::atomic<bool> slo_manifest_invalid_{false};
+  // Worker-owned mirror of safety-forced intervals. Enforcement has a real
+  // permit to retain; a non-mutating oracle holdout does not, so this mirror
+  // lets shadow classification reproduce held and release frames as well.
+  bool classified_force_active_[kMaxRLLevels] = {};
+  ActionReason classified_force_reason_[kMaxRLLevels] = {};
+  // A newly installed policy/posture permit must not become scheduler-visible
+  // until the worker has applied the same frame's safety classification.
+  std::atomic<bool> safety_evaluation_pending_{false};
   mutable std::atomic<uint64_t> pick_attempts_[kMaxRLLevels] = {};
   mutable std::atomic<uint64_t> pick_blocked_[kMaxRLLevels] = {};
   mutable std::atomic<uint64_t> pick_scheduled_[kMaxRLLevels] = {};
@@ -343,7 +353,8 @@ class RLCompactionPicker : public LevelCompactionPicker {
   static constexpr uint64_t kDiagnosticsEveryQueries = 200;
 
   void WorkerLoop();
-  void RunDecisionCycle(RLStateV2& state, bool actuate);
+  void RunDecisionCycle(RLStateV2& state, bool actuate,
+                        std::vector<SchedulingToken>* wake_tokens);
   void PopulateReadStats(RLStateV2& state);
   void LogDiagnostics(bool final) const;
   void SendDoneMessage();
@@ -384,9 +395,10 @@ class RLCompactionPicker : public LevelCompactionPicker {
   bool DebtRatioBreach(uint64_t pending_compaction_bytes) const;
   void CheckPressureDivergence(const VersionStorageInfo* vstorage) const;
   void RecordEpsilonSample(uint64_t admission_micros) const;
-  SafetyFrameEvaluation ClassifyWorkerSafety(
-      const RLStateV2& state, const RLSLOBreachState& slo,
-      bool dirty_deadline_miss, uint64_t now_micros) const;
+  SafetyFrameEvaluation ClassifyWorkerSafety(const RLStateV2& state,
+                                             const RLSLOBreachState& slo,
+                                             bool dirty_deadline_miss,
+                                             uint64_t now_micros);
   bool ApplyWorkerSafety(const RLStateV2& state,
                          const SafetyFrameEvaluation& evaluation);
   void EvaluateWorkerSafety(const RLStateV2& state, bool actuate);

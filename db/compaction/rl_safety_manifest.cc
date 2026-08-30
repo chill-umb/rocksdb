@@ -4,13 +4,17 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <set>
 #include <utility>
 
 #include "db/compaction/rl_compaction_client.h"
+#include "db/compaction/rl_compaction_telemetry.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
@@ -31,22 +35,47 @@ bool FindValueStart(const std::string& text, const std::string& key,
   return true;
 }
 
+bool IsValueTerminator(const std::string& text, const char* end) {
+  const char* limit = text.c_str() + text.size();
+  while (end < limit && std::isspace(static_cast<unsigned char>(*end))) {
+    ++end;
+  }
+  return end == limit || *end == ',' || *end == '}' || *end == ']';
+}
+
 bool NumberField(const std::string& text, const std::string& key,
                  double* value) {
   size_t position = 0;
   if (!FindValueStart(text, key, &position)) return false;
+  if (position >= text.size() ||
+      (text[position] != '-' &&
+       !std::isdigit(static_cast<unsigned char>(text[position])))) {
+    return false;
+  }
   char* end = nullptr;
+  errno = 0;
   const double parsed = std::strtod(text.c_str() + position, &end);
-  if (end == text.c_str() + position) return false;
+  if (end == text.c_str() + position || errno == ERANGE ||
+      !std::isfinite(parsed) || !IsValueTerminator(text, end)) {
+    return false;
+  }
   *value = parsed;
   return true;
 }
 
 bool UintField(const std::string& text, const std::string& key,
                uint64_t* value) {
-  double parsed = 0.0;
-  if (!NumberField(text, key, &parsed) || parsed < 0.0 ||
-      parsed > static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+  size_t position = 0;
+  if (!FindValueStart(text, key, &position) || position >= text.size() ||
+      !std::isdigit(static_cast<unsigned char>(text[position]))) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const unsigned long long parsed =
+      std::strtoull(text.c_str() + position, &end, 10);
+  if (end == text.c_str() + position || errno == ERANGE ||
+      !IsValueTerminator(text, end)) {
     return false;
   }
   *value = static_cast<uint64_t>(parsed);
@@ -61,7 +90,10 @@ bool StringField(const std::string& text, const std::string& key,
     return false;
   }
   const size_t end = text.find('"', position + 1);
-  if (end == std::string::npos) return false;
+  if (end == std::string::npos ||
+      !IsValueTerminator(text, text.c_str() + end + 1)) {
+    return false;
+  }
   *value = text.substr(position + 1, end - position - 1);
   return true;
 }
@@ -70,10 +102,12 @@ bool BoolField(const std::string& text, const std::string& key, bool* value) {
   size_t position = 0;
   if (!FindValueStart(text, key, &position)) return false;
   if (text.compare(position, 4, "true") == 0) {
+    if (!IsValueTerminator(text, text.c_str() + position + 4)) return false;
     *value = true;
     return true;
   }
   if (text.compare(position, 5, "false") == 0) {
+    if (!IsValueTerminator(text, text.c_str() + position + 5)) return false;
     *value = false;
     return true;
   }
@@ -168,6 +202,9 @@ bool RLSafetyController::Parse(const std::string& json,
       !NumberField(json, "allowed_pending_debt_ratio",
                    &pending_debt_ratio_limit_) ||
       minimum_samples_ == 0 || rolling == 0 || enter == 0 || exit == 0 ||
+      rolling > std::numeric_limits<size_t>::max() ||
+      enter > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
+      exit > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
       physical_sst_bytes_limit_ == 0 || pending_debt_ratio_limit_ <= 0.0) {
     if (error != nullptr) {
       *error = "baseline SLO schema, fingerprint, or required limits mismatch";
@@ -198,6 +235,7 @@ bool RLSafetyController::Parse(const std::string& json,
     return false;
   }
 
+  std::set<int> seen_levels;
   for (const std::string& object : ArrayObjects(json, "level_limits")) {
     uint64_t level = 0;
     bool calibrated = false;
@@ -209,9 +247,10 @@ bool RLSafetyController::Parse(const std::string& json,
         !NumberField(object, "pressure_limit_score_micros",
                      &limit.pressure_limit_score_micros) ||
         !NumberField(object, "score_limit", &limit.score_limit) ||
-        level > 1024 || limit.due_age_limit_micros == 0 ||
-        limit.pressure_limit_score_micros <= 0.0 ||
-        limit.score_limit < 1.0) {
+        level >= static_cast<uint64_t>(kRLTelemetryMaxLevels) ||
+        !seen_levels.insert(static_cast<int>(level)).second ||
+        limit.due_age_limit_micros == 0 ||
+        limit.pressure_limit_score_micros <= 0.0 || limit.score_limit < 1.0) {
       if (error != nullptr) *error = "invalid per-level safety limit";
       return false;
     }

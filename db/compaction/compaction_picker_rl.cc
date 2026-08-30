@@ -141,6 +141,7 @@ RLCompactionPicker::RLCompactionPicker(const ImmutableOptions& ioptions,
         decision_interval_ms_, requested_observe_interval);
   }
   experiment_fingerprint_ = EnvString("RL_EXPERIMENT_FINGERPRINT");
+  baseline_slo_sha256_ = EnvString("RL_BASELINE_SLO_SHA256");
   trigger_trace_path_ = EnvString("RL_TRIGGER_TRACE_PATH");
   if (!trigger_trace_path_.empty()) {
     trigger_trace_.open(trigger_trace_path_, std::ios::out | std::ios::app);
@@ -586,6 +587,11 @@ bool RLCompactionPicker::IsPermitEligible(const LevelPermit& permit,
                                           uint64_t now_micros) const {
   if (permit.mode == PermitMode::kClosed) return false;
   if (permit.backoff_until_micros > now_micros) return false;
+  if (safety_evaluation_pending_.load(std::memory_order_acquire) &&
+      (permit.reason == ActionReason::kPolicy ||
+       permit.reason == ActionReason::kPosture)) {
+    return false;
+  }
   if (current_score >= 1.0) {
     return permit.action == PolicyAction::kCompact ||
            permit.mode == PermitMode::kForcedOpen;
@@ -1179,9 +1185,10 @@ void RLCompactionPicker::RecordEpsilonSample(uint64_t admission_micros) const {
 }
 
 RLCompactionPicker::SafetyFrameEvaluation
-RLCompactionPicker::ClassifyWorkerSafety(
-    const RLStateV2& state, const RLSLOBreachState& slo,
-    bool dirty_deadline_miss, uint64_t now_micros) const {
+RLCompactionPicker::ClassifyWorkerSafety(const RLStateV2& state,
+                                         const RLSLOBreachState& slo,
+                                         bool dirty_deadline_miss,
+                                         uint64_t now_micros) {
   SafetyFrameEvaluation evaluation{};
   evaluation.now_micros = now_micros;
   evaluation.guard_ready = slo.guard_ready && !slo.manifest_invalid;
@@ -1199,16 +1206,25 @@ RLCompactionPicker::ClassifyWorkerSafety(
       state.levels.front().files >=
           rl_l0_slowdown_trigger_.load(std::memory_order_relaxed);
 
-  std::lock_guard<std::mutex> lock(permit_mu_);
+  bool present[kMaxRLLevels] = {};
   for (const RLLevelState& observed : state.levels) {
     const int level = observed.level;
     if (level < 0 || level >= kMaxRLLevels) continue;
-    const LevelPermit& permit = permits_[level];
+    present[level] = true;
+    const bool force_was_active = classified_force_active_[level];
+    const ActionReason previous_force_reason = classified_force_reason_[level];
     SafetyLevelEvaluation& item = evaluation.levels[level];
     item.observed = true;
     item.due = observed.score >= 1.0;
-    item.revoke_optional = evaluation.prohibit_optional &&
-                           permit.mode == PermitMode::kOptionalOpen;
+    // Classify the action the guard would mask, not the permit that happens to
+    // be installed at this instant. Oracle holdout frames never install
+    // optional permits, but a learned policy can choose compact anywhere in
+    // this band. Looking at the oracle permit therefore made write-side shadow
+    // validation blind to exactly the optional actions it is meant to screen.
+    // ApplyWorkerSafety revalidates the live permit under permit_mu_ before it
+    // mutates anything.
+    item.revoke_optional = evaluation.prohibit_optional && observed.files > 0 &&
+                           !item.due && observed.score >= optional_min_score_;
     uint64_t due_age_limit = safety_due_age_micros_;
     double pressure_limit = safety_pressure_score_micros_;
     double score_limit = safety_score_cap_;
@@ -1234,13 +1250,42 @@ RLCompactionPicker::ClassifyWorkerSafety(
                                      std::memory_order_relaxed)) {
       item.force_reason = ActionReason::kEmergency;
     }
-    if (item.revoke_optional || item.force) {
+    if (!item.force && force_was_active && item.due) {
+      // InstallPolicyFrame holds the previous safety permit until this method
+      // evaluates the exit condition. Mirror that behavior in shadow mode: a
+      // budget/emergency force lasts until the episode is healthy, whereas an
+      // SLO or stale-structure force has a distinct release frame. That release
+      // frame still suppresses the just-returned policy response and is not a
+      // valid learning transition.
+      const bool retain =
+          previous_force_reason == ActionReason::kBudget ||
+          previous_force_reason == ActionReason::kEmergency ||
+          previous_force_reason == ActionReason::kManifest ||
+          (previous_force_reason == ActionReason::kSLO &&
+           evaluation.slo_force_due) ||
+          (previous_force_reason == ActionReason::kStaleStructure &&
+           evaluation.dirty_deadline_miss);
+      if (retain) {
+        item.force = true;
+        item.force_reason = previous_force_reason;
+      } else {
+        item.release_forced = true;
+        item.force_reason = previous_force_reason;
+      }
+    }
+    classified_force_active_[level] = item.force;
+    if (item.force) classified_force_reason_[level] = item.force_reason;
+    if (item.revoke_optional || item.force || item.release_forced) {
       evaluation.would_invalidate_frame = true;
-      const ActionReason reason =
-          item.force ? item.force_reason : ActionReason::kSLO;
+      const ActionReason reason = (item.force || item.release_forced)
+                                      ? item.force_reason
+                                      : ActionReason::kSLO;
       evaluation.reason_mask |=
           1ULL << static_cast<unsigned int>(reason);
     }
+  }
+  for (int level = 0; level < kMaxRLLevels; ++level) {
+    if (!present[level]) classified_force_active_[level] = false;
   }
   return evaluation;
 }
@@ -1256,7 +1301,12 @@ bool RLCompactionPicker::ApplyWorkerSafety(
       if (level < 0 || level >= kMaxRLLevels) continue;
       const SafetyLevelEvaluation& item = evaluation.levels[level];
       LevelPermit& permit = permits_[level];
-      if (item.revoke_optional) {
+      // Classification and enforcement deliberately use separate lock
+      // acquisitions so the expensive safety calculation does not hold the
+      // scheduler mutex. A policy response or crossing promotion may replace
+      // the permit between those phases; never apply a stale optional revoke
+      // to that newer due/forced permit.
+      if (item.revoke_optional && permit.mode == PermitMode::kOptionalOpen) {
         permit = LevelPermit();
         permit.eligibility_generation = ++next_eligibility_generation_;
         last_transition_valid_[level].store(false,
@@ -1300,6 +1350,10 @@ bool RLCompactionPicker::ApplyWorkerSafety(
                    !evaluation.dirty_deadline_miss))) {
         permit = LevelPermit();
         permit.eligibility_generation = ++next_eligibility_generation_;
+        // InstallPolicyFrame retained the old safety permit before the current
+        // exit condition was known, so its newly returned policy action was
+        // suppressed on this release frame as well.
+        tree_transition_overridden = true;
       }
     }
   }
@@ -1348,18 +1402,23 @@ void RLCompactionPicker::EvaluateWorkerSafety(const RLStateV2& state,
     RequestScheduling(token, now);
   }
 
-  const SafetyFrameEvaluation evaluation =
-      ClassifyWorkerSafety(state, slo, dirty_deadline_miss, now);
-  if (evaluation.would_invalidate_frame) {
-    safety_would_override_windows_.fetch_add(1, std::memory_order_relaxed);
+  // Ordinary oracle and unconstrained runs have neither enforcement nor a
+  // shadow consumer. Keep their bridge path identical to the pre-shadow
+  // implementation instead of adding a per-level manifest scan to every
+  // worker tick. Holdout runs open safety_shadow_log_ and still classify.
+  if (safety_enabled_ || safety_shadow_log_.is_open()) {
+    const SafetyFrameEvaluation evaluation =
+        ClassifyWorkerSafety(state, slo, dirty_deadline_miss, now);
+    if (evaluation.would_invalidate_frame) {
+      safety_would_override_windows_.fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool intervention_applied =
+        safety_enabled_ ? ApplyWorkerSafety(state, evaluation) : false;
+    if (intervention_applied) {
+      safety_applied_override_windows_.fetch_add(1, std::memory_order_relaxed);
+    }
+    TraceSafetyShadow(state, evaluation, actuate, intervention_applied);
   }
-  const bool intervention_applied =
-      safety_enabled_ ? ApplyWorkerSafety(state, evaluation) : false;
-  if (intervention_applied) {
-    safety_applied_override_windows_.fetch_add(1,
-                                               std::memory_order_relaxed);
-  }
-  TraceSafetyShadow(state, evaluation, actuate, intervention_applied);
   TraceControlState(state);
 }
 
@@ -1494,6 +1553,8 @@ void RLCompactionPicker::TraceSafetyShadow(
   if (!safety_shadow_log_ || state.interval_micros == 0) return;
   safety_shadow_log_ << "{\"schema_version\":1,\"experiment_fingerprint\":";
   WriteJSONString(safety_shadow_log_, experiment_fingerprint_);
+  safety_shadow_log_ << ",\"baseline_slo_sha256\":";
+  WriteJSONString(safety_shadow_log_, baseline_slo_sha256_);
   safety_shadow_log_ << ",\"time_micros\":" << evaluation.now_micros
                      << ",\"interval_micros\":" << state.interval_micros
                      << ",\"guard_ready\":"
@@ -1541,7 +1602,8 @@ void RLCompactionPicker::PopulateReadStats(RLStateV2& state) {
   state.point_sst_probes = delta[8];
 }
 
-void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
+void RLCompactionPicker::RunDecisionCycle(
+    RLStateV2& state, bool actuate, std::vector<SchedulingToken>* wake_tokens) {
   const RLCompactionTelemetrySnapshot telemetry =
       RLCompactionTelemetry::Get().Consume();
   TraceLatencyWindow(telemetry);
@@ -1634,15 +1696,17 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
   }
   const uint64_t query_id =
       rl_query_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-  std::vector<SchedulingToken> wake_tokens;
   if (!result.ok) {
     rl_available_.store(false, std::memory_order_release);
     const uint64_t failures =
         rl_fallback_count_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (actuate) {
-      InstallFallbackFrame(state, &wake_tokens);
-      for (const SchedulingToken& token : wake_tokens) {
-        RequestScheduling(token, NowMicros());
+      InstallFallbackFrame(state, wake_tokens);
+      if (!safety_enabled_) {
+        for (const SchedulingToken& token : *wake_tokens) {
+          RequestScheduling(token, NowMicros());
+        }
+        wake_tokens->clear();
       }
     }
     if (!rl_fallback_logged_.exchange(true, std::memory_order_relaxed) ||
@@ -1672,15 +1736,29 @@ void RLCompactionPicker::RunDecisionCycle(RLStateV2& state, bool actuate) {
     }
     return;
   }
-  InstallPolicyFrame(state, result.actions, query_id, &wake_tokens);
+  // InstallPolicyFrame publishes the response under permit_mu_. Close its
+  // policy/posture eligibility before that publication and keep it closed
+  // until EvaluateWorkerSafety has classified the same frame. The prior frame
+  // remains authoritative during the synchronous query; that preserves held
+  // gate and crossing semantics while bounding the new response atomically.
+  if (safety_enabled_) {
+    safety_evaluation_pending_.store(true, std::memory_order_release);
+  }
+  InstallPolicyFrame(state, result.actions, query_id, wake_tokens);
   rl_actuation_count_.fetch_add(1, std::memory_order_relaxed);
   rl_fallback_logged_.store(false, std::memory_order_relaxed);
   // Publish availability only after the complete permit frame is visible.
   // A scheduler thread that sees `true` must never observe bootstrap-closed
   // gates in place of this valid response.
   rl_available_.store(true, std::memory_order_release);
-  for (const SchedulingToken& token : wake_tokens) {
-    RequestScheduling(token, NowMicros());
+  if (!safety_enabled_) {
+    // Preserve the original oracle/unconstrained ordering: those arms have no
+    // safety mutation to wait for, so their wake is not delayed behind shadow
+    // classification or diagnostic tracing.
+    for (const SchedulingToken& token : *wake_tokens) {
+      RequestScheduling(token, NowMicros());
+    }
+    wake_tokens->clear();
   }
 }
 
@@ -1723,8 +1801,18 @@ void RLCompactionPicker::WorkerLoop() {
       levels.push_back(level.level);
     const bool actuate = next_tick >= next_actuation;
     if (actuate) next_actuation = next_tick + actuation_interval;
-    RunDecisionCycle(state, actuate);
+    std::vector<SchedulingToken> decision_wakes;
+    RunDecisionCycle(state, actuate, &decision_wakes);
     EvaluateWorkerSafety(state, actuate);
+    // The final permit state is now visible. A policy token superseded by
+    // safety has a newer eligibility generation, so its deferred wake will
+    // fail validation; a permitted token can be dispatched without racing the
+    // safety check. Non-enforcing arms already dispatched inside
+    // RunDecisionCycle to preserve their original ordering.
+    safety_evaluation_pending_.store(false, std::memory_order_release);
+    for (const SchedulingToken& token : decision_wakes) {
+      RequestScheduling(token, NowMicros());
+    }
     // Close out due episodes that ended without ever being admitted, so the
     // admission-latency histogram has a visible denominator rather than
     // silently describing only the episodes that were served.
