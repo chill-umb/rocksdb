@@ -10,6 +10,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -67,8 +68,6 @@ void AppendLevelState(std::ostringstream& os, const RLLevelState& l) {
      << ",\"prev_completed_override_reason\":"
      << l.prev_completed_override_reason
      << ",\"prev_override_reason\":" << l.prev_override_reason
-     << ",\"prev_transition_valid\":"
-     << (l.prev_transition_valid ? "true" : "false")
      << ",\"defer_count\":" << l.defer_count
      << ",\"due_age_micros\":" << l.due_age_micros
      << ",\"pressure_score_micros\":" << l.pressure_score_micros
@@ -94,6 +93,11 @@ std::string FormatStateV2(const RLStateV2& s) {
   os.precision(6);
   os << std::fixed;
   os << "{\"version\":" << s.protocol_version
+     << ",\"credit_assignment_version\":"
+     << s.credit_assignment_version
+     << ",\"decision_id\":" << s.decision_id
+     << ",\"prev_reward_invalid_reason_mask\":"
+     << s.prev_reward_invalid_reason_mask
      << ",\"snapshot_epoch\":" << s.snapshot_epoch
      << ",\"pending_compaction_bytes\":" << s.pending_compaction_bytes
      << ",\"flushed_bytes\":" << s.flushed_bytes
@@ -158,35 +162,82 @@ std::string FormatStateV2(const RLStateV2& s) {
 // Whitespace-tolerant around ':' and '[' — json.dumps and hand-rolled
 // serializers differ here, and an intolerant needle silently rejected every
 // response once (causing a permanent fallback to leveled). Returns an empty
-// vector if the key is missing or the array is malformed.
-std::vector<int> ParseIntArrayField(const std::string& json, const char* key) {
-  std::vector<int> out;
+// false if the key is missing, duplicated, or the array is malformed.
+bool ParseIntArrayField(const std::string& json, const char* key,
+                        std::vector<int>* out) {
+  out->clear();
   const std::string needle = std::string("\"") + key + "\"";
   size_t pos = json.find(needle);
-  if (pos == std::string::npos) return out;
+  if (pos == std::string::npos ||
+      json.find(needle, pos + needle.size()) != std::string::npos) {
+    return false;
+  }
   pos += needle.size();
   auto skip_ws = [&json](size_t p) {
     while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
     return p;
   };
   pos = skip_ws(pos);
-  if (pos >= json.size() || json[pos] != ':') return out;
+  if (pos >= json.size() || json[pos] != ':') return false;
   pos = skip_ws(pos + 1);
-  if (pos >= json.size() || json[pos] != '[') return out;
+  if (pos >= json.size() || json[pos] != '[') return false;
   ++pos;
-  while (pos < json.size() && json[pos] != ']') {
-    while (pos < json.size() &&
-           (json[pos] == ' ' || json[pos] == '\t' || json[pos] == ',')) {
+  pos = skip_ws(pos);
+  if (pos < json.size() && json[pos] == ']') return true;
+  while (pos < json.size()) {
+    bool negative = false;
+    if (json[pos] == '-') {
+      negative = true;
       ++pos;
     }
-    if (pos >= json.size() || json[pos] == ']') break;
-    if (json[pos] != '-' && (json[pos] < '0' || json[pos] > '9')) {
-      return {};  // malformed
+    if (pos >= json.size() || json[pos] < '0' || json[pos] > '9') return false;
+    int value = 0;
+    while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+      const int digit = json[pos++] - '0';
+      if (value > (std::numeric_limits<int>::max() - digit) / 10) return false;
+      value = value * 10 + digit;
     }
-    out.push_back(std::atoi(json.c_str() + pos));
-    while (pos < json.size() && json[pos] != ',' && json[pos] != ']') ++pos;
+    out->push_back(negative ? -value : value);
+    pos = skip_ws(pos);
+    if (pos >= json.size()) return false;
+    if (json[pos] == ']') return true;
+    if (json[pos] != ',') return false;
+    pos = skip_ws(pos + 1);
   }
-  return out;
+  return false;
+}
+
+bool ParseUInt64Field(const std::string& json, const char* key,
+                      uint64_t* value) {
+  const std::string needle = std::string("\"") + key + "\"";
+  size_t pos = json.find(needle);
+  if (pos == std::string::npos ||
+      json.find(needle, pos + needle.size()) != std::string::npos) {
+    return false;
+  }
+  pos += needle.size();
+  auto skip_ws = [&json](size_t p) {
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) ++p;
+    return p;
+  };
+  pos = skip_ws(pos);
+  if (pos >= json.size() || json[pos] != ':') return false;
+  pos = skip_ws(pos + 1);
+  if (pos >= json.size() || json[pos] < '0' || json[pos] > '9') return false;
+  uint64_t parsed = 0;
+  while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+    const uint64_t digit = static_cast<uint64_t>(json[pos++] - '0');
+    if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+      return false;
+    }
+    parsed = parsed * 10 + digit;
+  }
+  pos = skip_ws(pos);
+  if (pos >= json.size() || (json[pos] != ',' && json[pos] != '}')) {
+    return false;
+  }
+  *value = parsed;
+  return true;
 }
 
 }  // namespace
@@ -205,6 +256,14 @@ RLCompactionClient::RLCompactionClient()
       socket_timeout_ms_(SocketTimeoutMsFromEnv()) {}
 
 RLCompactionClient::~RLCompactionClient() { Disconnect(); }
+
+uint64_t RLCompactionClient::AllocateDecisionId() {
+  uint64_t id = next_decision_id_.fetch_add(1, std::memory_order_relaxed);
+  if (id == 0) {
+    id = next_decision_id_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return id;
+}
 
 // ---------------------------------------------------------------------------
 // Connection management
@@ -339,9 +398,54 @@ std::string RLCompactionClient::RecvLine() {
 // Main entry point called by compaction picker
 // ---------------------------------------------------------------------------
 
+RLMultiQueryResult RLCompactionClient::DecodeResponse(
+    const RLStateV2& state, const std::string& response,
+    uint64_t last_acknowledged_decision_id) {
+  RLMultiQueryResult result;
+  result.failure = RLMultiQueryResult::Failure::kMalformedResponse;
+  uint64_t response_decision_id = 0;
+  std::vector<int> actions;
+  if (!ParseUInt64Field(response, "decision_id", &response_decision_id) ||
+      !ParseIntArrayField(response, "actions", &actions) ||
+      actions.size() != state.levels.size()) {
+    return result;
+  }
+  if (response_decision_id != 0 &&
+      response_decision_id == last_acknowledged_decision_id) {
+    result.failure = RLMultiQueryResult::Failure::kDuplicateDecisionId;
+    return result;
+  }
+  if (response_decision_id != state.decision_id) {
+    result.failure = RLMultiQueryResult::Failure::kDecisionIdMismatch;
+    return result;
+  }
+  result.actions.reserve(actions.size());
+  for (int action : actions) {
+    if (action < 0 || action > 1) {
+      result.actions.clear();
+      return result;
+    }
+    result.actions.push_back(static_cast<RLAction>(action));
+  }
+  result.decision_id = response_decision_id;
+  result.failure = RLMultiQueryResult::Failure::kNone;
+  result.ok = true;
+  return result;
+}
+
+std::string RLCompactionClient::FormatRequest(const RLStateV2& state) {
+  return FormatStateV2(state);
+}
+
 RLMultiQueryResult RLCompactionClient::QueryActions(const RLStateV2& state) {
   RLMultiQueryResult result;
+  result.failure = RLMultiQueryResult::Failure::kTransport;
   if (state.levels.empty()) {
+    return result;
+  }
+  if (state.protocol_version != 2 || state.credit_assignment_version != 2 ||
+      state.decision_id == 0) {
+    result.failure = RLMultiQueryResult::Failure::kMalformedResponse;
     return result;
   }
 
@@ -352,7 +456,7 @@ RLMultiQueryResult RLCompactionClient::QueryActions(const RLStateV2& state) {
     return result;
   }
 
-  const std::string msg = FormatStateV2(state);
+  const std::string msg = FormatRequest(state);
   if (!SendLine(msg)) {
     Disconnect();
     return result;
@@ -364,19 +468,12 @@ RLMultiQueryResult RLCompactionClient::QueryActions(const RLStateV2& state) {
     return result;
   }
 
-  std::vector<int> actions = ParseIntArrayField(response, "actions");
-  if (actions.size() != state.levels.size()) {
-    // Mis-sized or malformed response: treat as unavailable so the caller
-    // falls back to its local policy rather than misrouting actions.
+  result = DecodeResponse(state, response, last_acknowledged_decision_id_);
+  if (!result.ok) {
+    Disconnect();
     return result;
   }
-
-  result.actions.reserve(actions.size());
-  for (int a : actions) {
-    if (a < 0 || a > 1) a = static_cast<int>(RLAction::kDoNothing);
-    result.actions.push_back(static_cast<RLAction>(a));
-  }
-  result.ok = true;
+  last_acknowledged_decision_id_ = result.decision_id;
   return result;
 }
 

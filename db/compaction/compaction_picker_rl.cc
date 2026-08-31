@@ -163,6 +163,7 @@ RLCompactionPicker::RLCompactionPicker(const ImmutableOptions& ioptions,
       EnvBool("RL_REQUIRE_BASELINE_SLO", false), &manifest_error);
   if (slo_safety_->invalid()) {
     slo_manifest_invalid_.store(true, std::memory_order_relaxed);
+    MarkRewardInvalid(RLRewardInvalidReason::kRejectedManifest);
     ROCKS_LOG_WARN(ioptions_.logger,
                    "RL baseline SLO manifest rejected; learned trigger will "
                    "use conservative all-due native eligibility: %s",
@@ -171,9 +172,6 @@ RLCompactionPicker::RLCompactionPicker(const ImmutableOptions& ioptions,
     ROCKS_LOG_WARN(ioptions_.logger,
                    "RL safety is using explicitly uncalibrated bootstrap "
                    "limits; do not report this as baseline-calibrated");
-  }
-  for (int level = 0; level < kMaxRLLevels; ++level) {
-    last_transition_valid_[level].store(true, std::memory_order_relaxed);
   }
 }
 
@@ -379,6 +377,7 @@ void RLCompactionPicker::BuildObservation(
     const RLStructuralSnapshot& structural, RLStateV2* state) const {
   const uint64_t now = NowMicros();
   state->protocol_version = 2;
+  state->credit_assignment_version = 2;
   state->snapshot_epoch = structural.snapshot_epoch;
   state->pending_compaction_bytes = structural.pending_compaction_bytes;
   state->physical_sst_bytes = structural.physical_sst_bytes;
@@ -476,8 +475,6 @@ void RLCompactionPicker::BuildObservation(
         last_scheduling_result_[level].load(std::memory_order_relaxed);
     ls.prev_override_reason =
         last_override_reason_[level].load(std::memory_order_relaxed);
-    ls.prev_transition_valid =
-        last_transition_valid_[level].load(std::memory_order_relaxed);
     const LevelPermit& permit = permit_snapshot[level];
     ls.gate_open = permit.mode != PermitMode::kClosed;
     ls.gate_mode = static_cast<int>(permit.mode);
@@ -632,15 +629,13 @@ bool RLCompactionPicker::ApplyCrossingPosture(int level, LevelPermit& permit,
   permit.retry_generation = 0;
   permit.eligibility_opened_micros = now_micros;
   permit.first_schedule_micros = 0;
-  // Unlike ForceOpenLevel, the transition stays VALID for replay. This is a
-  // fixed, declared property of the environment — the same treatment
-  // RL_L0_ALLOW_DEFER=0 already receives — not a reactive safety intervention,
-  // and the learner keys its sample on the executed action.
-  permit.transition_valid = true;
+  // This fixed posture is a known policy transformation. The learner retains
+  // the interval and relabels the acknowledged decision to compact.
   last_effective_action_[level].store(1, std::memory_order_relaxed);
   last_action_overridden_[level].store(true, std::memory_order_relaxed);
   last_override_reason_[level].store(static_cast<int>(ActionReason::kPosture),
                                      std::memory_order_relaxed);
+  RecordKnownOverride(ActionReason::kPosture);
   posture_admissions_[level].fetch_add(1, std::memory_order_relaxed);
   return true;
 }
@@ -761,7 +756,6 @@ void RLCompactionPicker::InstallPolicyFrame(
     next.structural_generation = state.structural_built_generation;
     next.installed_micros = now;
     next.reason = ActionReason::kPolicy;
-    next.transition_valid = true;
     next.action = actions[index] == RLAction::kCompactNow
                       ? PolicyAction::kCompact
                       : PolicyAction::kDefer;
@@ -785,7 +779,6 @@ void RLCompactionPicker::InstallPolicyFrame(
       next.reason = previous.reason;
       next.action = PolicyAction::kCompact;
       next.optional_token_available = false;
-      next.transition_valid = false;
     } else if (next.action == PolicyAction::kDefer) {
       next.mode = PermitMode::kClosed;
       next.optional_token_available = false;
@@ -863,11 +856,13 @@ void RLCompactionPicker::InstallPolicyFrame(
     last_scheduling_result_[level].store(0, std::memory_order_relaxed);
     last_override_reason_[level].store(static_cast<int>(next.reason),
                                        std::memory_order_relaxed);
-    last_transition_valid_[level].store(next.transition_valid,
-                                         std::memory_order_relaxed);
     last_decision_id_[level].store(decision_id, std::memory_order_relaxed);
     last_snapshot_epoch_[level].store(state.snapshot_epoch,
                                       std::memory_order_relaxed);
+    if (next.reason != ActionReason::kPolicy ||
+        effective_compact != selected_compact) {
+      RecordKnownOverride(next.reason);
+    }
   }
   for (int level = 0; level < kMaxRLLevels; ++level) {
     if (present[level]) continue;
@@ -881,6 +876,7 @@ void RLCompactionPicker::InstallPolicyFrame(
 
 void RLCompactionPicker::InstallFallbackFrame(
     const RLStateV2& state, std::vector<SchedulingToken>* wake_tokens) {
+  fallback_frames_.fetch_add(1, std::memory_order_relaxed);
   const uint64_t now = NowMicros();
   std::lock_guard<std::mutex> lock(permit_mu_);
   const uint64_t frame_generation = ++decision_generation_;
@@ -897,7 +893,6 @@ void RLCompactionPicker::InstallFallbackFrame(
     next.mode = observed.score >= 1.0 ? PermitMode::kForcedOpen
                                       : PermitMode::kClosed;
     next.reason = ActionReason::kFallback;
-    next.transition_valid = false;
     if (next.mode == PermitMode::kForcedOpen &&
         previous.mode == PermitMode::kForcedOpen &&
         previous.reason == ActionReason::kFallback) {
@@ -924,7 +919,6 @@ void RLCompactionPicker::InstallFallbackFrame(
     last_scheduling_result_[level].store(0, std::memory_order_relaxed);
     last_override_reason_[level].store(static_cast<int>(ActionReason::kFallback),
                                        std::memory_order_relaxed);
-    last_transition_valid_[level].store(false, std::memory_order_relaxed);
     last_decision_id_[level].store(0, std::memory_order_relaxed);
     last_snapshot_epoch_[level].store(state.snapshot_epoch,
                                       std::memory_order_relaxed);
@@ -1042,7 +1036,8 @@ bool RLCompactionPicker::RecordSuccessfulSchedule(
   }
   if (permit.decision_generation == decision_generation) {
     last_effective_action_[level].store(1, std::memory_order_relaxed);
-    last_action_overridden_[level].store(false, std::memory_order_relaxed);
+    last_action_overridden_[level].store(
+        permit.reason != ActionReason::kPolicy, std::memory_order_relaxed);
     last_scheduling_result_[level].store(1, std::memory_order_relaxed);
     compaction_picked_[level].store(true, std::memory_order_relaxed);
   }
@@ -1070,18 +1065,44 @@ void RLCompactionPicker::ForceOpenLevel(const VersionStorageInfo* vstorage,
   permit.mode = PermitMode::kForcedOpen;
   permit.reason = reason;
   permit.optional_token_available = false;
-  permit.transition_valid = false;
   permit.installed_micros = NowMicros();
   last_effective_action_[level].store(1, std::memory_order_relaxed);
   last_action_overridden_[level].store(true, std::memory_order_relaxed);
   last_override_reason_[level].store(static_cast<int>(reason),
                                      std::memory_order_relaxed);
-  // The learner uses one cooperative whole-tree reward. A forced compaction
-  // changes that reward for every head, so the complete response frame is
-  // unattributable even when only one source level was forced.
-  for (int index = 0; index < kMaxRLLevels; ++index) {
-    last_transition_valid_[index].store(false, std::memory_order_relaxed);
+  RecordKnownOverride(reason);
+}
+
+void RLCompactionPicker::MarkRewardInvalid(
+    RLRewardInvalidReason reason) const {
+  const uint64_t bit = static_cast<uint64_t>(reason);
+  const uint64_t previous =
+      reward_invalid_reason_mask_.fetch_or(bit, std::memory_order_relaxed);
+  if (previous == 0) {
+    hard_reward_invalid_frames_.fetch_add(1, std::memory_order_relaxed);
   }
+}
+
+void RLCompactionPicker::RecordKnownOverride(ActionReason reason) const {
+  const int index = static_cast<int>(reason);
+  if (index >= 0 && index < 10) {
+    known_override_counts_[index].fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+bool RLCompactionPicker::AcceptResponseStructure(
+    const RLStateV2& state) const {
+  uint64_t current_source_generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(snap_mu_);
+    current_source_generation = structural_source_generation_;
+  }
+  if (state.structural_built_generation != 0 &&
+      state.structural_built_generation == current_source_generation) {
+    return true;
+  }
+  stale_response_rejections_.fetch_add(1, std::memory_order_relaxed);
+  return false;
 }
 
 uint64_t RLCompactionPicker::ResponseWatchdogMicros() const {
@@ -1255,8 +1276,8 @@ RLCompactionPicker::ClassifyWorkerSafety(const RLStateV2& state,
       // evaluates the exit condition. Mirror that behavior in shadow mode: a
       // budget/emergency force lasts until the episode is healthy, whereas an
       // SLO or stale-structure force has a distinct release frame. That release
-      // frame still suppresses the just-returned policy response and is not a
-      // valid learning transition.
+      // frame still suppresses the just-returned policy response, but publishes
+      // the known effective defer action as off-policy experience.
       const bool retain =
           previous_force_reason == ActionReason::kBudget ||
           previous_force_reason == ActionReason::kEmergency ||
@@ -1276,7 +1297,7 @@ RLCompactionPicker::ClassifyWorkerSafety(const RLStateV2& state,
     classified_force_active_[level] = item.force;
     if (item.force) classified_force_reason_[level] = item.force_reason;
     if (item.revoke_optional || item.force || item.release_forced) {
-      evaluation.would_invalidate_frame = true;
+      evaluation.would_override_frame = true;
       const ActionReason reason = (item.force || item.release_forced)
                                       ? item.force_reason
                                       : ActionReason::kSLO;
@@ -1307,10 +1328,21 @@ bool RLCompactionPicker::ApplyWorkerSafety(
       // the permit between those phases; never apply a stale optional revoke
       // to that newer due/forced permit.
       if (item.revoke_optional && permit.mode == PermitMode::kOptionalOpen) {
+        const uint64_t decision_id = permit.decision_id;
+        const uint64_t decision_generation = permit.decision_generation;
         permit = LevelPermit();
+        permit.decision_id = decision_id;
+        permit.decision_generation = decision_generation;
+        permit.action = PolicyAction::kDefer;
+        permit.reason = ActionReason::kSLO;
+        permit.installed_micros = evaluation.now_micros;
         permit.eligibility_generation = ++next_eligibility_generation_;
-        last_transition_valid_[level].store(false,
+        last_effective_action_[level].store(0, std::memory_order_relaxed);
+        last_action_overridden_[level].store(true,
                                              std::memory_order_relaxed);
+        last_override_reason_[level].store(
+            static_cast<int>(ActionReason::kSLO), std::memory_order_relaxed);
+        RecordKnownOverride(ActionReason::kSLO);
         tree_transition_overridden = true;
       }
       if (item.force) {
@@ -1331,14 +1363,23 @@ bool RLCompactionPicker::ApplyWorkerSafety(
         permit.mode = PermitMode::kForcedOpen;
         permit.reason = item.force_reason;
         permit.optional_token_available = false;
-        permit.transition_valid = false;
         permit.installed_micros = evaluation.now_micros;
+        last_effective_action_[level].store(1, std::memory_order_relaxed);
         last_action_overridden_[level].store(true,
                                              std::memory_order_relaxed);
         last_override_reason_[level].store(static_cast<int>(permit.reason),
                                            std::memory_order_relaxed);
-        last_transition_valid_[level].store(false,
-                                             std::memory_order_relaxed);
+        if (item.force_reason == ActionReason::kManifest) {
+          // A rejected manifest means the controller cannot establish which
+          // safety contract owns the interval. It is a hard attribution
+          // boundary, not ordinary constrained-policy experience.
+          for (int index = 0; index < kMaxRLLevels; ++index) {
+            last_decision_id_[index].store(0, std::memory_order_relaxed);
+          }
+          MarkRewardInvalid(RLRewardInvalidReason::kRejectedManifest);
+        } else {
+          RecordKnownOverride(item.force_reason);
+        }
         tree_transition_overridden = true;
       } else if (permit.mode == PermitMode::kForcedOpen &&
                  ((!item.due &&
@@ -1348,8 +1389,22 @@ bool RLCompactionPicker::ApplyWorkerSafety(
                    !evaluation.slo_force_due) ||
                   (permit.reason == ActionReason::kStaleStructure &&
                    !evaluation.dirty_deadline_miss))) {
+        const uint64_t decision_id = permit.decision_id;
+        const uint64_t decision_generation = permit.decision_generation;
+        const ActionReason released_reason = permit.reason;
         permit = LevelPermit();
+        permit.decision_id = decision_id;
+        permit.decision_generation = decision_generation;
+        permit.action = PolicyAction::kDefer;
+        permit.reason = released_reason;
+        permit.installed_micros = evaluation.now_micros;
         permit.eligibility_generation = ++next_eligibility_generation_;
+        last_effective_action_[level].store(0, std::memory_order_relaxed);
+        last_action_overridden_[level].store(true,
+                                             std::memory_order_relaxed);
+        last_override_reason_[level].store(static_cast<int>(released_reason),
+                                           std::memory_order_relaxed);
+        RecordKnownOverride(released_reason);
         // InstallPolicyFrame retained the old safety permit before the current
         // exit condition was known, so its newly returned policy action was
         // suppressed on this release frame as well.
@@ -1358,11 +1413,6 @@ bool RLCompactionPicker::ApplyWorkerSafety(
     }
   }
 
-  if (tree_transition_overridden) {
-    for (int level = 0; level < kMaxRLLevels; ++level) {
-      last_transition_valid_[level].store(false, std::memory_order_relaxed);
-    }
-  }
   for (const SchedulingToken& token : wake_tokens) {
     RequestScheduling(token, evaluation.now_micros);
   }
@@ -1386,15 +1436,13 @@ void RLCompactionPicker::EvaluateWorkerSafety(const RLStateV2& state,
   const bool dirty_deadline_miss = StructuralDirtyDeadlineMiss(now);
 
   if (!oracle_mode_ && rl_available_.load(std::memory_order_acquire)) {
-    uint64_t last_response = 0;
-    {
-      std::lock_guard<std::mutex> lock(permit_mu_);
-      last_response = last_valid_response_micros_;
-    }
+    const uint64_t last_response =
+        last_server_response_micros_.load(std::memory_order_relaxed);
     if (last_response != 0 && now > last_response &&
         now - last_response > ResponseWatchdogMicros()) {
       rl_available_.store(false, std::memory_order_release);
       watchdog_expiries_.fetch_add(1, std::memory_order_relaxed);
+      MarkRewardInvalid(RLRewardInvalidReason::kWatchdogNativeFallback);
       InstallFallbackFrame(state, &watchdog_wakes);
     }
   }
@@ -1409,7 +1457,7 @@ void RLCompactionPicker::EvaluateWorkerSafety(const RLStateV2& state,
   if (safety_enabled_ || safety_shadow_log_.is_open()) {
     const SafetyFrameEvaluation evaluation =
         ClassifyWorkerSafety(state, slo, dirty_deadline_miss, now);
-    if (evaluation.would_invalidate_frame) {
+    if (evaluation.would_override_frame) {
       safety_would_override_windows_.fetch_add(1, std::memory_order_relaxed);
     }
     const bool intervention_applied =
@@ -1510,8 +1558,6 @@ void RLCompactionPicker::TraceControlState(const RLStateV2& state) const {
                    << permit.decision_generation
                    << ",\"eligibility_generation\":"
                    << permit.eligibility_generation
-                   << ",\"transition_valid\":"
-                   << (permit.transition_valid ? "true" : "false")
                    << ",\"in_backoff\":"
                    << (permit.backoff_until_micros > now ? "true" : "false")
                    << '}';
@@ -1551,7 +1597,7 @@ void RLCompactionPicker::TraceSafetyShadow(
     const RLStateV2& state, const SafetyFrameEvaluation& evaluation,
     bool actuate, bool intervention_applied) const {
   if (!safety_shadow_log_ || state.interval_micros == 0) return;
-  safety_shadow_log_ << "{\"schema_version\":1,\"experiment_fingerprint\":";
+  safety_shadow_log_ << "{\"schema_version\":2,\"experiment_fingerprint\":";
   WriteJSONString(safety_shadow_log_, experiment_fingerprint_);
   safety_shadow_log_ << ",\"baseline_slo_sha256\":";
   WriteJSONString(safety_shadow_log_, baseline_slo_sha256_);
@@ -1561,8 +1607,8 @@ void RLCompactionPicker::TraceSafetyShadow(
                      << (evaluation.guard_ready ? "true" : "false")
                      << ",\"actuation_frame\":"
                      << (actuate ? "true" : "false")
-                     << ",\"would_invalidate_frame\":"
-                     << (evaluation.would_invalidate_frame ? "true" : "false")
+                     << ",\"would_override_frame\":"
+                     << (evaluation.would_override_frame ? "true" : "false")
                      << ",\"reason_mask\":" << evaluation.reason_mask
                      << ",\"observed_levels\":" << state.levels.size()
                      << ",\"enforcement_enabled\":"
@@ -1684,19 +1730,34 @@ void RLCompactionPicker::RunDecisionCycle(
   // silently discard the selected action, corrupting replay attribution.
   if (!actuate) return;
 
+  RLCompactionClient& client = RLCompactionClient::Get();
+  state.decision_id = client.AllocateDecisionId();
+  state.prev_reward_invalid_reason_mask =
+      reward_invalid_reason_mask_.exchange(0, std::memory_order_acq_rel);
+  rl_query_count_.fetch_add(1, std::memory_order_relaxed);
+
   RLMultiQueryResult result;
   if (oracle_mode_) {
     result.ok = true;
+    result.decision_id = state.decision_id;
     for (const RLLevelState& level : state.levels) {
       result.actions.push_back(level.score >= 1.0 ? RLAction::kCompactNow
                                                   : RLAction::kDoNothing);
     }
   } else {
-    result = RLCompactionClient::Get().QueryActions(state);
+    result = client.QueryActions(state);
   }
-  const uint64_t query_id =
-      rl_query_count_.fetch_add(1, std::memory_order_relaxed) + 1;
   if (!result.ok) {
+    if (result.failure == RLMultiQueryResult::Failure::kTransport) {
+      // The request may not have reached Python. Preserve any older pending
+      // reason bits so the next successful observation cannot lose them.
+      reward_invalid_reason_mask_.fetch_or(
+          state.prev_reward_invalid_reason_mask, std::memory_order_relaxed);
+      MarkRewardInvalid(RLRewardInvalidReason::kSocketOrQueryFallback);
+    } else {
+      MarkRewardInvalid(RLRewardInvalidReason::kMalformedProtocol);
+      protocol_mismatches_.fetch_add(1, std::memory_order_relaxed);
+    }
     rl_available_.store(false, std::memory_order_release);
     const uint64_t failures =
         rl_fallback_count_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1719,21 +1780,14 @@ void RLCompactionPicker::RunDecisionCycle(
     return;
   }
 
-  uint64_t current_source_generation = 0;
-  {
-    std::lock_guard<std::mutex> lock(snap_mu_);
-    current_source_generation = structural_source_generation_;
-  }
-  if (state.structural_built_generation == 0 ||
-      state.structural_built_generation != current_source_generation) {
+  // The server answered this decision id correctly. Record that before the
+  // structural test, which can reject many consecutive frames while Python is
+  // perfectly responsive.
+  last_server_response_micros_.store(NowMicros(), std::memory_order_relaxed);
+
+  if (!AcceptResponseStructure(state)) {
     // Advice produced from a superseded structure cannot close safety gates or
     // grant optional work. Preserve the prior frame in full.
-    for (const RLLevelState& level : state.levels) {
-      if (level.level >= 0 && level.level < kMaxRLLevels) {
-        last_transition_valid_[level.level].store(false,
-                                                   std::memory_order_relaxed);
-      }
-    }
     return;
   }
   // InstallPolicyFrame publishes the response under permit_mu_. Close its
@@ -1744,7 +1798,8 @@ void RLCompactionPicker::RunDecisionCycle(
   if (safety_enabled_) {
     safety_evaluation_pending_.store(true, std::memory_order_release);
   }
-  InstallPolicyFrame(state, result.actions, query_id, wake_tokens);
+  InstallPolicyFrame(state, result.actions, result.decision_id, wake_tokens);
+  response_acknowledgements_.fetch_add(1, std::memory_order_relaxed);
   rl_actuation_count_.fetch_add(1, std::memory_order_relaxed);
   rl_fallback_logged_.store(false, std::memory_order_relaxed);
   // Publish availability only after the complete permit frame is visible.
@@ -1819,7 +1874,16 @@ void RLCompactionPicker::WorkerLoop() {
     ObserveDueEpisodeTransitions();
     {
       std::lock_guard<std::mutex> lock(snap_mu_);
-      last_sent_levels_ = std::move(levels);
+      // Shutdown must acknowledge every level that may still own an open
+      // Python credit window, not only the levels populated in the final
+      // structural snapshot. Levels can empty and disappear before teardown.
+      for (int level : levels) {
+        if (std::find(last_sent_levels_.begin(), last_sent_levels_.end(),
+                      level) == last_sent_levels_.end()) {
+          last_sent_levels_.push_back(level);
+        }
+      }
+      std::sort(last_sent_levels_.begin(), last_sent_levels_.end());
     }
     LogDiagnostics(false);
   }
@@ -1835,6 +1899,10 @@ void RLCompactionPicker::SendDoneMessage() {
   if (levels.empty()) return;
   RLStateV2 state;
   state.protocol_version = 2;
+  state.credit_assignment_version = 2;
+  state.decision_id = RLCompactionClient::Get().AllocateDecisionId();
+  state.prev_reward_invalid_reason_mask =
+      reward_invalid_reason_mask_.exchange(0, std::memory_order_acq_rel);
   state.done = true;
   for (int source_level : levels) {
     RLLevelState level;
@@ -1845,8 +1913,10 @@ void RLCompactionPicker::SendDoneMessage() {
         compaction_picked_[source_level].load(std::memory_order_relaxed);
     level.prev_decision_id =
         last_decision_id_[source_level].load(std::memory_order_relaxed);
-    level.prev_transition_valid =
-        last_transition_valid_[source_level].load(std::memory_order_relaxed);
+    level.prev_action_overridden =
+        last_action_overridden_[source_level].load(std::memory_order_relaxed);
+    level.prev_override_reason =
+        last_override_reason_[source_level].load(std::memory_order_relaxed);
     state.levels.push_back(std::move(level));
   }
   RLCompactionClient::Get().QueryActions(state);
@@ -1881,7 +1951,8 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
         posture_admissions_[level].load(std::memory_order_relaxed);
   }
   ROCKS_LOG_INFO(ioptions_.logger,
-                 "RL trigger diagnostics: protocol=2 queries=%" PRIu64
+                 "RL trigger diagnostics: protocol=2 credit_assignment=2"
+                 " queries=%" PRIu64
                  " actuations=%" PRIu64 " bypasses=%" PRIu64
                  " skipped_ticks=%" PRIu64 " cumulative_fallbacks=%" PRIu64
                  " available=%d nc_calls=%" PRIu64 " nc_total_ms=%" PRIu64
@@ -1894,6 +1965,19 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                  " slo_masked_windows=%" PRIu64
                  " safety_would_override_windows=%" PRIu64
                  " safety_applied_override_windows=%" PRIu64
+                 " response_acknowledgements=%" PRIu64
+                 " stale_response_rejections=%" PRIu64
+                 " hard_reward_invalid_frames=%" PRIu64
+                 " protocol_mismatches=%" PRIu64
+                 " fallback_frames=%" PRIu64
+                 " override_policy=%" PRIu64
+                 " override_budget=%" PRIu64
+                 " override_maintenance=%" PRIu64
+                 " override_emergency=%" PRIu64
+                 " override_drain=%" PRIu64
+                 " override_slo=%" PRIu64
+                 " override_stale_structure=%" PRIu64
+                 " override_posture=%" PRIu64
                  " dirty_deadline_misses=%" PRIu64
                  " dirty_deadline_active=%d slo_read=%d slo_write=%d"
                  " slo_space=%d manifest_invalid=%d"
@@ -1930,6 +2014,30 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                      std::memory_order_relaxed),
                  safety_applied_override_windows_.load(
                      std::memory_order_relaxed),
+                 response_acknowledgements_.load(std::memory_order_relaxed),
+                 stale_response_rejections_.load(std::memory_order_relaxed),
+                 hard_reward_invalid_frames_.load(std::memory_order_relaxed),
+                 protocol_mismatches_.load(std::memory_order_relaxed),
+                 fallback_frames_.load(std::memory_order_relaxed),
+                 known_override_counts_[static_cast<int>(ActionReason::kPolicy)]
+                     .load(std::memory_order_relaxed),
+                 known_override_counts_[static_cast<int>(ActionReason::kBudget)]
+                     .load(std::memory_order_relaxed),
+                 known_override_counts_[static_cast<int>(
+                     ActionReason::kMaintenance)].load(
+                         std::memory_order_relaxed),
+                 known_override_counts_[static_cast<int>(
+                     ActionReason::kEmergency)].load(
+                         std::memory_order_relaxed),
+                 known_override_counts_[static_cast<int>(ActionReason::kDrain)]
+                     .load(std::memory_order_relaxed),
+                 known_override_counts_[static_cast<int>(ActionReason::kSLO)]
+                     .load(std::memory_order_relaxed),
+                 known_override_counts_[static_cast<int>(
+                     ActionReason::kStaleStructure)].load(
+                         std::memory_order_relaxed),
+                 known_override_counts_[static_cast<int>(
+                     ActionReason::kPosture)].load(std::memory_order_relaxed),
                  dirty_deadline_misses_.load(std::memory_order_relaxed),
                  dirty_deadline_active_.load(std::memory_order_relaxed) ? 1 : 0,
                  slo_read_breach_.load(std::memory_order_relaxed) ? 1 : 0,
@@ -1991,16 +2099,10 @@ bool RLCompactionPicker::NeedsCompaction(
   } timer{this, start};
 
   if (RLDrainMode()) {
-    for (int level = 0; level < kMaxRLLevels; ++level) {
-      last_transition_valid_[level].store(false, std::memory_order_relaxed);
-    }
     return LevelCompactionPicker::NeedsCompaction(vstorage);
   }
   if (HasMaintenanceWork(vstorage)) {
     rl_bypass_count_.fetch_add(1, std::memory_order_relaxed);
-    for (int level = 0; level < kMaxRLLevels; ++level) {
-      last_transition_valid_[level].store(false, std::memory_order_relaxed);
-    }
     return true;
   }
 
@@ -2026,23 +2128,18 @@ bool RLCompactionPicker::NeedsCompaction(
   }
 
   if (!oracle_mode_ && rl_available_.load(std::memory_order_acquire)) {
-    uint64_t last_response = 0;
-    {
-      std::lock_guard<std::mutex> lock(permit_mu_);
-      last_response = last_valid_response_micros_;
-    }
+    const uint64_t last_response =
+        last_server_response_micros_.load(std::memory_order_relaxed);
     const uint64_t now = NowMicros();
     if (last_response != 0 && now > last_response &&
         now - last_response > ResponseWatchdogMicros()) {
       rl_available_.store(false, std::memory_order_release);
       watchdog_expiries_.fetch_add(1, std::memory_order_relaxed);
+      MarkRewardInvalid(RLRewardInvalidReason::kWatchdogNativeFallback);
     }
   }
 
   if (!rl_available_.load(std::memory_order_acquire)) {
-    for (int level = 0; level < kMaxRLLevels; ++level) {
-      last_transition_valid_[level].store(false, std::memory_order_relaxed);
-    }
     return LevelCompactionPicker::NeedsCompaction(vstorage);
   }
 
@@ -2094,11 +2191,26 @@ Compaction* RLCompactionPicker::PickCompaction(
         snapshot_checker, vstorage, log_buffer, full_history_ts_low,
         require_max_output_level);
     if (compaction != nullptr) {
-      compaction->SetRLDecisionAttribution(0, SnapshotEpoch(vstorage),
-                                           parent_reason);
       const int level = std::max(
           0, std::min(compaction->start_level(), kMaxRLLevels - 1));
-      last_transition_valid_[level].store(false, std::memory_order_relaxed);
+      const ActionReason reason = static_cast<ActionReason>(parent_reason);
+      uint64_t decision_id =
+          last_decision_id_[level].load(std::memory_order_relaxed);
+      if (reason == ActionReason::kFallback) {
+        decision_id = 0;
+        for (int index = 0; index < kMaxRLLevels; ++index) {
+          last_decision_id_[index].store(0, std::memory_order_relaxed);
+        }
+        MarkRewardInvalid(RLRewardInvalidReason::kUnknownControlOwnership);
+      } else {
+        RecordKnownOverride(reason);
+      }
+      compaction->SetRLDecisionAttribution(
+          decision_id, SnapshotEpoch(vstorage), parent_reason);
+      last_effective_action_[level].store(1, std::memory_order_relaxed);
+      last_action_overridden_[level].store(true, std::memory_order_relaxed);
+      last_override_reason_[level].store(parent_reason,
+                                         std::memory_order_relaxed);
       RLCompactionTelemetry::Get().RecordCompactionScheduled(
           compaction->start_level(), false);
     }

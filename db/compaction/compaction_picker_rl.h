@@ -109,7 +109,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
     PermitMode mode = PermitMode::kClosed;
     ActionReason reason = ActionReason::kPolicy;
     bool optional_token_available = false;
-    bool transition_valid = true;
     // True when this permit's action was selected against a level observed
     // BELOW its trigger. Such a `defer` is not a decision to defer anything —
     // nothing was due — so binding it once the level crosses applies a permit
@@ -145,7 +144,7 @@ class RLCompactionPicker : public LevelCompactionPicker {
     bool dirty_deadline_miss = false;
     bool slo_force_due = false;
     bool prohibit_optional = false;
-    bool would_invalidate_frame = false;
+    bool would_override_frame = false;
     uint64_t reason_mask = 0;
     SafetyLevelEvaluation levels[kMaxRLLevels];
   };
@@ -250,6 +249,13 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable uint64_t next_eligibility_generation_{0};
   mutable uint64_t next_retry_generation_{0};
   mutable uint64_t last_valid_response_micros_{0};
+  // Liveness of the response path, distinct from last_valid_response_micros_
+  // above, which times installed frames and feeds the cadence histogram. A
+  // well-formed, decision-id-matched response proves the server is alive even
+  // when the frame is then discarded as structurally stale, so the watchdog
+  // must read this clock; otherwise a compaction storm that keeps rejecting
+  // frames is indistinguishable from a dead server.
+  mutable std::atomic<uint64_t> last_server_response_micros_{0};
   mutable std::deque<uint64_t> response_spacings_micros_;
   mutable std::atomic<uint64_t> watchdog_expiries_{0};
   mutable std::atomic<uint64_t> blocked_attempts_{0};
@@ -258,6 +264,13 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<uint64_t> slo_masked_windows_{0};
   mutable std::atomic<uint64_t> safety_would_override_windows_{0};
   mutable std::atomic<uint64_t> safety_applied_override_windows_{0};
+  mutable std::atomic<uint64_t> response_acknowledgements_{0};
+  mutable std::atomic<uint64_t> stale_response_rejections_{0};
+  mutable std::atomic<uint64_t> hard_reward_invalid_frames_{0};
+  mutable std::atomic<uint64_t> protocol_mismatches_{0};
+  mutable std::atomic<uint64_t> fallback_frames_{0};
+  mutable std::atomic<uint64_t> known_override_counts_[10] = {};
+  mutable std::atomic<uint64_t> reward_invalid_reason_mask_{0};
   mutable std::atomic<uint64_t> dirty_deadline_misses_{0};
   mutable std::atomic<bool> dirty_deadline_active_{false};
   mutable std::atomic<bool> slo_read_breach_{false};
@@ -329,7 +342,6 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<uint64_t> last_snapshot_epoch_[kMaxRLLevels] = {};
   mutable std::atomic<int> last_scheduling_result_[kMaxRLLevels] = {};
   mutable std::atomic<int> last_override_reason_[kMaxRLLevels] = {};
-  mutable std::atomic<bool> last_transition_valid_[kMaxRLLevels] = {};
 
   mutable std::atomic<bool> rl_available_{false};
   std::atomic<int> rl_l0_trigger_{4};
@@ -388,6 +400,9 @@ class RLCompactionPicker : public LevelCompactionPicker {
                                 uint64_t decision_generation) const;
   void ForceOpenLevel(const VersionStorageInfo* vstorage, int level,
                       ActionReason reason) const;
+  void MarkRewardInvalid(RLRewardInvalidReason reason) const;
+  void RecordKnownOverride(ActionReason reason) const;
+  bool AcceptResponseStructure(const RLStateV2& state) const;
   uint64_t ResponseWatchdogMicros() const;
   // Normalized pending debt against the manifest limit, or the configured
   // bootstrap cap. A byte-valued cap cannot serve 1M and 50M workloads with

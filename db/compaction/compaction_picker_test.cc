@@ -299,6 +299,20 @@ class CompactionPickerTest : public CompactionPickerTestBase {
   }
 };
 
+class RLCompactionClientTestPeer {
+ public:
+  static RLMultiQueryResult Decode(const RLStateV2& state,
+                                   const std::string& response,
+                                   uint64_t last_acknowledged) {
+    return RLCompactionClient::DecodeResponse(state, response,
+                                              last_acknowledged);
+  }
+
+  static std::string Format(const RLStateV2& state) {
+    return RLCompactionClient::FormatRequest(state);
+  }
+};
+
 class RLCompactionPickerTestPeer {
  public:
   using SafetyFrameEvaluation = RLCompactionPicker::SafetyFrameEvaluation;
@@ -334,7 +348,8 @@ class RLCompactionPickerTestPeer {
                            : RLCompactionPicker::PermitMode::kDueOpen;
     permit.reason = RLCompactionPicker::ActionReason::kPolicy;
     permit.optional_token_available = optional;
-    permit.transition_valid = true;
+    picker->last_decision_id_[level].store(decision_id,
+                                            std::memory_order_relaxed);
   }
 
   static std::shared_ptr<const RLCompactionPicker::RLStructuralSnapshot>
@@ -486,6 +501,37 @@ class RLCompactionPickerTestPeer {
     return static_cast<int>(picker->permits_[level].mode);
   }
 
+  static int LastEffectiveAction(RLCompactionPicker* picker, int level) {
+    return picker->last_effective_action_[level].load(
+        std::memory_order_relaxed);
+  }
+
+  static bool LastActionOverridden(RLCompactionPicker* picker, int level) {
+    return picker->last_action_overridden_[level].load(
+        std::memory_order_relaxed);
+  }
+
+  static uint64_t LastDecisionId(RLCompactionPicker* picker, int level) {
+    return picker->last_decision_id_[level].load(std::memory_order_relaxed);
+  }
+
+  static bool AcceptResponseStructure(RLCompactionPicker* picker,
+                                      const RLStateV2& state) {
+    return picker->AcceptResponseStructure(state);
+  }
+
+  static uint64_t StaleResponseRejections(RLCompactionPicker* picker) {
+    return picker->stale_response_rejections_.load(std::memory_order_relaxed);
+  }
+
+  static uint64_t RewardInvalidReasonMask(RLCompactionPicker* picker) {
+    return picker->reward_invalid_reason_mask_.load(std::memory_order_relaxed);
+  }
+
+  static uint64_t HardRewardInvalidFrames(RLCompactionPicker* picker) {
+    return picker->hard_reward_invalid_frames_.load(std::memory_order_relaxed);
+  }
+
   static void SetSafetyEnabled(RLCompactionPicker* picker, bool enabled) {
     picker->safety_enabled_ = enabled;
   }
@@ -521,6 +567,79 @@ class RLCompactionPickerTestPeer {
         std::memory_order_relaxed);
   }
 };
+
+TEST_F(CompactionPickerTest, RLCreditV2SerializesAndAcknowledgesExactIds) {
+  RLStateV2 state;
+  state.credit_assignment_version = 2;
+  state.decision_id = std::numeric_limits<uint64_t>::max();
+  state.prev_reward_invalid_reason_mask = 5;
+  RLLevelState first;
+  first.level = 0;
+  first.prev_decision_id = state.decision_id - 1;
+  RLLevelState second;
+  second.level = 1;
+  second.prev_decision_id = state.decision_id - 1;
+  state.levels = {first, second};
+
+  const std::string request = RLCompactionClientTestPeer::Format(state);
+  ASSERT_NE(request.find("\"credit_assignment_version\":2"),
+            std::string::npos);
+  ASSERT_NE(request.find("\"decision_id\":18446744073709551615"),
+            std::string::npos);
+  ASSERT_NE(request.find("\"prev_reward_invalid_reason_mask\":5"),
+            std::string::npos);
+  ASSERT_EQ(request.find("prev_transition_valid"), std::string::npos);
+
+  const auto accepted = RLCompactionClientTestPeer::Decode(
+      state, "{\"decision_id\":18446744073709551615,\"actions\":[0,1]}",
+      /*last_acknowledged=*/0);
+  ASSERT_TRUE(accepted.ok);
+  ASSERT_EQ(accepted.decision_id, state.decision_id);
+}
+
+TEST_F(CompactionPickerTest, RLCreditV2RejectsMalformedDuplicateAndMismatchedIds) {
+  RLStateV2 state;
+  state.decision_id = 42;
+  state.levels.resize(1);
+  using Failure = RLMultiQueryResult::Failure;
+
+  ASSERT_EQ(RLCompactionClientTestPeer::Decode(
+                state, "{\"decision_id\":42.0,\"actions\":[0]}", 0)
+                .failure,
+            Failure::kMalformedResponse);
+  ASSERT_EQ(RLCompactionClientTestPeer::Decode(
+                state,
+                "{\"decision_id\":42,\"decision_id\":42,\"actions\":[0]}",
+                0)
+                .failure,
+            Failure::kMalformedResponse);
+  ASSERT_EQ(RLCompactionClientTestPeer::Decode(
+                state, "{\"decision_id\":41,\"actions\":[0]}", 0)
+                .failure,
+            Failure::kDecisionIdMismatch);
+  ASSERT_EQ(RLCompactionClientTestPeer::Decode(
+                state, "{\"decision_id\":42,\"actions\":[0]}", 42)
+                .failure,
+            Failure::kDuplicateDecisionId);
+}
+
+TEST_F(CompactionPickerTest, RLStaleStructuralResponseRejectsOnlyNewAdvice) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/77);
+  RLCompactionPickerTestPeer::SetDirtyDeadlineState(
+      &picker, /*source_generation=*/8, /*built_generation=*/7,
+      /*dirty_since_micros=*/0, /*deadline_micros=*/50);
+  RLStateV2 stale;
+  stale.structural_built_generation = 7;
+
+  ASSERT_FALSE(
+      RLCompactionPickerTestPeer::AcceptResponseStructure(&picker, stale));
+  ASSERT_EQ(RLCompactionPickerTestPeer::StaleResponseRejections(&picker), 1U);
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastDecisionId(&picker, 1), 77U);
+  ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 1);
+}
 
 TEST_F(CompactionPickerTest, RLTriggerUsesRocksDBNativeFilePriority) {
   NewVersionStorage(4, kCompactionStyleLevel);
@@ -875,7 +994,7 @@ TEST_F(CompactionPickerTest,
 
   const auto evaluation =
       RLCompactionPickerTestPeer::ClassifyWriteBreach(&picker, state);
-  ASSERT_TRUE(evaluation.would_invalidate_frame);
+  ASSERT_TRUE(evaluation.would_override_frame);
   ASSERT_TRUE(evaluation.levels[1].revoke_optional);
   ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 0);
 }
@@ -903,6 +1022,9 @@ TEST_F(CompactionPickerTest, RLSafetyRevalidatesOptionalRevokeAtApplyTime) {
       RLCompactionPickerTestPeer::ClassifyWriteBreach(&picker, state);
   ASSERT_TRUE(RLCompactionPickerTestPeer::ApplySafety(&picker, state, current));
   ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 0);
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastEffectiveAction(&picker, 1), 0);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::LastActionOverridden(&picker, 1));
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastDecisionId(&picker, 1), 92U);
 }
 
 TEST_F(CompactionPickerTest,
@@ -933,6 +1055,8 @@ TEST_F(CompactionPickerTest, RLSafetyShadowIncludesHeldAndReleaseFrames) {
   level.files = 1;
   level.score = 1.1;
   state.levels.push_back(level);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/95);
 
   RLSLOBreachState breach;
   breach.guard_ready = true;
@@ -942,19 +1066,24 @@ TEST_F(CompactionPickerTest, RLSafetyShadowIncludesHeldAndReleaseFrames) {
   ASSERT_TRUE(forced.levels[1].force);
   ASSERT_TRUE(RLCompactionPickerTestPeer::ApplySafety(&picker, state, forced));
   ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 3);
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastEffectiveAction(&picker, 1), 1);
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastDecisionId(&picker, 1), 95U);
 
   RLSLOBreachState recovered;
   recovered.guard_ready = true;
   const auto release =
       RLCompactionPickerTestPeer::ClassifySafety(&picker, state, recovered);
-  ASSERT_TRUE(release.would_invalidate_frame);
+  ASSERT_TRUE(release.would_override_frame);
   ASSERT_TRUE(release.levels[1].release_forced);
   ASSERT_TRUE(RLCompactionPickerTestPeer::ApplySafety(&picker, state, release));
   ASSERT_EQ(RLCompactionPickerTestPeer::PermitModeValue(&picker, 1), 0);
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastEffectiveAction(&picker, 1), 0);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::LastActionOverridden(&picker, 1));
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastDecisionId(&picker, 1), 95U);
 
   const auto after_release =
       RLCompactionPickerTestPeer::ClassifySafety(&picker, state, recovered);
-  ASSERT_FALSE(after_release.would_invalidate_frame);
+  ASSERT_FALSE(after_release.would_override_frame);
 }
 
 TEST_F(CompactionPickerTest, RLDirtyStructuralDeadlineIsEdgeCounted) {
@@ -1091,6 +1220,8 @@ TEST_F(CompactionPickerTest, RLMaintenanceBypassIsExplicitlyAttributed) {
 
   RLCompactionPicker picker(ioptions_, &icmp_);
   RLCompactionPickerTestPeer::StopWorker(&picker);
+  RLCompactionPickerTestPeer::InstallPolicyPermit(
+      &picker, /*level=*/1, /*optional=*/false, /*decision_id=*/76);
   ASSERT_TRUE(picker.NeedsCompaction(vstorage_.get()));
   std::unique_ptr<Compaction> compaction(
       picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
@@ -1099,6 +1230,10 @@ TEST_F(CompactionPickerTest, RLMaintenanceBypassIsExplicitlyAttributed) {
   ASSERT_EQ(compaction->compaction_reason(),
             CompactionReason::kFilesMarkedForCompaction);
   ASSERT_EQ(compaction->rl_override_reason(), 2);
+  ASSERT_EQ(compaction->rl_decision_id(), 76U);
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastEffectiveAction(&picker, 1), 1);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::LastActionOverridden(&picker, 1));
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastDecisionId(&picker, 1), 76U);
   picker.UnregisterCompaction(compaction.get());
 }
 
@@ -1114,12 +1249,25 @@ TEST_F(CompactionPickerTest, RLUnavailableServerFallbackIsLevelScoped) {
   RLCompactionPickerTestPeer::StopWorker(&picker);
   RLCompactionPickerTestPeer::SetAvailable(&picker, false);
   ASSERT_TRUE(picker.NeedsCompaction(vstorage_.get()));
+  const uint64_t hard_invalid_before =
+      RLCompactionPickerTestPeer::HardRewardInvalidFrames(&picker);
   std::unique_ptr<Compaction> compaction(
       picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
                             {}, nullptr, vstorage_.get(), &log_buffer_, ""));
   ASSERT_NE(compaction, nullptr);
   ASSERT_EQ(compaction->start_level(), 2);
   ASSERT_EQ(compaction->rl_override_reason(), 4);
+  ASSERT_EQ(compaction->rl_decision_id(), 0U);
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastEffectiveAction(&picker, 2), 1);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::LastActionOverridden(&picker, 2));
+  ASSERT_EQ(RLCompactionPickerTestPeer::LastDecisionId(&picker, 2), 0U);
+  ASSERT_NE(
+      RLCompactionPickerTestPeer::RewardInvalidReasonMask(&picker) &
+          static_cast<uint64_t>(
+              RLRewardInvalidReason::kUnknownControlOwnership),
+      0U);
+  ASSERT_EQ(RLCompactionPickerTestPeer::HardRewardInvalidFrames(&picker),
+            hard_invalid_before + 1);
   picker.UnregisterCompaction(compaction.get());
 }
 

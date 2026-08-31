@@ -19,6 +19,14 @@ enum class RLAction : int {
   kCompactNow = 1,
 };
 
+enum class RLRewardInvalidReason : uint64_t {
+  kSocketOrQueryFallback = 1ULL << 0,
+  kWatchdogNativeFallback = 1ULL << 1,
+  kMalformedProtocol = 1ULL << 2,
+  kRejectedManifest = 1ULL << 3,
+  kUnknownControlOwnership = 1ULL << 4,
+};
+
 // Raw observable state for one LSM level. RocksDB only reports observables;
 // the Python agent owns normalization, reward computation, and learning.
 struct RLLevelState {
@@ -68,7 +76,6 @@ struct RLLevelState {
   // 6=latency/space SLO, 7=invalid/mismatched manifest,
   // 8=structural refresh deadline missed.
   int prev_override_reason = 0;
-  bool prev_transition_valid = true;
   // Consecutive decisions this level has been deferred while due (score>=1).
   int defer_count = 0;
   // Shadow safety clocks from the accepted active score-event stream. Phase
@@ -100,6 +107,14 @@ struct RLStateV2 {
   // Protocol v2 is intentionally trigger-only. The agent chooses compact or
   // defer for a level; RocksDB's native leveled picker chooses the SSTs.
   int protocol_version = 2;
+  int credit_assignment_version = 2;
+  // Nonzero ID of this request/proposal. Python must echo it exactly; C++
+  // installs no action from an unacknowledged response.
+  uint64_t decision_id = 0;
+  // Atomically accumulated since the preceding observation. Bits are defined
+  // by RLRewardInvalidReason and are set only when reward/action attribution is
+  // genuinely unavailable, never for a known policy override.
+  uint64_t prev_reward_invalid_reason_mask = 0;
   uint64_t snapshot_epoch = 0;
   uint64_t pending_compaction_bytes = 0;
   uint64_t flushed_bytes = 0;
@@ -170,7 +185,16 @@ struct RLStateV2 {
 // Result of a multi-level query: one action per requested level, in request
 // order. `ok=false` means the caller should use its local fallback policy.
 struct RLMultiQueryResult {
+  enum class Failure : int {
+    kNone = 0,
+    kTransport = 1,
+    kMalformedResponse = 2,
+    kDecisionIdMismatch = 3,
+    kDuplicateDecisionId = 4,
+  };
   bool ok = false;
+  uint64_t decision_id = 0;
+  Failure failure = Failure::kNone;
   std::vector<RLAction> actions;
 };
 
@@ -190,9 +214,14 @@ class RLCompactionClient {
   // or a malformed/mis-sized response.
   RLMultiQueryResult QueryActions(const RLStateV2& state);
 
+  // Process-wide monotonic request identity. Multiple column-family pickers
+  // share the socket and must not allocate colliding per-picker IDs.
+  uint64_t AllocateDecisionId();
+
   bool IsConnected() const { return fd_ >= 0; }
 
  private:
+  friend class RLCompactionClientTestPeer;
   RLCompactionClient();
   ~RLCompactionClient();
 
@@ -210,10 +239,16 @@ class RLCompactionClient {
 
   // Read until '\n'; returns empty string on error.
   std::string RecvLine();
+  static RLMultiQueryResult DecodeResponse(
+      const RLStateV2& state, const std::string& response,
+      uint64_t last_acknowledged_decision_id);
+  static std::string FormatRequest(const RLStateV2& state);
 
   std::string socket_path_;
   int socket_timeout_ms_{100};
   int fd_{-1};
+  std::atomic<uint64_t> next_decision_id_{1};
+  uint64_t last_acknowledged_decision_id_{0};
   mutable std::mutex mu_;
 };
 
