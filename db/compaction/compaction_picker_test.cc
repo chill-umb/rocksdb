@@ -331,11 +331,53 @@ class RLCompactionPickerTestPeer {
   }
 
   static void SetAvailable(RLCompactionPicker* picker, bool available) {
-    picker->rl_available_.store(available, std::memory_order_release);
+    picker->control_state_.store(
+        available ? RLCompactionPicker::ControlState::kActive
+                  : RLCompactionPicker::ControlState::kFallback,
+        std::memory_order_release);
+  }
+
+  static int ControlStateValue(RLCompactionPicker* picker) {
+    return static_cast<int>(
+        picker->control_state_.load(std::memory_order_acquire));
+  }
+
+  static void ActivateControl(RLCompactionPicker* picker) {
+    picker->ActivateControl();
+  }
+
+  static bool EnterNativeFallback(RLCompactionPicker* picker,
+                                  RLRewardInvalidReason reason) {
+    return picker->EnterNativeFallback(reason);
+  }
+
+  static uint64_t BootstrapGateChecks(RLCompactionPicker* picker) {
+    return picker->bootstrap_gate_checks_.load(std::memory_order_relaxed);
+  }
+
+  static uint64_t BootstrapPickAttempts(RLCompactionPicker* picker) {
+    return picker->bootstrap_pick_attempts_.load(std::memory_order_relaxed);
+  }
+
+  static uint64_t BootstrapActivations(RLCompactionPicker* picker) {
+    return picker->bootstrap_activations_.load(std::memory_order_relaxed);
+  }
+
+  static uint64_t BootstrapFailures(RLCompactionPicker* picker) {
+    return picker->bootstrap_failures_.load(std::memory_order_relaxed);
+  }
+
+  static void SetDebtRatioCap(RLCompactionPicker* picker, double cap) {
+    picker->safety_debt_ratio_cap_ = cap;
+    if (picker->slo_safety_ != nullptr) {
+      picker->slo_safety_->pending_debt_ratio_limit_ = cap;
+    }
   }
 
   static void InstallPolicyPermit(RLCompactionPicker* picker, int level,
                                   bool optional, uint64_t decision_id) {
+    picker->control_state_.store(RLCompactionPicker::ControlState::kActive,
+                                 std::memory_order_release);
     std::lock_guard<std::mutex> lock(picker->permit_mu_);
     auto& permit = picker->permits_[level];
     permit.decision_id = decision_id;
@@ -530,6 +572,10 @@ class RLCompactionPickerTestPeer {
 
   static uint64_t HardRewardInvalidFrames(RLCompactionPicker* picker) {
     return picker->hard_reward_invalid_frames_.load(std::memory_order_relaxed);
+  }
+
+  static void ClearPendingRewardInvalidMask(RLCompactionPicker* picker) {
+    picker->reward_invalid_reason_mask_.store(0, std::memory_order_relaxed);
   }
 
   static void SetSafetyEnabled(RLCompactionPicker* picker, bool enabled) {
@@ -1235,6 +1281,91 @@ TEST_F(CompactionPickerTest, RLMaintenanceBypassIsExplicitlyAttributed) {
   ASSERT_TRUE(RLCompactionPickerTestPeer::LastActionOverridden(&picker, 1));
   ASSERT_EQ(RLCompactionPickerTestPeer::LastDecisionId(&picker, 1), 76U);
   picker.UnregisterCompaction(compaction.get());
+}
+
+TEST_F(CompactionPickerTest,
+       RLBootstrapClosesOrdinaryGatesWithoutInvalidatingReward) {
+  NewVersionStorage(4, kCompactionStyleLevel);
+  mutable_cf_options_.max_bytes_for_level_base = 100;
+  Add(1, 11U, "a", "c", 200);
+  UpdateVersionStorageInfo();
+
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+  // Keep this test on the ordinary policy path rather than the independently
+  // attributed emergency-debt path.
+  RLCompactionPickerTestPeer::SetDebtRatioCap(&picker, 1000.0);
+  const uint64_t hard_invalid_before =
+      RLCompactionPickerTestPeer::HardRewardInvalidFrames(&picker);
+
+  ASSERT_FALSE(picker.NeedsCompaction(vstorage_.get()));
+  std::unique_ptr<Compaction> compaction(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
+  ASSERT_EQ(compaction, nullptr);
+  ASSERT_EQ(RLCompactionPickerTestPeer::ControlStateValue(&picker), 0);
+  ASSERT_GT(RLCompactionPickerTestPeer::BootstrapGateChecks(&picker), 0U);
+  ASSERT_GT(RLCompactionPickerTestPeer::BootstrapPickAttempts(&picker), 0U);
+  ASSERT_EQ(RLCompactionPickerTestPeer::HardRewardInvalidFrames(&picker),
+            hard_invalid_before);
+  ASSERT_EQ(
+      RLCompactionPickerTestPeer::RewardInvalidReasonMask(&picker) &
+          static_cast<uint64_t>(
+              RLRewardInvalidReason::kUnknownControlOwnership),
+      0U);
+}
+
+TEST_F(CompactionPickerTest,
+       RLFirstQueryFailureLeavesBootstrapAndEntersNativeFallback) {
+  NewVersionStorage(4, kCompactionStyleLevel);
+  mutable_cf_options_.max_bytes_for_level_base = 100;
+  Add(1, 11U, "a", "c", 200);
+  UpdateVersionStorageInfo();
+
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+  RLCompactionPickerTestPeer::ClearPendingRewardInvalidMask(&picker);
+  const uint64_t hard_invalid_before =
+      RLCompactionPickerTestPeer::HardRewardInvalidFrames(&picker);
+
+  ASSERT_TRUE(RLCompactionPickerTestPeer::EnterNativeFallback(
+      &picker, RLRewardInvalidReason::kSocketOrQueryFallback));
+  ASSERT_EQ(RLCompactionPickerTestPeer::ControlStateValue(&picker), 2);
+  ASSERT_EQ(RLCompactionPickerTestPeer::BootstrapFailures(&picker), 1U);
+  ASSERT_EQ(RLCompactionPickerTestPeer::HardRewardInvalidFrames(&picker),
+            hard_invalid_before + 1);
+  ASSERT_NE(
+      RLCompactionPickerTestPeer::RewardInvalidReasonMask(&picker) &
+          static_cast<uint64_t>(
+              RLRewardInvalidReason::kSocketOrQueryFallback),
+      0U);
+
+  ASSERT_TRUE(picker.NeedsCompaction(vstorage_.get()));
+  std::unique_ptr<Compaction> compaction(
+      picker.PickCompaction(cf_name_, mutable_cf_options_, mutable_db_options_,
+                            {}, nullptr, vstorage_.get(), &log_buffer_, ""));
+  ASSERT_NE(compaction, nullptr);
+  ASSERT_EQ(compaction->rl_override_reason(), 4);
+  ASSERT_EQ(compaction->rl_decision_id(), 0U);
+  picker.UnregisterCompaction(compaction.get());
+}
+
+TEST_F(CompactionPickerTest,
+       RLInstalledControlRecoversFromFallbackWithoutReenteringBootstrap) {
+  RLCompactionPicker picker(ioptions_, &icmp_);
+  RLCompactionPickerTestPeer::StopWorker(&picker);
+
+  RLCompactionPickerTestPeer::ActivateControl(&picker);
+  ASSERT_EQ(RLCompactionPickerTestPeer::ControlStateValue(&picker), 1);
+  ASSERT_EQ(RLCompactionPickerTestPeer::BootstrapActivations(&picker), 1U);
+  ASSERT_TRUE(RLCompactionPickerTestPeer::EnterNativeFallback(
+      &picker, RLRewardInvalidReason::kWatchdogNativeFallback));
+  ASSERT_EQ(RLCompactionPickerTestPeer::ControlStateValue(&picker), 2);
+  ASSERT_EQ(RLCompactionPickerTestPeer::BootstrapFailures(&picker), 0U);
+
+  RLCompactionPickerTestPeer::ActivateControl(&picker);
+  ASSERT_EQ(RLCompactionPickerTestPeer::ControlStateValue(&picker), 1);
+  ASSERT_EQ(RLCompactionPickerTestPeer::BootstrapActivations(&picker), 1U);
 }
 
 TEST_F(CompactionPickerTest, RLUnavailableServerFallbackIsLevelScoped) {

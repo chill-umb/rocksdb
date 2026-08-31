@@ -74,7 +74,7 @@ struct RLLevelState {
   int prev_completed_override_reason = 0;
   // 0=policy, 1=budget, 2=maintenance, 3=emergency, 4=fallback, 5=drain,
   // 6=latency/space SLO, 7=invalid/mismatched manifest,
-  // 8=structural refresh deadline missed.
+  // 8=structural refresh deadline missed, 9=fixed control posture.
   int prev_override_reason = 0;
   // Consecutive decisions this level has been deferred while due (score>=1).
   int defer_count = 0;

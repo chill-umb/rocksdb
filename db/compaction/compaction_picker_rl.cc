@@ -192,6 +192,14 @@ void RLCompactionPicker::AttachControl(
     registration_generation_ = registration_generation;
     control_handle_ = std::move(control_handle);
     pressure_view_ = std::move(pressure_view);
+    // Learned control starts with closed gates while the asynchronous worker
+    // obtains its first acknowledged frame. This is not a native fallback:
+    // no action has failed and there is no unknown interval to invalidate.
+    control_state_.store(ControlState::kBootstrap,
+                         std::memory_order_release);
+    bootstrap_started_micros_.store(NowMicros(),
+                                    std::memory_order_relaxed);
+    last_server_response_micros_.store(0, std::memory_order_relaxed);
     attached_.store(true, std::memory_order_release);
     worker_stop_.store(false, std::memory_order_release);
   }
@@ -226,7 +234,7 @@ void RLCompactionPicker::AttachControl(
         RequestScheduling(token, NowMicros());
       }
     }
-    rl_available_.store(true, std::memory_order_release);
+    ActivateControl();
   }
   worker_started_.store(true, std::memory_order_release);
   worker_ = std::thread([this] { WorkerLoop(); });
@@ -1083,6 +1091,43 @@ void RLCompactionPicker::MarkRewardInvalid(
   }
 }
 
+void RLCompactionPicker::ActivateControl() const {
+  const ControlState previous =
+      control_state_.exchange(ControlState::kActive,
+                              std::memory_order_acq_rel);
+  if (previous != ControlState::kBootstrap) return;
+
+  bootstrap_activations_.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t started =
+      bootstrap_started_micros_.load(std::memory_order_relaxed);
+  const uint64_t now = NowMicros();
+  if (started != 0 && now >= started) {
+    bootstrap_duration_micros_.store(now - started,
+                                     std::memory_order_relaxed);
+  }
+}
+
+bool RLCompactionPicker::EnterNativeFallback(
+    RLRewardInvalidReason reason) const {
+  const ControlState previous =
+      control_state_.exchange(ControlState::kFallback,
+                              std::memory_order_acq_rel);
+  if (previous == ControlState::kFallback) return false;
+
+  if (previous == ControlState::kBootstrap) {
+    bootstrap_failures_.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t started =
+        bootstrap_started_micros_.load(std::memory_order_relaxed);
+    const uint64_t now = NowMicros();
+    if (started != 0 && now >= started) {
+      bootstrap_duration_micros_.store(now - started,
+                                       std::memory_order_relaxed);
+    }
+  }
+  MarkRewardInvalid(reason);
+  return true;
+}
+
 void RLCompactionPicker::RecordKnownOverride(ActionReason reason) const {
   const int index = static_cast<int>(reason);
   if (index >= 0 && index < 10) {
@@ -1435,15 +1480,18 @@ void RLCompactionPicker::EvaluateWorkerSafety(const RLStateV2& state,
   }
   const bool dirty_deadline_miss = StructuralDirtyDeadlineMiss(now);
 
-  if (!oracle_mode_ && rl_available_.load(std::memory_order_acquire)) {
+  if (!oracle_mode_ &&
+      control_state_.load(std::memory_order_acquire) ==
+          ControlState::kActive) {
     const uint64_t last_response =
         last_server_response_micros_.load(std::memory_order_relaxed);
     if (last_response != 0 && now > last_response &&
         now - last_response > ResponseWatchdogMicros()) {
-      rl_available_.store(false, std::memory_order_release);
-      watchdog_expiries_.fetch_add(1, std::memory_order_relaxed);
-      MarkRewardInvalid(RLRewardInvalidReason::kWatchdogNativeFallback);
-      InstallFallbackFrame(state, &watchdog_wakes);
+      if (EnterNativeFallback(
+              RLRewardInvalidReason::kWatchdogNativeFallback)) {
+        watchdog_expiries_.fetch_add(1, std::memory_order_relaxed);
+        InstallFallbackFrame(state, &watchdog_wakes);
+      }
     }
   }
   for (const SchedulingToken& token : watchdog_wakes) {
@@ -1748,17 +1796,23 @@ void RLCompactionPicker::RunDecisionCycle(
     result = client.QueryActions(state);
   }
   if (!result.ok) {
+    RLRewardInvalidReason invalid_reason =
+        RLRewardInvalidReason::kMalformedProtocol;
     if (result.failure == RLMultiQueryResult::Failure::kTransport) {
       // The request may not have reached Python. Preserve any older pending
       // reason bits so the next successful observation cannot lose them.
       reward_invalid_reason_mask_.fetch_or(
           state.prev_reward_invalid_reason_mask, std::memory_order_relaxed);
-      MarkRewardInvalid(RLRewardInvalidReason::kSocketOrQueryFallback);
+      invalid_reason = RLRewardInvalidReason::kSocketOrQueryFallback;
     } else {
-      MarkRewardInvalid(RLRewardInvalidReason::kMalformedProtocol);
       protocol_mismatches_.fetch_add(1, std::memory_order_relaxed);
     }
-    rl_available_.store(false, std::memory_order_release);
+    // Repeated failed queries while already in fallback still describe a new
+    // invalid observation boundary, so reassert the reason after the state
+    // transition when necessary.
+    if (!EnterNativeFallback(invalid_reason)) {
+      MarkRewardInvalid(invalid_reason);
+    }
     const uint64_t failures =
         rl_fallback_count_.fetch_add(1, std::memory_order_relaxed) + 1;
     if (actuate) {
@@ -1802,10 +1856,10 @@ void RLCompactionPicker::RunDecisionCycle(
   response_acknowledgements_.fetch_add(1, std::memory_order_relaxed);
   rl_actuation_count_.fetch_add(1, std::memory_order_relaxed);
   rl_fallback_logged_.store(false, std::memory_order_relaxed);
-  // Publish availability only after the complete permit frame is visible.
-  // A scheduler thread that sees `true` must never observe bootstrap-closed
+  // Publish the active state only after the complete permit frame is visible.
+  // A scheduler thread that sees kActive must never observe bootstrap-closed
   // gates in place of this valid response.
-  rl_available_.store(true, std::memory_order_release);
+  ActivateControl();
   if (!safety_enabled_) {
     // Preserve the original oracle/unconstrained ordering: those arms have no
     // safety mutation to wait for, so their wake is not delayed behind shadow
@@ -1950,12 +2004,20 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
     posture_admissions_total +=
         posture_admissions_[level].load(std::memory_order_relaxed);
   }
+  const ControlState logged_control_state =
+      control_state_.load(std::memory_order_relaxed);
   ROCKS_LOG_INFO(ioptions_.logger,
                  "RL trigger diagnostics: protocol=2 credit_assignment=2"
                  " queries=%" PRIu64
                  " actuations=%" PRIu64 " bypasses=%" PRIu64
                  " skipped_ticks=%" PRIu64 " cumulative_fallbacks=%" PRIu64
-                 " available=%d nc_calls=%" PRIu64 " nc_total_ms=%" PRIu64
+                 " available=%d control_state=%d"
+                 " bootstrap_gate_checks=%" PRIu64
+                 " bootstrap_pick_attempts=%" PRIu64
+                 " bootstrap_activations=%" PRIu64
+                 " bootstrap_failures=%" PRIu64
+                 " bootstrap_duration_us=%" PRIu64
+                 " nc_calls=%" PRIu64 " nc_total_ms=%" PRIu64
                  " publish_calls=%" PRIu64 " publish_total_ms=%" PRIu64
                  " publish_max_us=%" PRIu64
                  " source_generation=%" PRIu64 " built_generation=%" PRIu64
@@ -1997,7 +2059,13 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                  rl_bypass_count_.load(std::memory_order_relaxed),
                  rl_skipped_ticks_.load(std::memory_order_relaxed),
                  rl_fallback_count_.load(std::memory_order_relaxed),
-                 rl_available_.load(std::memory_order_relaxed) ? 1 : 0,
+                 logged_control_state == ControlState::kActive ? 1 : 0,
+                 static_cast<int>(logged_control_state),
+                 bootstrap_gate_checks_.load(std::memory_order_relaxed),
+                 bootstrap_pick_attempts_.load(std::memory_order_relaxed),
+                 bootstrap_activations_.load(std::memory_order_relaxed),
+                 bootstrap_failures_.load(std::memory_order_relaxed),
+                 bootstrap_duration_micros_.load(std::memory_order_relaxed),
                  rl_nc_calls_.load(std::memory_order_relaxed),
                  rl_nc_nanos_.load(std::memory_order_relaxed) / 1000000,
                  rl_publish_calls_.load(std::memory_order_relaxed),
@@ -2127,20 +2195,30 @@ bool RLCompactionPicker::NeedsCompaction(
     rl_bypass_count_.fetch_add(1, std::memory_order_relaxed);
   }
 
-  if (!oracle_mode_ && rl_available_.load(std::memory_order_acquire)) {
+  if (!oracle_mode_ &&
+      control_state_.load(std::memory_order_acquire) ==
+          ControlState::kActive) {
     const uint64_t last_response =
         last_server_response_micros_.load(std::memory_order_relaxed);
     const uint64_t now = NowMicros();
     if (last_response != 0 && now > last_response &&
         now - last_response > ResponseWatchdogMicros()) {
-      rl_available_.store(false, std::memory_order_release);
-      watchdog_expiries_.fetch_add(1, std::memory_order_relaxed);
-      MarkRewardInvalid(RLRewardInvalidReason::kWatchdogNativeFallback);
+      if (EnterNativeFallback(
+              RLRewardInvalidReason::kWatchdogNativeFallback)) {
+        watchdog_expiries_.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
 
-  if (!rl_available_.load(std::memory_order_acquire)) {
+  const ControlState control_state =
+      control_state_.load(std::memory_order_acquire);
+  if (control_state == ControlState::kFallback) {
     return LevelCompactionPicker::NeedsCompaction(vstorage);
+  }
+  if (control_state == ControlState::kBootstrap) {
+    // Continue below so explicitly forced emergency/deadline permits remain
+    // usable, but ordinary due work sees only the initial closed gates.
+    bootstrap_gate_checks_.fetch_add(1, std::memory_order_relaxed);
   }
 
   const uint64_t now = NowMicros();
@@ -2178,12 +2256,20 @@ Compaction* RLCompactionPicker::PickCompaction(
   UpdateTriggerOptions(mutable_cf_options);
 
   int parent_reason = -1;
+  const ControlState pick_control_state =
+      control_state_.load(std::memory_order_acquire);
   if (RLDrainMode()) {
     parent_reason = static_cast<int>(ActionReason::kDrain);
   } else if (HasMaintenanceWork(vstorage)) {
     parent_reason = static_cast<int>(ActionReason::kMaintenance);
-  } else if (!rl_available_.load(std::memory_order_acquire)) {
+  } else if (pick_control_state == ControlState::kFallback) {
     parent_reason = static_cast<int>(ActionReason::kFallback);
+  } else if (pick_control_state == ControlState::kBootstrap) {
+    // A direct picker call during bootstrap must not silently become a native
+    // compaction. The controlled path below can still consume a permit opened
+    // by a known emergency, maintenance-independent safety rule, or structural
+    // deadline force.
+    bootstrap_pick_attempts_.fetch_add(1, std::memory_order_relaxed);
   }
   if (parent_reason >= 0) {
     Compaction* compaction = LevelCompactionPicker::PickCompaction(

@@ -92,6 +92,16 @@ class RLCompactionPicker : public LevelCompactionPicker {
   };
 
   enum class PolicyAction : int { kDefer = 0, kCompact = 1 };
+  // Bootstrap is deliberately distinct from fallback. Before the first
+  // acknowledged policy frame, ordinary trigger gates remain closed; no
+  // native work is admitted under unknown ownership merely because the
+  // asynchronous worker has not completed its first query yet. Only a real
+  // control-path failure enters kFallback.
+  enum class ControlState : int {
+    kBootstrap = 0,
+    kActive = 1,
+    kFallback = 2,
+  };
   enum class PermitMode : int {
     kClosed = 0,
     kDueOpen = 1,
@@ -269,6 +279,12 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<uint64_t> hard_reward_invalid_frames_{0};
   mutable std::atomic<uint64_t> protocol_mismatches_{0};
   mutable std::atomic<uint64_t> fallback_frames_{0};
+  mutable std::atomic<uint64_t> bootstrap_gate_checks_{0};
+  mutable std::atomic<uint64_t> bootstrap_pick_attempts_{0};
+  mutable std::atomic<uint64_t> bootstrap_activations_{0};
+  mutable std::atomic<uint64_t> bootstrap_failures_{0};
+  mutable std::atomic<uint64_t> bootstrap_started_micros_{0};
+  mutable std::atomic<uint64_t> bootstrap_duration_micros_{0};
   mutable std::atomic<uint64_t> known_override_counts_[10] = {};
   mutable std::atomic<uint64_t> reward_invalid_reason_mask_{0};
   mutable std::atomic<uint64_t> dirty_deadline_misses_{0};
@@ -343,7 +359,7 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<int> last_scheduling_result_[kMaxRLLevels] = {};
   mutable std::atomic<int> last_override_reason_[kMaxRLLevels] = {};
 
-  mutable std::atomic<bool> rl_available_{false};
+  mutable std::atomic<ControlState> control_state_{ControlState::kBootstrap};
   std::atomic<int> rl_l0_trigger_{4};
   std::atomic<int> rl_l0_slowdown_trigger_{20};
   std::atomic<int> rl_l0_stop_trigger_{36};
@@ -400,6 +416,8 @@ class RLCompactionPicker : public LevelCompactionPicker {
                                 uint64_t decision_generation) const;
   void ForceOpenLevel(const VersionStorageInfo* vstorage, int level,
                       ActionReason reason) const;
+  void ActivateControl() const;
+  bool EnterNativeFallback(RLRewardInvalidReason reason) const;
   void MarkRewardInvalid(RLRewardInvalidReason reason) const;
   void RecordKnownOverride(ActionReason reason) const;
   bool AcceptResponseStructure(const RLStateV2& state) const;
