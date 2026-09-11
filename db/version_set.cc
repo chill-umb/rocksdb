@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <list>
 #include <map>
@@ -2489,6 +2490,7 @@ VersionStorageInfo::VersionStorageInfo(
       // cfd is nullptr if Version is dummy
       num_levels_(levels),
       num_non_empty_levels_(0),
+      capacity_scales_(levels, 1.0),
       file_indexer_(user_comparator),
       compaction_style_(compaction_style),
       files_(new std::vector<FileMetaData*>[num_levels_]),
@@ -2518,6 +2520,10 @@ VersionStorageInfo::VersionStorageInfo(
       epoch_number_requirement_(epoch_number_requirement),
       offpeak_time_option_(std::move(offpeak_time_option)) {
   if (ref_vstorage != nullptr) {
+    if (ref_vstorage->num_levels_ == num_levels_) {
+      capacity_scales_ = ref_vstorage->capacity_scales_;
+      capacity_generation_ = ref_vstorage->capacity_generation_;
+    }
     accumulated_file_size_ = ref_vstorage->accumulated_file_size_;
     accumulated_raw_key_size_ = ref_vstorage->accumulated_raw_key_size_;
     accumulated_raw_value_size_ = ref_vstorage->accumulated_raw_value_size_;
@@ -5091,11 +5097,66 @@ uint64_t VersionStorageInfo::MaxNextLevelOverlappingBytes() {
 }
 
 uint64_t VersionStorageInfo::MaxBytesForLevel(int level) const {
-  // Note: the result for level zero is not really used since we set
-  // the level-0 compaction threshold based on number of files.
+  const uint64_t base = BaseMaxBytesForLevel(level);
+  if (level == 0 || capacity_scales_[level] == 1.0) {
+    return base;
+  }
+  const long double target = static_cast<long double>(base) * capacity_scales_[level];
+  return target >= std::numeric_limits<uint64_t>::max()
+             ? std::numeric_limits<uint64_t>::max()
+             : static_cast<uint64_t>(target);
+}
+
+uint64_t VersionStorageInfo::BaseMaxBytesForLevel(int level) const {
   assert(level >= 0);
   assert(level < static_cast<int>(level_max_bytes_.size()));
   return level_max_bytes_[level];
+}
+
+Status VersionStorageInfo::SetCapacityScales(
+    const std::vector<double>& scales, uint64_t expected_generation,
+    const ImmutableOptions& immutable_options,
+    const MutableCFOptions& mutable_cf_options,
+    const std::string& full_history_ts_low) {
+  if (immutable_options.level_compaction_dynamic_level_bytes ||
+      (compaction_style_ != kCompactionStyleLevel &&
+       compaction_style_ != kCompactionStyleRL)) {
+    return Status::InvalidArgument("capacity control requires static leveled targets");
+  }
+  if (scales.size() != static_cast<size_t>(num_levels_) || scales.size() < 2 ||
+      level_max_bytes_.size() != scales.size() ||
+      scales.front() != 1.0 || scales.back() != 1.0) {
+    return Status::InvalidArgument("capacity scales must preserve L0 and final target");
+  }
+  if (expected_generation != capacity_generation_) {
+    return Status::InvalidArgument("stale capacity generation");
+  }
+  uint64_t previous = 0;
+  for (int level = 0; level < num_levels_; ++level) {
+    const double scale = scales[level];
+    const long double target = static_cast<long double>(level_max_bytes_[level]) * scale;
+    if (!std::isfinite(scale) || scale < 1 ||
+        target > std::numeric_limits<uint64_t>::max()) {
+      return Status::InvalidArgument("invalid or overflowing capacity scale");
+    }
+    const auto bytes = static_cast<uint64_t>(target);
+    if (level > 0 && bytes < previous) {
+      return Status::InvalidArgument("capacity targets must be nondecreasing");
+    }
+    previous = bytes;
+  }
+  if (scales == capacity_scales_) {
+    return Status::OK();
+  }
+  if (capacity_generation_ == std::numeric_limits<uint64_t>::max()) {
+    return Status::InvalidArgument("capacity generation exhausted");
+  }
+  capacity_scales_ = scales;
+  ++capacity_generation_;
+  // This also recomputes estimated debt and publishes the existing pressure
+  // observer, so scheduling and safety see the same effective targets.
+  ComputeCompactionScore(immutable_options, mutable_cf_options, full_history_ts_low);
+  return Status::OK();
 }
 
 void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
@@ -5832,6 +5893,15 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
   assert(v != current);
   if (current != nullptr) {
     assert(current->refs_ > 0);
+    // Manifest I/O may release the DB mutex after this version was built.
+    // Preserve target changes made to the active version during that interval.
+    if (v->storage_info()->CapacityGeneration() !=
+        current->storage_info()->CapacityGeneration()) {
+      v->storage_info()->InheritCapacityState(*current->storage_info());
+      v->storage_info()->ComputeCompactionScore(
+          column_family_data->ioptions(), v->GetMutableCFOptions(),
+          column_family_data->GetFullHistoryTsLow());
+    }
     current->storage_info()->SetCompactionPressureObserver(nullptr);
     current->Unref();
   }

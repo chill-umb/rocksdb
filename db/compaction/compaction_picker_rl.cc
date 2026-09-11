@@ -297,7 +297,7 @@ uint64_t RLCompactionPicker::SnapshotEpoch(
   for (int level = 0; level < vstorage->num_levels(); ++level) {
     epoch = MixEpoch(epoch, static_cast<uint64_t>(level));
     if (level > 0) {
-      epoch = MixEpoch(epoch, vstorage->MaxBytesForLevel(level));
+      epoch = MixEpoch(epoch, vstorage->BaseMaxBytesForLevel(level));
     }
     for (const FileMetaData* file : vstorage->LevelFiles(level)) {
       epoch = MixEpoch(epoch, file->fd.GetNumber());

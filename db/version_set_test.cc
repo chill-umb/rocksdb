@@ -239,6 +239,87 @@ TEST_F(VersionStorageInfoTest, MaxBytesForLevelStatic) {
   ASSERT_EQ(0, logger_->log_count);
 }
 
+TEST_F(VersionStorageInfoTest, CapacityScaleChangesTargetsScoreAndDebtOnly) {
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  mutable_cf_options_.max_bytes_for_level_base = 100;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 5;
+  Add(0, 100U, "a", "b", 110U);
+  Add(1, 101U, "a", "b", 180U);
+  Add(2, 102U, "a", "b", 500U);
+  UpdateVersionStorageInfo();
+  vstorage_.ComputeCompactionScore(ioptions_, mutable_cf_options_, "");
+  auto score = [&](int level) {
+    for (int index = 0; index <= vstorage_.MaxInputLevel(); ++index) {
+      if (vstorage_.CompactionScoreLevel(index) == level) {
+        return vstorage_.CompactionScore(index);
+      }
+    }
+    return -1.0;
+  };
+  const double l0 = score(0);
+  const double l1 = score(1);
+  const auto debt = vstorage_.estimated_compaction_needed_bytes();
+  std::vector<double> scales(6, 1.0);
+  ASSERT_OK(vstorage_.SetCapacityScales(scales, 0, ioptions_, mutable_cf_options_, ""));
+  ASSERT_EQ(vstorage_.CapacityGeneration(), 0U);
+  scales[1] = 2.0;
+  ASSERT_OK(vstorage_.SetCapacityScales(scales, 0, ioptions_, mutable_cf_options_, ""));
+  ASSERT_EQ(vstorage_.BaseMaxBytesForLevel(1), 100U);
+  ASSERT_EQ(vstorage_.MaxBytesForLevel(1), 200U);
+  ASSERT_EQ(vstorage_.MaxBytesForLevel(2), 500U);
+  ASSERT_EQ(score(0), l0);
+  ASSERT_DOUBLE_EQ(score(1), l1 / 2);
+  ASSERT_LT(vstorage_.estimated_compaction_needed_bytes(), debt);
+  ASSERT_EQ(vstorage_.CapacityGeneration(), 1U);
+  ASSERT_TRUE(vstorage_.SetCapacityScales(scales, 0, ioptions_,
+                                        mutable_cf_options_, "").IsInvalidArgument());
+}
+
+TEST_F(VersionStorageInfoTest, CapacityScaleRejectsInvalidProfilesAtomically) {
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  mutable_cf_options_.max_bytes_for_level_base = 100;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 5;
+  UpdateVersionStorageInfo();
+  for (int level : {0, 5}) {
+    std::vector<double> scales(6, 1.0);
+    scales[level] = 2;
+    ASSERT_TRUE(vstorage_.SetCapacityScales(scales, 0, ioptions_,
+                                          mutable_cf_options_, "").IsInvalidArgument());
+  }
+  for (double invalid : {0.5, -1.0, 6.0, std::numeric_limits<double>::infinity()}) {
+    std::vector<double> scales(6, 1.0);
+    scales[1] = invalid;
+    ASSERT_TRUE(vstorage_.SetCapacityScales(scales, 0, ioptions_,
+                                          mutable_cf_options_, "").IsInvalidArgument());
+    ASSERT_EQ(vstorage_.MaxBytesForLevel(1), 100U);
+    ASSERT_EQ(vstorage_.CapacityGeneration(), 0U);
+  }
+  ioptions_.level_compaction_dynamic_level_bytes = true;
+  ASSERT_TRUE(vstorage_.SetCapacityScales(std::vector<double>(6, 1.0), 0,
+                 ioptions_, mutable_cf_options_, "").IsInvalidArgument());
+}
+
+TEST_F(VersionStorageInfoTest, CapacityScaleSurvivesVersionConstruction) {
+  ioptions_.level_compaction_dynamic_level_bytes = false;
+  mutable_cf_options_.max_bytes_for_level_base = 100;
+  mutable_cf_options_.max_bytes_for_level_multiplier = 5;
+  UpdateVersionStorageInfo();
+  std::vector<double> scales(6, 1.0);
+  scales[1] = 1.5;
+  ASSERT_OK(vstorage_.SetCapacityScales(scales, 0, ioptions_, mutable_cf_options_, ""));
+  VersionStorageInfo next(&icmp_, ucmp_, 6, kCompactionStyleLevel, &vstorage_,
+                         false, EpochNumberRequirement::kMustPresent,
+                         ioptions_.clock, 0, OffpeakTimeOption());
+  next.PrepareForVersionAppend(ioptions_, mutable_cf_options_);
+  ASSERT_EQ(next.MaxBytesForLevel(1), 150U);
+  ASSERT_EQ(next.CapacityGeneration(), 1U);
+  scales[1] = 2;
+  ASSERT_OK(vstorage_.SetCapacityScales(scales, 1, ioptions_, mutable_cf_options_, ""));
+  next.InheritCapacityState(vstorage_);
+  ASSERT_EQ(next.MaxBytesForLevel(1), 200U);
+  ASSERT_EQ(next.CapacityGeneration(), 2U);
+}
+
 TEST_F(VersionStorageInfoTest, MaxBytesForLevelDynamic_1) {
   ioptions_.level_compaction_dynamic_level_bytes = true;
   mutable_cf_options_.max_bytes_for_level_base = 1000;

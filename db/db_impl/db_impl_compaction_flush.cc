@@ -44,6 +44,52 @@ uint64_t ApproximateFlushBytesForRL(const TableProperties& props) {
   return bytes;
 }
 
+// Called with the DB mutex held immediately before executing an admitted job.
+// Capture current occupancy here, not in the asynchronous picker trace or at
+// completion, when other jobs may already have changed downstream headroom.
+void LogCompactionRelease(const Compaction* c, int job_id, uint64_t now_micros,
+                          bool trivial_move, EventLogger* logger,
+                          LogBuffer* log_buffer) {
+  auto* cfd = c->column_family_data();
+  const auto* storage = cfd->current()->storage_info();
+  auto stream = logger->LogToBuffer(log_buffer, 8192);
+  stream << "event" << "compaction_release" << "release_schema_version" << 1
+         << "job" << job_id << "cf_id" << cfd->GetID()
+         << "release_micros" << now_micros
+         << "source_level" << c->start_level()
+         << "output_level" << c->output_level()
+         << "rl_decision_id" << c->rl_decision_id()
+         << "effective_action" << 1
+         << "rl_override_reason" << c->rl_override_reason()
+         << "capacity_generation" << storage->CapacityGeneration()
+         << "rl_drain" << RLDrainMode() << "trivial_move" << trivial_move;
+  stream << "occupancy_bytes";
+  stream.StartArray();
+  for (int level = 0; level < storage->num_levels(); ++level) {
+    stream << storage->NumLevelBytes(level);
+  }
+  stream.EndArray();
+  stream << "nominal_target_bytes";
+  stream.StartArray();
+  for (int level = 0; level < storage->num_levels(); ++level) {
+    // L0 is file-count/byte governed, not an expandable single sorted run.
+    stream << (level == 0 ? uint64_t{0} : storage->BaseMaxBytesForLevel(level));
+  }
+  stream.EndArray();
+  stream << "effective_target_bytes";
+  stream.StartArray();
+  for (int level = 0; level < storage->num_levels(); ++level) {
+    stream << (level == 0 ? uint64_t{0} : storage->MaxBytesForLevel(level));
+  }
+  stream.EndArray();
+  stream << "capacity_scales";
+  stream.StartArray();
+  for (int level = 0; level < storage->num_levels(); ++level) {
+    stream << storage->CapacityScale(level);
+  }
+  stream.EndArray();
+}
+
 }  // namespace
 
 bool DBImpl::EnoughRoomForCompaction(
@@ -4383,6 +4429,10 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         "DBImpl::BackgroundCompaction:TriviaCopyAfterCompaction",
         c->column_family_data());
   } else if (!trivial_move_disallowed && c->IsTrivialMove()) {
+    mutex_.AssertHeld();
+    LogCompactionRelease(c.get(), job_context->job_id,
+                         immutable_db_options_.clock->NowMicros(), true,
+                         &event_logger_, log_buffer);
     TEST_SYNC_POINT("DBImpl::BackgroundCompaction:TrivialMove");
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:BeforeCompaction",
                              c->column_family_data());
@@ -4510,6 +4560,11 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         &blob_callback_, &bg_compaction_scheduled_,
         &bg_bottom_compaction_scheduled_);
     compaction_job.Prepare(std::nullopt /*subcompact to be computed*/);
+
+    mutex_.AssertHeld();
+    LogCompactionRelease(c.get(), job_context->job_id,
+                         immutable_db_options_.clock->NowMicros(), false,
+                         &event_logger_, log_buffer);
 
     std::unique_ptr<std::list<uint64_t>::iterator> min_options_file_number_elem;
     if (immutable_db_options().compaction_service != nullptr) {

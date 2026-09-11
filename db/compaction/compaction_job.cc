@@ -1255,6 +1255,12 @@ Status CompactionJob::Install(bool* compaction_released) {
          << compact_->compaction->output_level() << "num_output_files"
          << stats.num_output_files << "total_output_size"
          << stats.bytes_written << "rl_drain" << RLDrainMode();
+  stream << "merge_schema_version" << 1 << "cf_id" << cfd->GetID()
+         << "source_level" << compact_->compaction->start_level()
+         << "merge_input_bytes"
+         << (stats.bytes_read_non_output_levels + stats.bytes_read_output_level)
+         << "merge_output_bytes" << stats.bytes_written
+         << "merge_success" << status.ok();
 
   if (stats.num_output_files_blob > 0) {
     stream << "num_blob_output_files" << stats.num_output_files_blob
