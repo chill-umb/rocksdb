@@ -628,6 +628,10 @@ class VersionStorageInfo {
     capacity_generation_ = current.capacity_generation_;
   }
 
+  // Open-loop static expansion for the capacity calibration arms, read once
+  // from RL_STATIC_CAPACITY_SCALES. A controller-set vector always wins.
+  void ApplyStaticCapacityScales();
+
   // Atomic target/score/debt change. REQUIRES: DB mutex held. L0 and the
   // output-only final level are fixed; targets must remain nondecreasing.
   // A stale generation is rejected without changing any state.
