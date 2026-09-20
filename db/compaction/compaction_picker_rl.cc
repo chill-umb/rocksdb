@@ -1271,6 +1271,13 @@ RLCompactionPicker::ClassifyWorkerSafety(const RLStateV2& state,
       state.levels.front().level == 0 &&
       state.levels.front().files >=
           rl_l0_slowdown_trigger_.load(std::memory_order_relaxed);
+  evaluation.global_debt_breach = global_debt_breach;
+  evaluation.l0_slowdown = l0_slowdown;
+  evaluation.pending_debt_ratio =
+      state.live_logical_bytes > 0
+          ? static_cast<double>(state.pending_compaction_bytes) /
+                static_cast<double>(state.live_logical_bytes)
+          : 0.0;
 
   bool present[kMaxRLLevels] = {};
   for (const RLLevelState& observed : state.levels) {
@@ -1318,14 +1325,19 @@ RLCompactionPicker::ClassifyWorkerSafety(const RLStateV2& state,
     }
     if (!item.force && force_was_active && item.due) {
       // InstallPolicyFrame holds the previous safety permit until this method
-      // evaluates the exit condition. Mirror that behavior in shadow mode: a
-      // budget/emergency force lasts until the episode is healthy, whereas an
-      // SLO or stale-structure force has a distinct release frame. That release
-      // frame still suppresses the just-returned policy response, but publishes
+      // evaluates the exit condition. Mirror that behavior in shadow mode. A
+      // force lasts exactly as long as its condition holds: a budget or
+      // emergency force releases the frame its term clears (due age and
+      // pressure only grow while a level is due, so those persist on their
+      // own), while a manifest, SLO or stale-structure force has its own
+      // release condition. Until 2026-09-20 (PREREGISTRATION D-2) a budget
+      // force was retained until the level was healthy, which let one
+      // over-limit frame hold a level open for its whole due run -- 47% of
+      // E-1's override frames at T=2 had no term true -- and the
+      // frame-simulated calibration models no such memory. The release frame
+      // still suppresses the just-returned policy response, but publishes
       // the known effective defer action as off-policy experience.
       const bool retain =
-          previous_force_reason == ActionReason::kBudget ||
-          previous_force_reason == ActionReason::kEmergency ||
           previous_force_reason == ActionReason::kManifest ||
           (previous_force_reason == ActionReason::kSLO &&
            evaluation.slo_force_due) ||
@@ -1427,9 +1439,8 @@ bool RLCompactionPicker::ApplyWorkerSafety(
         }
         tree_transition_overridden = true;
       } else if (permit.mode == PermitMode::kForcedOpen &&
-                 ((!item.due &&
-                   (permit.reason == ActionReason::kBudget ||
-                    permit.reason == ActionReason::kEmergency)) ||
+                 (permit.reason == ActionReason::kBudget ||
+                  permit.reason == ActionReason::kEmergency ||
                   (permit.reason == ActionReason::kSLO &&
                    !evaluation.slo_force_due) ||
                   (permit.reason == ActionReason::kStaleStructure &&
@@ -1645,7 +1656,7 @@ void RLCompactionPicker::TraceSafetyShadow(
     const RLStateV2& state, const SafetyFrameEvaluation& evaluation,
     bool actuate, bool intervention_applied) const {
   if (!safety_shadow_log_ || state.interval_micros == 0) return;
-  safety_shadow_log_ << "{\"schema_version\":2,\"experiment_fingerprint\":";
+  safety_shadow_log_ << "{\"schema_version\":3,\"experiment_fingerprint\":";
   WriteJSONString(safety_shadow_log_, experiment_fingerprint_);
   safety_shadow_log_ << ",\"baseline_slo_sha256\":";
   WriteJSONString(safety_shadow_log_, baseline_slo_sha256_);
@@ -1658,6 +1669,14 @@ void RLCompactionPicker::TraceSafetyShadow(
                      << ",\"would_override_frame\":"
                      << (evaluation.would_override_frame ? "true" : "false")
                      << ",\"reason_mask\":" << evaluation.reason_mask
+                     << ",\"slo_force_due\":"
+                     << (evaluation.slo_force_due ? "true" : "false")
+                     << ",\"global_debt_breach\":"
+                     << (evaluation.global_debt_breach ? "true" : "false")
+                     << ",\"l0_slowdown\":"
+                     << (evaluation.l0_slowdown ? "true" : "false")
+                     << ",\"pending_debt_ratio\":"
+                     << evaluation.pending_debt_ratio
                      << ",\"observed_levels\":" << state.levels.size()
                      << ",\"enforcement_enabled\":"
                      << (safety_enabled_ ? "true" : "false")

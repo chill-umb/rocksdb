@@ -160,6 +160,12 @@ class RLCompactionPicker : public LevelCompactionPicker {
     bool dirty_deadline_miss = false;
     bool slo_force_due = false;
     bool prohibit_optional = false;
+    // The three global force terms and the debt ratio they act on, logged
+    // per frame (safety_shadow schema 3) because no per-level limit can
+    // offset them and no other record of them exists at frame resolution.
+    bool global_debt_breach = false;
+    bool l0_slowdown = false;
+    double pending_debt_ratio = 0.0;
     bool would_override_frame = false;
     uint64_t reason_mask = 0;
     SafetyLevelEvaluation levels[kMaxRLLevels];
