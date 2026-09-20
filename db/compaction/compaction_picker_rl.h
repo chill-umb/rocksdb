@@ -380,6 +380,10 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<uint64_t> rl_query_count_{0};
   mutable std::atomic<uint64_t> rl_actuation_count_{0};
   mutable std::atomic<uint64_t> rl_skipped_ticks_{0};
+  // Ticks taken while control was suspended (rlsuspend .. rlresume). Idle by
+  // design, so kept apart from skipped_ticks, which 09's observation_health
+  // invariant reads as the worker missing a tick it should have taken.
+  mutable std::atomic<uint64_t> rl_suspended_ticks_{0};
   mutable std::atomic<uint64_t> rl_bypass_count_{0};
   mutable std::atomic<bool> rl_fallback_logged_{false};
   mutable std::atomic<uint64_t> rl_nc_calls_{0};

@@ -41,14 +41,24 @@ bool RLDrainMode() { return g_rl_drain_mode.load(std::memory_order_acquire); }
 
 namespace {
 std::atomic<bool> g_rl_control_suspended{false};
+std::atomic<uint64_t> g_rl_control_resumed_micros{0};
 }  // namespace
 
 void SetRLControlSuspended(bool suspended) {
+  if (!suspended) {
+    // Stamp the resume instant before the flag drops, so any reader that
+    // observes control as live also observes when it became live.
+    g_rl_control_resumed_micros.store(NowMicros(), std::memory_order_release);
+  }
   g_rl_control_suspended.store(suspended, std::memory_order_release);
 }
 
 bool RLControlSuspended() {
   return g_rl_control_suspended.load(std::memory_order_acquire);
+}
+
+uint64_t RLControlResumedMicros() {
+  return g_rl_control_resumed_micros.load(std::memory_order_acquire);
 }
 
 RLCompactionTelemetry& RLCompactionTelemetry::Get() {

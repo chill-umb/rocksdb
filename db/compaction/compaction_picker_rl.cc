@@ -655,6 +655,13 @@ void RLCompactionPicker::RecordDueAdmission(int level,
       now_micros < due_since_micros) {
     return;
   }
+  // An episode that went due under suspension was serviced by the native
+  // picker; the controller's first admission after rlresume would otherwise
+  // record the tail of the bulk load as its own latency (~1 s at 1M, seen as
+  // the max on every parity run of 2026-09-21).
+  if (RLControlSuspended() || due_since_micros < RLControlResumedMicros()) {
+    return;
+  }
   // One sample per due episode. The episode's own start timestamp is its
   // identity, so a gate that stays open across many PickCompaction calls
   // contributes exactly once.
@@ -689,7 +696,12 @@ void RLCompactionPicker::ObserveDueEpisodeTransitions() const {
     const uint64_t previous =
         last_seen_due_since_[level].exchange(due_since,
                                             std::memory_order_relaxed);
-    if (previous == 0 || previous == due_since) continue;
+    // An episode that began before the last resume was the native picker's
+    // to admit, not the controller's.
+    if (previous == 0 || previous == due_since ||
+        previous < RLControlResumedMicros()) {
+      continue;
+    }
     // The previous due episode ended. If it never reached the admission
     // recorder, the controller held that level closed for its whole life.
     if (recorded_due_since_[level].load(std::memory_order_relaxed) !=
@@ -1920,7 +1932,8 @@ void RLCompactionPicker::WorkerLoop() {
       last_tick_micros = tick_micros;
       structural = structural_snapshot_;
       if (structural == nullptr) {
-        rl_skipped_ticks_.fetch_add(1, std::memory_order_relaxed);
+        (RLControlSuspended() ? rl_suspended_ticks_ : rl_skipped_ticks_)
+            .fetch_add(1, std::memory_order_relaxed);
         continue;
       }
     }
@@ -1929,7 +1942,7 @@ void RLCompactionPicker::WorkerLoop() {
       // window is still consumed so that the first controlled frame after
       // `rlresume` covers one observation interval rather than the whole load.
       RLCompactionTelemetry::Get().Consume();
-      rl_skipped_ticks_.fetch_add(1, std::memory_order_relaxed);
+      rl_suspended_ticks_.fetch_add(1, std::memory_order_relaxed);
       continue;
     }
     RLStateV2 state;
@@ -2040,7 +2053,8 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                  "RL trigger diagnostics: protocol=2 credit_assignment=2"
                  " queries=%" PRIu64
                  " actuations=%" PRIu64 " bypasses=%" PRIu64
-                 " skipped_ticks=%" PRIu64 " cumulative_fallbacks=%" PRIu64
+                 " skipped_ticks=%" PRIu64 " suspended_ticks=%" PRIu64
+                 " cumulative_fallbacks=%" PRIu64
                  " available=%d control_state=%d"
                  " bootstrap_gate_checks=%" PRIu64
                  " bootstrap_pick_attempts=%" PRIu64
@@ -2088,6 +2102,7 @@ void RLCompactionPicker::LogDiagnostics(bool final) const {
                  queries, rl_actuation_count_.load(std::memory_order_relaxed),
                  rl_bypass_count_.load(std::memory_order_relaxed),
                  rl_skipped_ticks_.load(std::memory_order_relaxed),
+                 rl_suspended_ticks_.load(std::memory_order_relaxed),
                  rl_fallback_count_.load(std::memory_order_relaxed),
                  logged_control_state == ControlState::kActive ? 1 : 0,
                  static_cast<int>(logged_control_state),

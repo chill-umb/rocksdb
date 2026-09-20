@@ -35,6 +35,13 @@ bool RLDrainMode();
 // workload nor the drain, and the event log stamps them `rl_suspended`.
 void SetRLControlSuspended(bool suspended);
 bool RLControlSuspended();
+// steady_clock micros of the most recent suspended -> resumed transition, 0
+// if control was never suspended. A due episode that started before this
+// instant went due under the native picker, so its wait is not the
+// controller's: RLCompactionPicker's admission-latency histogram and its
+// never-admitted counter both ignore such episodes. Stamped before the
+// suspended flag clears, so a reader that sees the flag down also sees it.
+uint64_t RLControlResumedMicros();
 
 struct RLCompactionTelemetrySnapshot {
   // Global counters (kept for the legacy single-level protocol and as
