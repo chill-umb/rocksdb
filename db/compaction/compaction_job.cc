@@ -1254,7 +1254,8 @@ Status CompactionJob::Install(bool* compaction_released) {
          << "compaction_time_cpu_micros" << stats.cpu_micros << "output_level"
          << compact_->compaction->output_level() << "num_output_files"
          << stats.num_output_files << "total_output_size"
-         << stats.bytes_written << "rl_drain" << RLDrainMode();
+         << stats.bytes_written << "rl_drain" << RLDrainMode()
+         << "rl_suspended" << RLControlSuspended();
   stream << "merge_schema_version" << 1 << "cf_id" << cfd->GetID()
          << "source_level" << compact_->compaction->start_level()
          << "merge_input_bytes"
@@ -2808,7 +2809,8 @@ void CompactionJob::LogCompaction() {
            << "rl_eligibility_generation"
            << compaction->rl_eligibility_generation() << "rl_override_reason"
            << compaction->rl_override_reason() << "rl_drain"
-           << RLDrainMode() << "oldest_snapshot_seqno"
+           << RLDrainMode() << "rl_suspended" << RLControlSuspended()
+           << "oldest_snapshot_seqno"
            << (job_context_->snapshot_seqs.empty()
                    ? int64_t{-1}  // Use -1 for "none"
                    : static_cast<int64_t>(

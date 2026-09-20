@@ -89,6 +89,12 @@ class RLCompactionPicker : public LevelCompactionPicker {
     // bridge validation L0 is held non-deferring so it matches native leveled
     // behavior while deeper-level control is evaluated.
     kPosture = 9,
+    // Control suspended by the benchmark driver (db_bench `rlsuspend`, raised
+    // across the bulk load). The parent leveled picker runs, no frame is sent
+    // and no safety rule evaluates, so these jobs are neither policy nor
+    // override: they precede the controlled phase on an identical tree in
+    // every arm.
+    kSuspended = 10,
   };
 
   enum class PolicyAction : int { kDefer = 0, kCompact = 1 };
@@ -285,7 +291,7 @@ class RLCompactionPicker : public LevelCompactionPicker {
   mutable std::atomic<uint64_t> bootstrap_failures_{0};
   mutable std::atomic<uint64_t> bootstrap_started_micros_{0};
   mutable std::atomic<uint64_t> bootstrap_duration_micros_{0};
-  mutable std::atomic<uint64_t> known_override_counts_[10] = {};
+  mutable std::atomic<uint64_t> known_override_counts_[11] = {};
   mutable std::atomic<uint64_t> reward_invalid_reason_mask_{0};
   mutable std::atomic<uint64_t> dirty_deadline_misses_{0};
   mutable std::atomic<bool> dirty_deadline_active_{false};

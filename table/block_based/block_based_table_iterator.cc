@@ -35,7 +35,15 @@ void BlockBasedTableIterator::SeekSecondPass(const Slice* target) {
 
 void BlockBasedTableIterator::SeekImpl(const Slice* target,
                                        bool async_prefetch) {
-  if (lookup_context_.caller != TableReaderCaller::kCompaction) {
+  // One tick per SORTED RUN a user seek touches, not per table. A keyed seek
+  // reaches each L0 file directly and each deeper level through its
+  // LevelIterator's first file, so counting keyed seeks here is exactly one
+  // per run. A null target is SeekToFirst(), which a LevelIterator also
+  // issues when a scan crosses a file boundary inside one level; ticking
+  // there charged a second "run" for the same level. LevelIterator counts
+  // its own SeekToFirst/SeekToLast once per level instead.
+  if (target != nullptr &&
+      lookup_context_.caller != TableReaderCaller::kCompaction) {
     RecordTick(table_->GetStatistics(), SORTED_RUN_SEEK);
   }
   // TODO(hx235): set `seek_key_prefix_for_readahead_trimming_`

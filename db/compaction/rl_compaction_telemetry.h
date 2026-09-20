@@ -26,6 +26,16 @@ constexpr int kRLTelemetryMaxLevels = 16;
 void SetRLDrainMode(bool enabled);
 bool RLDrainMode();
 
+// Control suspension. While set, RLCompactionPicker delegates entirely to the
+// parent leveled picker, sends no observation frames and evaluates no safety
+// rule. db_bench raises it across the bulk load (`rlsuspend` ... `rlresume`)
+// so every arm loads the tree under native leveled compaction and the
+// controller starts on an identical tree at `mixgraph` start. Unlike drain it
+// is not a settle-up phase: bytes it moves belong to neither the measured
+// workload nor the drain, and the event log stamps them `rl_suspended`.
+void SetRLControlSuspended(bool suspended);
+bool RLControlSuspended();
+
 struct RLCompactionTelemetrySnapshot {
   // Global counters (kept for the legacy single-level protocol and as
   // aggregate features).
@@ -45,6 +55,9 @@ struct RLCompactionTelemetrySnapshot {
   uint64_t foreground_count[3] = {};
   uint64_t foreground_latency_sum_ns[3] = {};
   uint64_t foreground_latency_p95_ns[3] = {};
+  // The formal latency constraint is average and p99 (P0-4); p95 stays for
+  // the guard, whose manifest limits are calibrated on it.
+  uint64_t foreground_latency_p99_ns[3] = {};
   RLLatencyHistogram foreground_latency_buckets[3] = {};
 
   // Wall-clock span these deltas cover, measured between successive Consume()

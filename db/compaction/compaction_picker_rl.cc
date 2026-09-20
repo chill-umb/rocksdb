@@ -1130,7 +1130,7 @@ bool RLCompactionPicker::EnterNativeFallback(
 
 void RLCompactionPicker::RecordKnownOverride(ActionReason reason) const {
   const int index = static_cast<int>(reason);
-  if (index >= 0 && index < 10) {
+  if (index >= 0 && index < 11) {
     known_override_counts_[index].fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -1720,6 +1720,7 @@ void RLCompactionPicker::RunDecisionCycle(
           : static_cast<double>(telemetry.foreground_latency_sum_ns[0]) /
                 telemetry.foreground_count[0];
   state.get_latency_p95_ns = telemetry.foreground_latency_p95_ns[0];
+  state.get_latency_p99_ns = telemetry.foreground_latency_p99_ns[0];
   state.get_latency_buckets = telemetry.foreground_latency_buckets[0];
   state.scan_latency_count = telemetry.foreground_count[1];
   state.scan_latency_avg_ns =
@@ -1728,6 +1729,7 @@ void RLCompactionPicker::RunDecisionCycle(
           : static_cast<double>(telemetry.foreground_latency_sum_ns[1]) /
                 telemetry.foreground_count[1];
   state.scan_latency_p95_ns = telemetry.foreground_latency_p95_ns[1];
+  state.scan_latency_p99_ns = telemetry.foreground_latency_p99_ns[1];
   state.scan_latency_buckets = telemetry.foreground_latency_buckets[1];
   state.write_latency_count = telemetry.foreground_count[2];
   state.write_latency_avg_ns =
@@ -1736,6 +1738,7 @@ void RLCompactionPicker::RunDecisionCycle(
           : static_cast<double>(telemetry.foreground_latency_sum_ns[2]) /
                 telemetry.foreground_count[2];
   state.write_latency_p95_ns = telemetry.foreground_latency_p95_ns[2];
+  state.write_latency_p99_ns = telemetry.foreground_latency_p99_ns[2];
   state.write_latency_buckets = telemetry.foreground_latency_buckets[2];
   state.fallback_count = rl_fallback_count_.load(std::memory_order_relaxed);
   PopulateReadStats(state);
@@ -1901,6 +1904,14 @@ void RLCompactionPicker::WorkerLoop() {
         rl_skipped_ticks_.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
+    }
+    if (RLControlSuspended()) {
+      // Suspended: no frame, no safety evaluation, no learning. The telemetry
+      // window is still consumed so that the first controlled frame after
+      // `rlresume` covers one observation interval rather than the whole load.
+      RLCompactionTelemetry::Get().Consume();
+      rl_skipped_ticks_.fetch_add(1, std::memory_order_relaxed);
+      continue;
     }
     RLStateV2 state;
     BuildObservation(*structural, &state);
@@ -2166,7 +2177,7 @@ bool RLCompactionPicker::NeedsCompaction(
     }
   } timer{this, start};
 
-  if (RLDrainMode()) {
+  if (RLDrainMode() || RLControlSuspended()) {
     return LevelCompactionPicker::NeedsCompaction(vstorage);
   }
   if (HasMaintenanceWork(vstorage)) {
@@ -2260,6 +2271,8 @@ Compaction* RLCompactionPicker::PickCompaction(
       control_state_.load(std::memory_order_acquire);
   if (RLDrainMode()) {
     parent_reason = static_cast<int>(ActionReason::kDrain);
+  } else if (RLControlSuspended()) {
+    parent_reason = static_cast<int>(ActionReason::kSuspended);
   } else if (HasMaintenanceWork(vstorage)) {
     parent_reason = static_cast<int>(ActionReason::kMaintenance);
   } else if (pick_control_state == ControlState::kFallback) {

@@ -143,12 +143,15 @@ std::string FormatStateV2(const RLStateV2& s) {
      << ",\"get_latency_count\":" << s.get_latency_count
      << ",\"get_latency_avg_ns\":" << s.get_latency_avg_ns
      << ",\"get_latency_p95_ns\":" << s.get_latency_p95_ns
+     << ",\"get_latency_p99_ns\":" << s.get_latency_p99_ns
      << ",\"scan_latency_count\":" << s.scan_latency_count
      << ",\"scan_latency_avg_ns\":" << s.scan_latency_avg_ns
      << ",\"scan_latency_p95_ns\":" << s.scan_latency_p95_ns
+     << ",\"scan_latency_p99_ns\":" << s.scan_latency_p99_ns
      << ",\"write_latency_count\":" << s.write_latency_count
      << ",\"write_latency_avg_ns\":" << s.write_latency_avg_ns
      << ",\"write_latency_p95_ns\":" << s.write_latency_p95_ns
+     << ",\"write_latency_p99_ns\":" << s.write_latency_p99_ns
      << ",\"done\":" << (s.done ? "true" : "false") << ",\"levels\":[";
   for (size_t i = 0; i < s.levels.size(); ++i) {
     if (i > 0) os << ",";

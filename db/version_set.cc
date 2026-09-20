@@ -1561,6 +1561,11 @@ void LevelIterator::SeekToFirst() {
   ClearSentinel();
   InitFileIterator(0);
   if (file_iter_.iter() != nullptr) {
+    // One sorted run per level: the table iterator does not tick on a null
+    // target (see BlockBasedTableIterator::SeekImpl), so count here.
+    if (caller_ != TableReaderCaller::kCompaction) {
+      RecordTick(db_statistics_, SORTED_RUN_SEEK);
+    }
     file_iter_.SeekToFirst();
     if (range_tombstone_iter_) {
       // We do this in SeekToFirst() and SeekToLast() since
@@ -1578,6 +1583,9 @@ void LevelIterator::SeekToLast() {
   ClearSentinel();
   InitFileIterator(flevel_->num_files - 1);
   if (file_iter_.iter() != nullptr) {
+    if (caller_ != TableReaderCaller::kCompaction) {
+      RecordTick(db_statistics_, SORTED_RUN_SEEK);
+    }
     file_iter_.SeekToLast();
     if (range_tombstone_iter_) {
       TrySetDeleteRangeSentinel(file_smallest_key(file_index_));

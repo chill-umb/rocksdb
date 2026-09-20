@@ -3838,6 +3838,18 @@ class Benchmark {
         CompactLevel(1);
       } else if (name == "waitforcompaction") {
         WaitForCompaction();
+      } else if (name == "rlsuspend") {
+        // Hand the tree to native leveled compaction for the benchmarks that
+        // follow (the bulk load). Every arm then reaches `rlresume` with the
+        // same tree, and the controller's first frame is the first measured
+        // operation rather than a load it was never meant to govern.
+        SetRLControlSuspended(true);
+        fprintf(stdout, "RL_CONTROL_SUSPENDED_MICROS %" PRIu64 "\n",
+                FLAGS_env->NowMicros());
+      } else if (name == "rlresume") {
+        SetRLControlSuspended(false);
+        fprintf(stdout, "RL_CONTROL_RESUMED_MICROS %" PRIu64 "\n",
+                FLAGS_env->NowMicros());
       } else if (name == "flush") {
         Flush();
       } else if (name == "crc32c") {

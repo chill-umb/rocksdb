@@ -39,6 +39,18 @@ void SetRLDrainMode(bool enabled) {
 
 bool RLDrainMode() { return g_rl_drain_mode.load(std::memory_order_acquire); }
 
+namespace {
+std::atomic<bool> g_rl_control_suspended{false};
+}  // namespace
+
+void SetRLControlSuspended(bool suspended) {
+  g_rl_control_suspended.store(suspended, std::memory_order_release);
+}
+
+bool RLControlSuspended() {
+  return g_rl_control_suspended.load(std::memory_order_acquire);
+}
+
 RLCompactionTelemetry& RLCompactionTelemetry::Get() {
   static RLCompactionTelemetry telemetry;
   return telemetry;
@@ -191,6 +203,7 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Snapshot() const {
       snapshot.foreground_latency_sum_ns[op] =
           foreground_latency_sum_ns_[op];
       const uint64_t rank = (snapshot.foreground_count[op] * 95 + 99) / 100;
+      const uint64_t rank99 = (snapshot.foreground_count[op] * 99 + 99) / 100;
       uint64_t seen = 0;
       for (size_t bucket = 0; bucket < kRLLatencyBucketCount; ++bucket) {
         snapshot.foreground_latency_buckets[op][bucket] =
@@ -199,6 +212,11 @@ RLCompactionTelemetrySnapshot RLCompactionTelemetry::Snapshot() const {
         if (snapshot.foreground_latency_p95_ns[op] == 0 && rank != 0 &&
             seen >= rank) {
           snapshot.foreground_latency_p95_ns[op] =
+              RLLatencyBucketUpperBound(bucket);
+        }
+        if (snapshot.foreground_latency_p99_ns[op] == 0 && rank99 != 0 &&
+            seen >= rank99) {
+          snapshot.foreground_latency_p99_ns[op] =
               RLLatencyBucketUpperBound(bucket);
         }
       }
