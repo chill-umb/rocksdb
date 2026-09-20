@@ -187,7 +187,7 @@ bool RLSafetyController::Parse(const std::string& json,
   std::string p95_method;
   if (!UintField(json, "schema_version", &schema) || schema != 2 ||
       !StringField(json, "metric_definitions_version", &definitions) ||
-      definitions != "trigger-v2-logical-v2" ||
+      definitions != "trigger-v2-logical-v3" ||
       !StringField(json, "experiment_fingerprint", &manifest_fingerprint) ||
       fingerprint.empty() || manifest_fingerprint != fingerprint ||
       !BoolField(json, "guard_calibrated", &guard_calibrated) ||
