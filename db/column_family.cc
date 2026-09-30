@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -1683,6 +1684,55 @@ Status ColumnFamilyData::ValidateOptions(
           "CompactionOptionsUniversal::max_read_amp limits the number of sorted"
           " runs but is smaller than the compaction trigger "
           "level0_file_num_compaction_trigger.");
+    }
+  }
+
+  // Research fork, level target multipliers (PATHWAYS A-Impl-1, 2 and 7).
+  // Rejected, never clamped: a silently altered vector would measure a
+  // different configuration from the one requested.
+  const std::vector<double>& multipliers = cf_options.level_target_multipliers;
+  if (!multipliers.empty()) {
+    if (cf_options.compaction_style != kCompactionStyleLevel) {
+      return Status::InvalidArgument(
+          "level_target_multipliers requires kCompactionStyleLevel");
+    }
+    if (cf_options.level_compaction_dynamic_level_bytes) {
+      return Status::InvalidArgument(
+          "level_target_multipliers requires "
+          "level_compaction_dynamic_level_bytes = false");
+    }
+    if (multipliers.size() != static_cast<size_t>(cf_options.num_levels)) {
+      return Status::InvalidArgument(
+          "level_target_multipliers needs one entry per level");
+    }
+    if (multipliers[0] != 1.0) {
+      return Status::InvalidArgument(
+          "level_target_multipliers[0] must be 1.0: L0 is never scaled");
+    }
+    // [m_min, m_max] of A-Impl-7, which PREREGISTRATION fixes (§0.6 item 3).
+    constexpr double kMinMultiplier = 0.5;
+    constexpr double kMaxMultiplier = 2.0;
+    for (size_t level = 1; level < multipliers.size(); ++level) {
+      const double m = multipliers[level];
+      if (!std::isfinite(m) || m < kMinMultiplier || m > kMaxMultiplier) {
+        return Status::InvalidArgument("level_target_multipliers[" +
+                                       std::to_string(level) +
+                                       "] is outside [0.5, 2.0]");
+      }
+    }
+    // Targets never shrink going down the tree: the static ladder makes
+    // level i+1's target (T * additional[i]) times level i's, so require
+    // m[i+1] * T * additional[i] >= m[i].
+    const auto& additional =
+        cf_options.max_bytes_for_level_multiplier_additional;
+    for (size_t level = 1; level + 1 < multipliers.size(); ++level) {
+      const double ratio = cf_options.max_bytes_for_level_multiplier *
+                           (level < additional.size() ? additional[level] : 1);
+      if (multipliers[level + 1] * ratio < multipliers[level]) {
+        return Status::InvalidArgument(
+            "level_target_multipliers make level " + std::to_string(level + 1) +
+            "'s target smaller than level " + std::to_string(level) + "'s");
+      }
     }
   }
   return s;

@@ -620,26 +620,9 @@ class VersionStorageInfo {
   // Returns maximum total bytes of data on a given level.
   uint64_t MaxBytesForLevel(int level) const;
   uint64_t BaseMaxBytesForLevel(int level) const;
+  // The level_target_multipliers entry this version was built with (1 for
+  // L0 and when the option is empty). MaxBytesForLevel multiplies it in.
   double CapacityScale(int level) const { return capacity_scales_.at(level); }
-  uint64_t CapacityGeneration() const { return capacity_generation_; }
-  void InheritCapacityState(const VersionStorageInfo& current) {
-    assert(num_levels_ == current.num_levels_);
-    capacity_scales_ = current.capacity_scales_;
-    capacity_generation_ = current.capacity_generation_;
-  }
-
-  // Open-loop static expansion for the capacity calibration arms, read once
-  // from RL_STATIC_CAPACITY_SCALES. A controller-set vector always wins.
-  void ApplyStaticCapacityScales();
-
-  // Atomic target/score/debt change. REQUIRES: DB mutex held. L0 and the
-  // output-only final level are fixed; targets must remain nondecreasing.
-  // A stale generation is rejected without changing any state.
-  Status SetCapacityScales(const std::vector<double>& scales,
-                           uint64_t expected_generation,
-                           const ImmutableOptions& immutable_options,
-                           const MutableCFOptions& mutable_cf_options,
-                           const std::string& full_history_ts_low);
 
   // Returns an estimate of the amount of live data in bytes.
   uint64_t EstimateLiveDataSize() const;
@@ -704,7 +687,6 @@ class VersionStorageInfo {
   // Per-level max bytes
   std::vector<uint64_t> level_max_bytes_;
   std::vector<double> capacity_scales_;
-  uint64_t capacity_generation_ = 0;
 
   // A short brief metadata of files per level
   autovector<ROCKSDB_NAMESPACE::LevelFilesBrief> level_files_brief_;

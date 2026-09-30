@@ -61,7 +61,6 @@ void LogCompactionRelease(const Compaction* c, int job_id, uint64_t now_micros,
          << "rl_decision_id" << c->rl_decision_id()
          << "effective_action" << 1
          << "rl_override_reason" << c->rl_override_reason()
-         << "capacity_generation" << storage->CapacityGeneration()
          << "rl_drain" << RLDrainMode() << "rl_suspended"
          << RLControlSuspended() << "trivial_move" << trivial_move;
   stream << "occupancy_bytes";

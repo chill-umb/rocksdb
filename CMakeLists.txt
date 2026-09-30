@@ -1355,6 +1355,8 @@ if(WITH_TESTS)
   set(TESTS
         db/db_basic_test.cc
         env/env_basic_test.cc
+        # Research fork's own tests, built even without WITH_ALL_TESTS.
+        db/level_target_multipliers_test.cc
   )
   if(WITH_ALL_TESTS)
     list(APPEND TESTS

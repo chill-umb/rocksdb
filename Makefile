@@ -1512,6 +1512,9 @@ db_merge_operand_test: $(OBJ_DIR)/db/db_merge_operand_test.o $(TEST_LIBRARY) $(L
 db_options_test: $(OBJ_DIR)/db/db_options_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+level_target_multipliers_test: $(OBJ_DIR)/db/level_target_multipliers_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_range_del_test: $(OBJ_DIR)/db/db_range_del_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

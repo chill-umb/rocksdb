@@ -2529,10 +2529,6 @@ VersionStorageInfo::VersionStorageInfo(
       epoch_number_requirement_(epoch_number_requirement),
       offpeak_time_option_(std::move(offpeak_time_option)) {
   if (ref_vstorage != nullptr) {
-    if (ref_vstorage->num_levels_ == num_levels_) {
-      capacity_scales_ = ref_vstorage->capacity_scales_;
-      capacity_generation_ = ref_vstorage->capacity_generation_;
-    }
     accumulated_file_size_ = ref_vstorage->accumulated_file_size_;
     accumulated_raw_key_size_ = ref_vstorage->accumulated_raw_key_size_;
     accumulated_raw_value_size_ = ref_vstorage->accumulated_raw_value_size_;
@@ -3440,92 +3436,25 @@ void VersionStorageInfo::GenerateLevelFilesBrief() {
   }
 }
 
-namespace {
-
-// Static per-level capacity expansion, for the open-loop arms that calibrate
-// s_max. Parsed once from RL_STATIC_CAPACITY_SCALES as a comma-separated list
-// with one entry per level. A-Impl-1 keeps expansion out of L0's byte branch,
-// so the first and last entries must be 1.0. Unset means no expansion; set but
-// unusable aborts rather than running an experiment that silently measures an
-// unexpanded tree.
-const std::vector<double>& StaticCapacityScales() {
-  static const std::vector<double> scales = [] {
-    std::vector<double> parsed;
-    const char* raw = std::getenv("RL_STATIC_CAPACITY_SCALES");
-    if (raw == nullptr || *raw == '\0') {
-      return parsed;
-    }
-    const char* cursor = raw;
-    while (*cursor != '\0') {
-      char* end = nullptr;
-      const double value = std::strtod(cursor, &end);
-      if (end == cursor || !std::isfinite(value) || value < 1.0) {
-        std::fprintf(stderr,
-                     "RL_STATIC_CAPACITY_SCALES is not a comma-separated list "
-                     "of finite values >= 1.0: %s\n", raw);
-        std::abort();
-      }
-      parsed.push_back(value);
-      cursor = (*end == ',') ? end + 1 : end;
-    }
-    if (parsed.size() < 2 || parsed.front() != 1.0 || parsed.back() != 1.0) {
-      std::fprintf(stderr,
-                   "RL_STATIC_CAPACITY_SCALES must hold one entry per level "
-                   "with the first and last equal to 1.0: %s\n", raw);
-      std::abort();
-    }
-    return parsed;
-  }();
-  return scales;
-}
-
-}  // namespace
-
-void VersionStorageInfo::ApplyStaticCapacityScales() {
-  const std::vector<double>& configured = StaticCapacityScales();
-  // A controller-set vector has a nonzero generation and is never overwritten.
-  if (configured.empty() || capacity_generation_ != 0 ||
-      (compaction_style_ != kCompactionStyleLevel &&
-       compaction_style_ != kCompactionStyleRL)) {
-    return;
-  }
-  if (configured.size() != static_cast<size_t>(num_levels_) ||
-      level_max_bytes_.size() != configured.size()) {
-    std::fprintf(stderr,
-                 "RL_STATIC_CAPACITY_SCALES has %zu entries but the column "
-                 "family has %d levels\n", configured.size(), num_levels_);
-    std::abort();
-  }
-  uint64_t previous = 0;
-  for (int level = 0; level < num_levels_; ++level) {
-    const long double target =
-        static_cast<long double>(level_max_bytes_[level]) * configured[level];
-    if (target > static_cast<long double>(
-                     std::numeric_limits<uint64_t>::max())) {
-      std::fprintf(stderr, "RL_STATIC_CAPACITY_SCALES overflows level %d\n",
-                   level);
-      std::abort();
-    }
-    const auto bytes = static_cast<uint64_t>(target);
-    if (level > 0 && bytes < previous) {
-      std::fprintf(stderr,
-                   "RL_STATIC_CAPACITY_SCALES makes level %d smaller than the "
-                   "level above it\n", level);
-      std::abort();
-    }
-    previous = bytes;
-  }
-  capacity_scales_ = configured;
-}
-
 void VersionStorageInfo::PrepareForVersionAppend(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options) {
   ComputeCompensatedSizes();
   UpdateNumNonEmptyLevels();
   CalculateBaseBytes(immutable_options, mutable_cf_options);
-  // After the base ladder exists, before any score is computed from it.
-  ApplyStaticCapacityScales();
+  // Level target multipliers (PATHWAYS A-Impl-1): after the base ladder
+  // exists, before any score is computed from it. Every version takes them
+  // from the options it is built with, so a SetOptions() call is in effect in
+  // the version it appends. ColumnFamilyData::ValidateOptions guarantees an
+  // empty vector or one entry per level.
+  const std::vector<double>& multipliers =
+      mutable_cf_options.level_target_multipliers;
+  if (multipliers.size() == static_cast<size_t>(num_levels_)) {
+    capacity_scales_ = multipliers;
+  } else {
+    assert(multipliers.empty());
+    capacity_scales_.assign(num_levels_, 1.0);
+  }
   UpdateFilesByCompactionPri(immutable_options, mutable_cf_options);
   GenerateFileIndexer();
   GenerateLevelFilesBrief();
@@ -5202,52 +5131,6 @@ uint64_t VersionStorageInfo::BaseMaxBytesForLevel(int level) const {
   return level_max_bytes_[level];
 }
 
-Status VersionStorageInfo::SetCapacityScales(
-    const std::vector<double>& scales, uint64_t expected_generation,
-    const ImmutableOptions& immutable_options,
-    const MutableCFOptions& mutable_cf_options,
-    const std::string& full_history_ts_low) {
-  if (immutable_options.level_compaction_dynamic_level_bytes ||
-      (compaction_style_ != kCompactionStyleLevel &&
-       compaction_style_ != kCompactionStyleRL)) {
-    return Status::InvalidArgument("capacity control requires static leveled targets");
-  }
-  if (scales.size() != static_cast<size_t>(num_levels_) || scales.size() < 2 ||
-      level_max_bytes_.size() != scales.size() ||
-      scales.front() != 1.0 || scales.back() != 1.0) {
-    return Status::InvalidArgument("capacity scales must preserve L0 and final target");
-  }
-  if (expected_generation != capacity_generation_) {
-    return Status::InvalidArgument("stale capacity generation");
-  }
-  uint64_t previous = 0;
-  for (int level = 0; level < num_levels_; ++level) {
-    const double scale = scales[level];
-    const long double target = static_cast<long double>(level_max_bytes_[level]) * scale;
-    if (!std::isfinite(scale) || scale < 1 ||
-        target > std::numeric_limits<uint64_t>::max()) {
-      return Status::InvalidArgument("invalid or overflowing capacity scale");
-    }
-    const auto bytes = static_cast<uint64_t>(target);
-    if (level > 0 && bytes < previous) {
-      return Status::InvalidArgument("capacity targets must be nondecreasing");
-    }
-    previous = bytes;
-  }
-  if (scales == capacity_scales_) {
-    return Status::OK();
-  }
-  if (capacity_generation_ == std::numeric_limits<uint64_t>::max()) {
-    return Status::InvalidArgument("capacity generation exhausted");
-  }
-  capacity_scales_ = scales;
-  ++capacity_generation_;
-  // This also recomputes estimated debt and publishes the existing pressure
-  // observer, so scheduling and safety see the same effective targets.
-  ComputeCompactionScore(immutable_options, mutable_cf_options, full_history_ts_low);
-  return Status::OK();
-}
-
 void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
                                             const MutableCFOptions& options) {
   // Special logic to set number of sorted runs.
@@ -5982,15 +5865,6 @@ void VersionSet::AppendVersion(ColumnFamilyData* column_family_data,
   assert(v != current);
   if (current != nullptr) {
     assert(current->refs_ > 0);
-    // Manifest I/O may release the DB mutex after this version was built.
-    // Preserve target changes made to the active version during that interval.
-    if (v->storage_info()->CapacityGeneration() !=
-        current->storage_info()->CapacityGeneration()) {
-      v->storage_info()->InheritCapacityState(*current->storage_info());
-      v->storage_info()->ComputeCompactionScore(
-          column_family_data->ioptions(), v->GetMutableCFOptions(),
-          column_family_data->GetFullHistoryTsLow());
-    }
     current->storage_info()->SetCompactionPressureObserver(nullptr);
     current->Unref();
   }

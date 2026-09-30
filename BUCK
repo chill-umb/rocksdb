@@ -50,9 +50,15 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/compaction/compaction_picker.cc",
         "db/compaction/compaction_picker_fifo.cc",
         "db/compaction/compaction_picker_level.cc",
+        "db/compaction/compaction_picker_rl.cc",
         "db/compaction/compaction_picker_universal.cc",
+        "db/compaction/compaction_pressure_observer.cc",
         "db/compaction/compaction_service_job.cc",
         "db/compaction/compaction_state.cc",
+        "db/compaction/rl_compaction_client.cc",
+        "db/compaction/rl_compaction_telemetry.cc",
+        "db/compaction/rl_control_coordinator.cc",
+        "db/compaction/rl_safety_manifest.cc",
         "db/compaction/sst_partitioner.cc",
         "db/compaction/subcompaction_state.cc",
         "db/convenience.cc",
@@ -5264,6 +5270,12 @@ cpp_unittest_wrapper(name="iostats_context_test",
 
 cpp_unittest_wrapper(name="ldb_cmd_test",
             srcs=["tools/ldb_cmd_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="level_target_multipliers_test",
+            srcs=["db/level_target_multipliers_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

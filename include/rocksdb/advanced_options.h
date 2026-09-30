@@ -686,6 +686,21 @@ struct AdvancedColumnFamilyOptions {
   std::vector<int> max_bytes_for_level_multiplier_additional =
       std::vector<int>(static_cast<size_t>(num_levels), 1);
 
+  // Research fork (PATHWAYS Pathway A): per-level multipliers on the leveled
+  // byte targets. Level i >= 1 is due when its bytes exceed
+  // MaxBytesForLevel(i) = (the static target) * level_target_multipliers[i].
+  // Level 0 is never scaled, so entry 0 must be 1.0 and L0's triggers are
+  // unchanged. Empty (the default) means every multiplier is 1.
+  //
+  // A non-empty vector needs kCompactionStyleLevel, a static ladder
+  // (level_compaction_dynamic_level_bytes = false) and one entry per level,
+  // each finite and in [0.5, 2.0], and must never make a level's target
+  // smaller than the one above it. Anything else is rejected, never clamped.
+  //
+  // Dynamically changeable through SetOptions() as "1:1.5:0.8:...". The new
+  // targets and scores are in effect when SetOptions() returns.
+  std::vector<double> level_target_multipliers;
+
   // We try to limit number of bytes in one compaction to be lower than this
   // threshold. But it's not guaranteed.
   // Value 0 will be sanitized.

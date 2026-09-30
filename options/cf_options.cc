@@ -528,6 +528,11 @@ static std::unordered_map<std::string, OptionTypeInfo>
                       max_bytes_for_level_multiplier_additional),
              OptionVerificationType::kNormal, OptionTypeFlags::kMutable,
              {0, OptionType::kInt})},
+        {"level_target_multipliers",
+         OptionTypeInfo::Vector<double>(
+             offsetof(struct MutableCFOptions, level_target_multipliers),
+             OptionVerificationType::kNormal, OptionTypeFlags::kMutable,
+             {0, OptionType::kDouble})},
         {"max_sequential_skip_in_iterations",
          {offsetof(struct MutableCFOptions, max_sequential_skip_in_iterations),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -1228,6 +1233,12 @@ void MutableCFOptions::Dump(Logger* log) const {
 
   ROCKS_LOG_INFO(log, "max_bytes_for_level_multiplier_additional: %s",
                  result.c_str());
+  std::string multipliers;
+  for (const double m : level_target_multipliers) {
+    multipliers += (multipliers.empty() ? "" : ":") + std::to_string(m);
+  }
+  ROCKS_LOG_INFO(log, "                 level_target_multipliers: %s",
+                 multipliers.empty() ? "(all 1)" : multipliers.c_str());
   ROCKS_LOG_INFO(log, "        max_sequential_skip_in_iterations: %" PRIu64,
                  max_sequential_skip_in_iterations);
   ROCKS_LOG_INFO(log, "                     paranoid_file_checks: %d",

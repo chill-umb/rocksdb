@@ -930,6 +930,13 @@ static std::vector<int> FLAGS_max_bytes_for_level_multiplier_additional_v;
 DEFINE_string(max_bytes_for_level_multiplier_additional, "",
               "A vector that specifies additional fanout per level");
 
+DEFINE_string(
+    level_target_multipliers, "",
+    "Research fork (PATHWAYS Pathway A): per-level multipliers on the "
+    "leveled byte targets, one per level, as \"1:1.5:0.8:...\", "
+    "entry 0 = 1. Empty = all 1. Parsed and validated as the "
+    "level_target_multipliers column family option.");
+
 DEFINE_int32(level0_stop_writes_trigger,
              ROCKSDB_NAMESPACE::Options().level0_stop_writes_trigger,
              "Number of files in level-0 that will trigger put stop.");
@@ -4843,6 +4850,19 @@ class Benchmark {
       }
       options.max_bytes_for_level_multiplier_additional =
           FLAGS_max_bytes_for_level_multiplier_additional_v;
+    }
+    if (!FLAGS_level_target_multipliers.empty()) {
+      // RocksDB's own parser, so the flag takes exactly the SetOptions()
+      // format. Range and ordering are checked when the DB opens.
+      Status parsed = GetColumnFamilyOptionsFromString(
+          ConfigOptions(), options,
+          "level_target_multipliers=" + FLAGS_level_target_multipliers,
+          &options);
+      if (!parsed.ok()) {
+        fprintf(stderr, "Invalid --level_target_multipliers: %s\n",
+                parsed.ToString().c_str());
+        db_bench_exit(1);
+      }
     }
     options.level0_stop_writes_trigger = FLAGS_level0_stop_writes_trigger;
     options.level0_file_num_compaction_trigger =

@@ -273,6 +273,7 @@ void UpdateColumnFamilyOptions(const MutableCFOptions& moptions,
   for (auto value : moptions.max_bytes_for_level_multiplier_additional) {
     cf_opts->max_bytes_for_level_multiplier_additional.emplace_back(value);
   }
+  cf_opts->level_target_multipliers = moptions.level_target_multipliers;
 
   cf_opts->compaction_options_fifo = moptions.compaction_options_fifo;
   cf_opts->compaction_options_universal = moptions.compaction_options_universal;
