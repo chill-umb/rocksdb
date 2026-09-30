@@ -937,6 +937,11 @@ DEFINE_string(
     "entry 0 = 1. Empty = all 1. Parsed and validated as the "
     "level_target_multipliers column family option.");
 
+DEFINE_string(setoptions, "",
+              "Research fork: column family options the `setoptions` "
+              "benchmark applies through DB::SetOptions, in RocksDB's option "
+              "string form, e.g. \"level_target_multipliers=1:2:1:1\".");
+
 DEFINE_int32(level0_stop_writes_trigger,
              ROCKSDB_NAMESPACE::Options().level0_stop_writes_trigger,
              "Number of files in level-0 that will trigger put stop.");
@@ -3845,6 +3850,8 @@ class Benchmark {
         CompactLevel(1);
       } else if (name == "waitforcompaction") {
         WaitForCompaction();
+      } else if (name == "setoptions") {
+        SetOptionsFromFlag();
       } else if (name == "rlsuspend") {
         // Hand the tree to native leveled compaction for the benchmarks that
         // follow (the bulk load). Every arm then reaches `rlresume` with the
@@ -8990,6 +8997,32 @@ class Benchmark {
     fprintf(stdout, "RL_DRAIN_END_MICROS %" PRIu64 "\n",
             FLAGS_env->NowMicros());
     SetRLDrainMode(false);
+  }
+
+  // One DB::SetOptions call on the default column family, as the controller
+  // will make, so the Release binary's SetOptions path can be checked from
+  // outside (PATHWAYS ACT-1). A refused call exits, like any db_bench error.
+  void SetOptionsFromFlag() {
+    std::unordered_map<std::string, std::string> options_map;
+    Status s = StringToMap(FLAGS_setoptions, &options_map);
+    if (s.ok() && options_map.empty()) {
+      s = Status::InvalidArgument("--setoptions is empty");
+    }
+    std::vector<DB*> dbs;
+    if (db_.db != nullptr) {
+      dbs.push_back(db_.db);
+    }
+    for (auto& db_with_cfh : multi_dbs_) {
+      dbs.push_back(db_with_cfh.db);
+    }
+    for (size_t i = 0; s.ok() && i < dbs.size(); ++i) {
+      s = dbs[i]->SetOptions(options_map);
+    }
+    fprintf(stdout, "setoptions(%s): %s\n", FLAGS_setoptions.c_str(),
+            s.ToString().c_str());
+    if (!s.ok()) {
+      ErrorExit();
+    }
   }
 
   bool CompactLevelHelper(DBWithColumnFamilies& db_with_cfh, int from_level) {
