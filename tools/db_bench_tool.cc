@@ -27,6 +27,7 @@
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>
 #endif
+#include <algorithm>
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
@@ -5173,7 +5174,11 @@ class Benchmark {
     }
 
     options.listeners.emplace_back(listener_);
-    if (rl_host_log_ != nullptr) {
+    // Once only: a fresh-DB benchmark (the load) opens the DB again with these
+    // same options, and a second copy would log every job and H sample twice.
+    if (rl_host_log_ != nullptr &&
+        std::find(options.listeners.begin(), options.listeners.end(),
+                  rl_host_log_) == options.listeners.end()) {
       options.listeners.emplace_back(rl_host_log_);
     }
 
