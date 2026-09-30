@@ -92,6 +92,7 @@ LIB_SOURCES =                                                   \
   db/range_del_aggregator.cc                                    \
   db/range_tombstone_fragmenter.cc                              \
   db/repair.cc                                                  \
+  db/rl_controller_host.cc                                      \
   db/seqno_to_time_mapping.cc                                   \
   db/snapshot_impl.cc                                           \
   db/table_cache.cc                                             \
@@ -525,6 +526,8 @@ TEST_MAIN_SOURCES =                                                     \
   db/db_merge_operand_test.cc                                           \
   db/db_options_test.cc                                                 \
   db/level_target_multipliers_test.cc                                   \
+  db/per_level_read_counters_test.cc                                    \
+  db/rl_controller_host_test.cc                                         \
   db/db_properties_test.cc                                              \
   db/db_range_del_test.cc                                               \
   db/db_rate_limiter_test.cc                                            \

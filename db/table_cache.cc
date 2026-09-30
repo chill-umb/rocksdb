@@ -309,6 +309,8 @@ InternalIterator* TableCache::NewIterator(
           options, mutable_cf_options.prefix_extractor.get(), arena,
           skip_filters, caller, file_options.compaction_readahead_size,
           allow_unprepared_value);
+      // The version's level, not the table reader's (WP3).
+      result->SetReadCounterLevel(level);
     }
     if (handle != nullptr) {
       cache_.RegisterReleaseAsCleanup(handle, *result);

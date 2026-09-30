@@ -79,6 +79,13 @@ class GetContext {
   };
   GetContextStats get_context_stats_;
 
+  // Research fork (WP3): the whole-key filter outcome of one table lookup,
+  // set where BLOOM_FILTER_FULL_POSITIVE and BLOOM_FILTER_FULL_TRUE_POSITIVE
+  // tick. Version::Get clears them before each file and charges them to the
+  // file's level in the version (see db/rl_read_counters.h).
+  bool rl_filter_passed = false;
+  bool rl_filter_hit = false;
+
   // Constructor
   // @param value Holds the value corresponding to user_key. If its nullptr
   //              then return all merge operands corresponding to user_key

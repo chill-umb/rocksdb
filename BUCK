@@ -102,6 +102,7 @@ cpp_library_wrapper(name="rocksdb_lib", srcs=[
         "db/range_del_aggregator.cc",
         "db/range_tombstone_fragmenter.cc",
         "db/repair.cc",
+        "db/rl_controller_host.cc",
         "db/seqno_to_time_mapping.cc",
         "db/snapshot_impl.cc",
         "db/table_cache.cc",
@@ -5406,6 +5407,12 @@ cpp_unittest_wrapper(name="partitioned_filter_block_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="per_level_read_counters_test",
+            srcs=["db/per_level_read_counters_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="perf_context_test",
             srcs=["db/perf_context_test.cc"],
             deps=[":rocksdb_test_lib"],
@@ -5510,6 +5517,12 @@ cpp_unittest_wrapper(name="repeatable_thread_test",
 
 cpp_unittest_wrapper(name="ribbon_test",
             srcs=["util/ribbon_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
+cpp_unittest_wrapper(name="rl_controller_host_test",
+            srcs=["db/rl_controller_host_test.cc"],
             deps=[":rocksdb_test_lib"],
             extra_compiler_flags=[])
 

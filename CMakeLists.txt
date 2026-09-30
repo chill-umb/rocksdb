@@ -762,6 +762,7 @@ set(SOURCES
         db/range_del_aggregator.cc
         db/range_tombstone_fragmenter.cc
         db/repair.cc
+        db/rl_controller_host.cc
         db/seqno_to_time_mapping.cc
         db/snapshot_impl.cc
         db/table_cache.cc
@@ -1357,6 +1358,8 @@ if(WITH_TESTS)
         env/env_basic_test.cc
         # Research fork's own tests, built even without WITH_ALL_TESTS.
         db/level_target_multipliers_test.cc
+        db/per_level_read_counters_test.cc
+        db/rl_controller_host_test.cc
   )
   if(WITH_ALL_TESTS)
     list(APPEND TESTS

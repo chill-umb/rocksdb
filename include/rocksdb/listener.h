@@ -492,6 +492,16 @@ struct CompactionJobInfo {
 
   // Whether this compaction was aborted via AbortAllCompactions()
   bool aborted = false;
+
+  // Research fork (Programme 1 host log). Input bytes at the start level (S)
+  // and at the output level (O), from the input files' sizes; a trivial move
+  // moves exactly S.
+  uint64_t rl_start_level_input_bytes = 0;
+  uint64_t rl_output_level_input_bytes = 0;
+  // When the start level's compaction score last reached 1 before this job
+  // was picked, in steady_clock microseconds. 0 if the level was not due or
+  // the compaction was not picked automatically.
+  uint64_t rl_start_level_due_since_micros = 0;
 };
 
 struct MemTableInfo {

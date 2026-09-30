@@ -42,6 +42,11 @@ class InternalIteratorBase : public Cleanable {
   // iterators.
   virtual void SetRangeDelReadSeqno(SequenceNumber /* read_seqno */) {}
 
+  // Research fork (WP3): the version level of the file this table iterator
+  // reads, set by TableCache::NewIterator, so its seeks are counted per level
+  // (db/rl_read_counters.h). Noop except for BlockBasedTableIterator.
+  virtual void SetReadCounterLevel(int /* level */) {}
+
   // An iterator is either positioned at a key/value pair, or
   // not valid.  This method returns true iff the iterator is valid.
   // Always returns false if !status().ok().

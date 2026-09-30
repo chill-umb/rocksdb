@@ -53,6 +53,8 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
 
   ~BlockBasedTableIterator() override { ClearBlockHandles(); }
 
+  void SetReadCounterLevel(int level) override { read_counter_level_ = level; }
+
   void Seek(const Slice& target) override;
   void SeekForPrev(const Slice& target) override;
   void SeekToFirst() override;
@@ -324,6 +326,9 @@ class BlockBasedTableIterator : public InternalIteratorBase<Slice> {
   const SliceTransform* prefix_extractor_;
   uint64_t prev_block_offset_ = std::numeric_limits<uint64_t>::max();
   BlockCacheLookupContext lookup_context_;
+  // Version level for the per-level seek counter; -1 (uncounted) until
+  // TableCache::NewIterator sets it.
+  int read_counter_level_ = -1;
 
   BlockPrefetcher block_prefetcher_;
 

@@ -10,6 +10,7 @@
 #include <deque>
 
 #include "db/builder.h"
+#include "db/compaction/compaction_pressure_observer.h"
 #include "db/compaction/rl_compaction_telemetry.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
@@ -1899,12 +1900,18 @@ void DBImpl::NotifyOnCompactionCompleted(
   }
 
   if (cfd->ioptions().compaction_style == kCompactionStyleRL) {
+    // The job stats flag a trivial move; Compaction::is_trivial_move() is set
+    // only by the universal picker. A move reads nothing, so its progress is
+    // the bytes it relinked (Gate N0 item 3).
+    const bool trivial_move =
+        compaction_job_stats.num_input_files_trivially_moved > 0;
     RLCompactionTelemetry::Get().RecordCompactionCompleted(
         c->start_level(), c->output_level(),
-        compaction_job_stats.total_input_bytes,
+        trivial_move ? c->CalculateTotalInputSize()
+                     : compaction_job_stats.total_input_bytes,
         compaction_job_stats.total_output_bytes, c->rl_decision_id(),
         c->rl_decision_generation(), c->rl_eligibility_generation(),
-        c->rl_override_reason(), st.ok(), c->is_trivial_move());
+        c->rl_override_reason(), st.ok(), trivial_move);
   }
 
   if (immutable_db_options_.listeners.size() == 0U) {
@@ -4078,10 +4085,21 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         InitSnapshotContext(job_context);
         assert(is_snapshot_supported_ || snapshots_.empty());
       }
+      // The host log's slot wait needs when the start level became due.
+      // Read it now: picking recomputes the scores without the chosen files,
+      // which usually ends the level's due episode.
+      const auto pressure_view = cfd->compaction_pressure_view();
+      const auto pre_pick =
+          pressure_view == nullptr ? nullptr : pressure_view->Load();
       c.reset(cfd->PickCompaction(
           mutable_cf_options, mutable_db_options_, job_context->snapshot_seqs,
           job_context->snapshot_checker, log_buffer,
           thread_pri == Env::Priority::BOTTOM /* require_max_output_level */));
+      if (c != nullptr && pre_pick != nullptr && c->start_level() >= 0 &&
+          static_cast<size_t>(c->start_level()) < pre_pick->levels.size()) {
+        c->SetRLStartLevelDueSince(
+            pre_pick->levels[c->start_level()].due_since_micros);
+      }
       if (thread_pri == Env::Priority::LOW) {
         TEST_SYNC_POINT("DBImpl::BackgroundCompaction():AfterPickCompaction");
       } else if (thread_pri == Env::Priority::BOTTOM) {
@@ -4933,8 +4951,15 @@ void DBImpl::BuildCompactionJobInfo(
       compaction_job_info->input_files.push_back(fn);
       compaction_job_info->input_file_infos.push_back(CompactionFileInfo{
           static_cast<int>(i), file_number, fmd->oldest_blob_file_number});
+      if (i == 0) {
+        compaction_job_info->rl_start_level_input_bytes += desc.GetFileSize();
+      } else if (c->level(i) == c->output_level()) {
+        compaction_job_info->rl_output_level_input_bytes += desc.GetFileSize();
+      }
     }
   }
+  compaction_job_info->rl_start_level_due_since_micros =
+      c->rl_start_level_due_since_micros();
 
   for (const auto& newf : c->edit()->GetNewFiles()) {
     const FileMetaData& meta = newf.second;

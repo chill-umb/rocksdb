@@ -430,6 +430,16 @@ class Compaction {
     return rl_eligibility_generation_;
   }
 
+  // When the start level last became due before this compaction was picked
+  // (CompactionPressureObserver's clock), for the host log's slot wait. Read
+  // before picking: the pick recomputes scores without the chosen files.
+  void SetRLStartLevelDueSince(uint64_t micros) {
+    rl_start_level_due_since_micros_ = micros;
+  }
+  uint64_t rl_start_level_due_since_micros() const {
+    return rl_start_level_due_since_micros_;
+  }
+
   const std::vector<FileMetaData*>& grandparents() const {
     return grandparents_;
   }
@@ -649,6 +659,7 @@ class Compaction {
   int rl_override_reason_ = 0;
   uint64_t rl_decision_generation_ = 0;
   uint64_t rl_eligibility_generation_ = 0;
+  uint64_t rl_start_level_due_since_micros_ = 0;
 
   // Notify on compaction completion only if listener was notified on compaction
   // begin.

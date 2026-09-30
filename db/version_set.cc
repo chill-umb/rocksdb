@@ -9,8 +9,6 @@
 
 #include "db/version_set.h"
 
-#include "db/compaction/compaction_pressure_observer.h"
-
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -31,6 +29,7 @@
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction.h"
+#include "db/compaction/compaction_pressure_observer.h"
 #include "db/compaction/file_pri.h"
 #include "db/dbformat.h"
 #include "db/internal_stats.h"
@@ -41,6 +40,7 @@
 #include "db/merge_context.h"
 #include "db/merge_helper.h"
 #include "db/pinned_iterators_manager.h"
+#include "db/rl_read_counters.h"
 #include "db/table_cache.h"
 #include "db/version_builder.h"
 #include "db/version_edit.h"
@@ -1565,6 +1565,7 @@ void LevelIterator::SeekToFirst() {
     // target (see BlockBasedTableIterator::SeekImpl), so count here.
     if (caller_ != TableReaderCaller::kCompaction) {
       RecordTick(db_statistics_, SORTED_RUN_SEEK);
+      RLReadCounters::Add(level_, RLReadCounter::kSeek);
     }
     file_iter_.SeekToFirst();
     if (range_tombstone_iter_) {
@@ -1585,6 +1586,7 @@ void LevelIterator::SeekToLast() {
   if (file_iter_.iter() != nullptr) {
     if (caller_ != TableReaderCaller::kCompaction) {
       RecordTick(db_statistics_, SORTED_RUN_SEEK);
+      RLReadCounters::Add(level_, RLReadCounter::kSeek);
     }
     file_iter_.SeekToLast();
     if (range_tombstone_iter_) {
@@ -2790,6 +2792,12 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
     // subsequent table lookup is rejected by a Bloom filter or served from a
     // cache. Physical file-read counters are retained separately.
     RecordTick(db_statistics_, POINT_SST_PROBE);
+    // Per-level counters take the level from this version (WP3); the table
+    // reports its filter outcome through get_context.
+    const int rl_level = static_cast<int>(fp.GetHitFileLevel());
+    RLReadCounters::Add(rl_level, RLReadCounter::kProbe);
+    get_context.rl_filter_passed = false;
+    get_context.rl_filter_hit = false;
     *status = table_cache_->Get(
         read_options, *internal_comparator(), *f->file_metadata, ikey,
         &get_context, mutable_cf_options_,
@@ -2797,6 +2805,12 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
                         fp.IsHitFileLastInLevel()),
         fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
+    if (get_context.rl_filter_passed) {
+      RLReadCounters::Add(rl_level, RLReadCounter::kFilterPass);
+    }
+    if (get_context.rl_filter_hit) {
+      RLReadCounters::Add(rl_level, RLReadCounter::kFilterHit);
+    }
     // TODO: examine the behavior for corrupted key
     if (timer_enabled) {
       PERF_COUNTER_BY_LEVEL_ADD(get_from_table_nanos, timer.ElapsedNanos(),

@@ -39,9 +39,10 @@
 #include <thread>
 #include <unordered_map>
 
-#include "db/db_impl/db_impl.h"
 #include "db/compaction/rl_compaction_telemetry.h"
+#include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
+#include "db/rl_controller_host.h"
 #include "db/version_set.h"
 #include "monitoring/histogram.h"
 #include "monitoring/statistics_impl.h"
@@ -941,6 +942,16 @@ DEFINE_string(setoptions, "",
               "Research fork: column family options the `setoptions` "
               "benchmark applies through DB::SetOptions, in RocksDB's option "
               "string form, e.g. \"level_target_multipliers=1:2:1:1\".");
+
+DEFINE_string(rl_host_log, "",
+              "Research fork (plan WP4): write the host log here: H samples, "
+              "compaction job records and phase stamps, one JSON object per "
+              "line (db/rl_controller_host.h). Needs --statistics.");
+
+DEFINE_int32(rl_settle_hold_seconds, 10,
+             "Research fork: h_w, how long the `settle` benchmark holds the "
+             "tree after WaitForCompact with nothing due (PREREGISTRATION "
+             "D-13 §6).");
 
 DEFINE_int32(level0_stop_writes_trigger,
              ROCKSDB_NAMESPACE::Options().level0_stop_writes_trigger,
@@ -2939,6 +2950,7 @@ class Benchmark {
   };
 
   std::shared_ptr<ErrorHandlerListener> listener_;
+  std::shared_ptr<RLHostLog> rl_host_log_;
 
   std::unique_ptr<TimestampEmulator> mock_app_clock_;
 
@@ -3446,6 +3458,17 @@ class Benchmark {
     }
 
     listener_.reset(new ErrorHandlerListener());
+    if (!FLAGS_rl_host_log.empty()) {
+      // Operation counts come from dbstats, and stamps read one DB.
+      Status s = FLAGS_num_multi_db > 1
+                     ? Status::NotSupported("--rl_host_log with --num_multi_db")
+                     : RLHostLog::Open(FLAGS_rl_host_log, dbstats,
+                                       FLAGS_num_levels, &rl_host_log_);
+      if (!s.ok()) {
+        fprintf(stderr, "--rl_host_log: %s\n", s.ToString().c_str());
+        ErrorExit();
+      }
+    }
     if (user_timestamp_size_ > 0) {
       mock_app_clock_.reset(new TimestampEmulator());
     }
@@ -3852,6 +3875,8 @@ class Benchmark {
         WaitForCompaction();
       } else if (name == "setoptions") {
         SetOptionsFromFlag();
+      } else if (name == "settle") {
+        Settle();
       } else if (name == "rlsuspend") {
         // Hand the tree to native leveled compaction for the benchmarks that
         // follow (the bulk load). Every arm then reaches `rlresume` with the
@@ -5148,6 +5173,9 @@ class Benchmark {
     }
 
     options.listeners.emplace_back(listener_);
+    if (rl_host_log_ != nullptr) {
+      options.listeners.emplace_back(rl_host_log_);
+    }
 
     if (options.file_checksum_gen_factory == nullptr) {
       if (FLAGS_file_checksum) {
@@ -7251,6 +7279,14 @@ class Benchmark {
       use_random_modeling = true;
     }
 
+    // The measured phase starts at the first mixgraph operation, n_w
+    // (PATHWAYS A8, H §5). The workload has one client thread.
+    if (thread->tid == 0 && dbstats != nullptr) {
+      fprintf(stdout, "RL_MEASURE_START_OP %" PRIu64 "\n",
+              RLOperationCount(*dbstats));
+      StampHostLog("measure_start");
+    }
+
     Duration duration(FLAGS_duration, reads_);
     while (!duration.Done(1)) {
       DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
@@ -8986,6 +9022,7 @@ class Benchmark {
     SetRLDrainMode(true);
     fprintf(stdout, "RL_DRAIN_START_MICROS %" PRIu64 "\n",
             FLAGS_env->NowMicros());
+    StampHostLog("drain_start");
 
     if (db_.db != nullptr) {
       WaitForCompactionHelper(db_);
@@ -8996,7 +9033,83 @@ class Benchmark {
     }
     fprintf(stdout, "RL_DRAIN_END_MICROS %" PRIu64 "\n",
             FLAGS_env->NowMicros());
+    StampHostLog("drain_end");
     SetRLDrainMode(false);
+  }
+
+  // A host-log stamp on the single DB (none without --rl_host_log). A lost
+  // record ends the run: a log with a hole must not be scored.
+  void StampHostLog(const std::string& name, const std::string& extra = "") {
+    if (rl_host_log_ == nullptr || db_.db == nullptr) {
+      return;
+    }
+    Status s = rl_host_log_->Stamp(db_.db, name, extra);
+    if (!s.ok()) {
+      fprintf(stderr, "host log stamp %s: %s\n", name.c_str(),
+              s.ToString().c_str());
+      ErrorExit();
+    }
+  }
+
+  // Settle, then measure (PATHWAYS H §5; PREREGISTRATION D-13 §6). After
+  // the load: WaitForCompact with flushes, then a hold of
+  // --rl_settle_hold_seconds, polled every 100 ms, during which nothing may
+  // be due: no compaction pending (the picker's NeedsCompaction, true when
+  // any level's score is >= 1, L0's counting k0 / K0, or a file is marked
+  // for compaction) and k0 < K0. Prints RL_SETTLED. A failed hold ends the
+  // run, since the arm is invalid (A8). Not `waitforcompaction`, which also
+  // enters the old stack's drain mode.
+  void Settle() {
+    DB* db = db_.db;
+    if (db == nullptr) {
+      fprintf(stderr, "settle needs a single open DB\n");
+      ErrorExit();
+    }
+    const uint64_t wait_start = FLAGS_env->NowMicros();
+    WaitForCompactOptions wait_options;
+    wait_options.flush = true;
+    Status s = db->WaitForCompact(wait_options);
+    const uint64_t wait_micros = FLAGS_env->NowMicros() - wait_start;
+
+    const int trigger = db->GetOptions().level0_file_num_compaction_trigger;
+    const uint64_t hold_micros =
+        static_cast<uint64_t>(std::max(FLAGS_rl_settle_hold_seconds, 0)) *
+        1000000;
+    const uint64_t hold_start = FLAGS_env->NowMicros();
+    std::string failure = s.ok() ? "" : "WaitForCompact " + s.ToString();
+    while (failure.empty()) {
+      uint64_t pending = 0;
+      std::string l0_files;
+      if (!db->GetIntProperty(DB::Properties::kCompactionPending, &pending) ||
+          !db->GetProperty(DB::Properties::kNumFilesAtLevelPrefix + "0",
+                           &l0_files)) {
+        failure = "property read failed";
+      } else if (pending != 0) {
+        failure = "compaction pending";
+      } else if (std::stoi(l0_files) >= trigger) {
+        failure =
+            "L0 files " + l0_files + " >= trigger " + std::to_string(trigger);
+      } else if (FLAGS_env->NowMicros() - hold_start >= hold_micros) {
+        break;
+      } else {
+        FLAGS_env->SleepForMicroseconds(100000);
+      }
+    }
+    const uint64_t held_micros = FLAGS_env->NowMicros() - hold_start;
+    const int ok = failure.empty() ? 1 : 0;
+    fprintf(stdout,
+            "RL_SETTLED ok=%d wait_micros=%" PRIu64 " hold_micros=%" PRIu64
+            "%s%s\n",
+            ok, wait_micros, held_micros,
+            ok ? "" : " reason=", failure.c_str());
+    fflush(stdout);
+    StampHostLog("settle",
+                 ",\"ok\":" + std::to_string(ok) +
+                     ",\"wait_micros\":" + std::to_string(wait_micros) +
+                     ",\"hold_micros\":" + std::to_string(held_micros));
+    if (!ok) {
+      ErrorExit();
+    }
   }
 
   // One DB::SetOptions call on the default column family, as the controller

@@ -2331,6 +2331,9 @@ bool BlockBasedTable::FullFilterKeyMayMatch(
     if (may_match) {
       RecordTick(rep_->ioptions.stats, BLOOM_FILTER_FULL_POSITIVE);
       PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_full_positive, 1, rep_->level);
+      if (get_context != nullptr) {
+        get_context->rl_filter_passed = true;
+      }
     } else {
       RecordTick(rep_->ioptions.stats, BLOOM_FILTER_USEFUL);
       PERF_COUNTER_BY_LEVEL_ADD(bloom_filter_useful, 1, rep_->level);
@@ -2637,6 +2640,7 @@ Status BlockBasedTable::Get(const ReadOptions& read_options, const Slice& key,
     if (matched && filter != nullptr) {
       if (rep_->whole_key_filtering) {
         RecordTick(rep_->ioptions.stats, BLOOM_FILTER_FULL_TRUE_POSITIVE);
+        get_context->rl_filter_hit = true;
       } else {
         RecordTick(rep_->ioptions.stats, BLOOM_FILTER_PREFIX_TRUE_POSITIVE);
       }

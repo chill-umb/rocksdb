@@ -1515,6 +1515,12 @@ db_options_test: $(OBJ_DIR)/db/db_options_test.o $(TEST_LIBRARY) $(LIBRARY)
 level_target_multipliers_test: $(OBJ_DIR)/db/level_target_multipliers_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+per_level_read_counters_test: $(OBJ_DIR)/db/per_level_read_counters_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+rl_controller_host_test: $(OBJ_DIR)/db/rl_controller_host_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_range_del_test: $(OBJ_DIR)/db/db_range_del_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

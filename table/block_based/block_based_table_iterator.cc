@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include "table/block_based/block_based_table_iterator.h"
 
+#include "db/rl_read_counters.h"
+
 namespace ROCKSDB_NAMESPACE {
 
 void BlockBasedTableIterator::SeekToFirst() { SeekImpl(nullptr, false); }
@@ -45,6 +47,7 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
   if (target != nullptr &&
       lookup_context_.caller != TableReaderCaller::kCompaction) {
     RecordTick(table_->GetStatistics(), SORTED_RUN_SEEK);
+    RLReadCounters::Add(read_counter_level_, RLReadCounter::kSeek);
   }
   // TODO(hx235): set `seek_key_prefix_for_readahead_trimming_`
   // even when `target == nullptr` that is when `SeekToFirst()` is called
@@ -218,6 +221,7 @@ void BlockBasedTableIterator::SeekImpl(const Slice* target,
 void BlockBasedTableIterator::SeekForPrev(const Slice& target) {
   if (lookup_context_.caller != TableReaderCaller::kCompaction) {
     RecordTick(table_->GetStatistics(), SORTED_RUN_SEEK);
+    RLReadCounters::Add(read_counter_level_, RLReadCounter::kSeek);
   }
   ResetMultiScan();
   direction_ = IterDirection::kBackward;
