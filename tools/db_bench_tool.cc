@@ -949,6 +949,16 @@ DEFINE_string(rl_host_log, "",
               "compaction job records and phase stamps, one JSON object per "
               "line (db/rl_controller_host.h). Needs --statistics.");
 
+DEFINE_string(rl_plugin, "",
+              "Research fork (plan WP2): the controller plugin to load, e.g. "
+              "build-controller/librl_controller.so. Created at the first "
+              "mixgraph operation (n_w), destroyed after the drain. Needs "
+              "--statistics, --rl_plugin_config, one DB and one column "
+              "family, and leveled compaction.");
+
+DEFINE_string(rl_plugin_config, "",
+              "Research fork: the --rl_plugin controller's JSON config.");
+
 DEFINE_int32(rl_settle_hold_seconds, 10,
              "Research fork: h_w, how long the `settle` benchmark holds the "
              "tree after WaitForCompact with nothing due (PREREGISTRATION "
@@ -2952,6 +2962,10 @@ class Benchmark {
 
   std::shared_ptr<ErrorHandlerListener> listener_;
   std::shared_ptr<RLHostLog> rl_host_log_;
+  // --rl_plugin: the host from construction, the plugin from n_w to the end
+  // of the drain.
+  std::shared_ptr<RLControllerHostImpl> rl_host_;
+  std::unique_ptr<RLControllerPlugin> rl_plugin_;
 
   std::unique_ptr<TimestampEmulator> mock_app_clock_;
 
@@ -3470,12 +3484,32 @@ class Benchmark {
         ErrorExit();
       }
     }
+    if (!FLAGS_rl_plugin.empty()) {
+      // The host listens from the first open, so it knows every job running
+      // when the plugin starts at n_w (MixGraph); one DB, one column family.
+      const char* problem =
+          dbstats == nullptr               ? "needs --statistics"
+          : FLAGS_rl_plugin_config.empty() ? "needs --rl_plugin_config"
+          : FLAGS_num_multi_db > 1         ? "needs one DB (--num_multi_db)"
+          : FLAGS_num_column_families != 1
+              ? "needs one column family (--num_column_families)"
+          : FLAGS_compaction_style != kCompactionStyleLevel
+              ? "needs leveled compaction (--compaction_style=0)"
+              : nullptr;
+      if (problem != nullptr) {
+        fprintf(stderr, "--rl_plugin %s\n", problem);
+        ErrorExit();
+      }
+      rl_host_ = std::make_shared<RLControllerHostImpl>(dbstats);
+    }
     if (user_timestamp_size_ > 0) {
       mock_app_clock_.reset(new TimestampEmulator());
     }
   }
 
   void DeleteDBs() {
+    // The controller calls the DB until it is destroyed.
+    rl_plugin_.reset();
     db_.DeleteDBs();
     for (auto& dbwcf : multi_dbs_) {
       dbwcf.DeleteDBs();
@@ -3991,6 +4025,12 @@ class Benchmark {
           method = nullptr;
         } else {
           if (db_.db != nullptr) {
+            if (rl_plugin_ != nullptr) {
+              // The controller holds this DB; a fresh one gets no new one.
+              fprintf(stderr, "--rl_plugin: %s reopens the DB after n_w\n",
+                      name.c_str());
+              ErrorExit();
+            }
             db_.DeleteDBs();
             DestroyDB(FLAGS_db, open_options_);
           }
@@ -5180,6 +5220,11 @@ class Benchmark {
         std::find(options.listeners.begin(), options.listeners.end(),
                   rl_host_log_) == options.listeners.end()) {
       options.listeners.emplace_back(rl_host_log_);
+    }
+    if (rl_host_ != nullptr &&
+        std::find(options.listeners.begin(), options.listeners.end(),
+                  rl_host_) == options.listeners.end()) {
+      options.listeners.emplace_back(rl_host_);
     }
 
     if (options.file_checksum_gen_factory == nullptr) {
@@ -7290,6 +7335,7 @@ class Benchmark {
       fprintf(stdout, "RL_MEASURE_START_OP %" PRIu64 "\n",
               RLOperationCount(*dbstats));
       StampHostLog("measure_start");
+      StartRLPlugin();
     }
 
     Duration duration(FLAGS_duration, reads_);
@@ -9028,6 +9074,15 @@ class Benchmark {
     fprintf(stdout, "RL_DRAIN_START_MICROS %" PRIu64 "\n",
             FLAGS_env->NowMicros());
     StampHostLog("drain_start");
+    if (rl_plugin_ != nullptr) {
+      // Plan WP4: the drain runs under fallback settings. The controller
+      // keeps attributing until it is destroyed after drain_end.
+      Status s = rl_host_->BeginDrain();
+      fprintf(stdout, "RL_PLUGIN_DRAIN %s\n", s.ToString().c_str());
+      if (!s.ok()) {
+        ErrorExit();
+      }
+    }
 
     if (db_.db != nullptr) {
       WaitForCompactionHelper(db_);
@@ -9039,7 +9094,35 @@ class Benchmark {
     fprintf(stdout, "RL_DRAIN_END_MICROS %" PRIu64 "\n",
             FLAGS_env->NowMicros());
     StampHostLog("drain_end");
+    if (rl_plugin_ != nullptr) {
+      rl_plugin_.reset();
+      fprintf(stdout, "RL_PLUGIN_STOPPED\n");
+    }
     SetRLDrainMode(false);
+  }
+
+  // --rl_plugin: binds the host to the DB and creates the controller, at n_w
+  // (PREREGISTRATION D-13: the controller starts at the first measured
+  // operation). Once per run; a plugin that cannot load ends the run.
+  void StartRLPlugin() {
+    if (rl_host_ == nullptr || rl_plugin_ != nullptr) {
+      return;
+    }
+    Status s = db_.db == nullptr ? Status::InvalidArgument("no open DB")
+                                 : rl_host_->Attach(db_.db);
+    if (s.ok()) {
+      s = RLControllerPlugin::Load(FLAGS_rl_plugin, FLAGS_rl_plugin_config,
+                                   rl_host_.get(), &rl_plugin_);
+    }
+    if (!s.ok()) {
+      fprintf(stderr, "--rl_plugin: %s\n", s.ToString().c_str());
+      ErrorExit();
+    }
+    // A plugin that made no controller runs the arm as native; the
+    // pipeline refuses such an arm by this line.
+    fprintf(stdout, "RL_PLUGIN_STARTED created=%d\n",
+            rl_plugin_->created() ? 1 : 0);
+    fflush(stdout);
   }
 
   // A host-log stamp on the single DB (none without --rl_host_log). A lost

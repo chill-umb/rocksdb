@@ -3,9 +3,12 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 //
-// Research fork: the controller host (implementation plan WP2-WP4, §6.2).
-// So far the host log's parts: the operation count, job records, H samples
-// and stamps. The snapshot, Apply and plugin cases join with WP2.
+// Research fork: the controller host (implementation plan WP2-WP4, §6.2):
+// the host log (operation count, job records, H samples, stamps) and the
+// controller host (snapshot, counters, job callback, Apply, the drain, and
+// loading a plugin). The plugin case loads the library named by
+// RL_TEST_PLUGIN, which 01b_build_test_trees.sh sets to the Debug plugin it
+// builds first.
 
 #include "db/rl_controller_host.h"
 
@@ -16,9 +19,12 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "db/compaction/compaction_pressure_observer.h"
 #include "db/db_test_util.h"
 #include "db/rl_read_counters.h"
 #include "port/stack_trace.h"
@@ -369,6 +375,416 @@ TEST_F(RLControllerHostTest, StampCarriesCountersTickersAndStall) {
   }
   EXPECT_GT(levels[0][static_cast<int>(RLReadCounter::kProbe)], 0u);
   EXPECT_GT(levels[0][static_cast<int>(RLReadCounter::kSeek)], 0u);
+}
+
+// The controller host (plan WP2), registered as a listener when the DB
+// opens and attached afterwards, as db_bench does.
+class RLControllerHostImplTest : public RLControllerHostTest {
+ public:
+  void OpenWithHost(Options options) {
+    stats_ = CreateDBStatistics();
+    options.statistics = stats_;
+    host_ = std::make_shared<RLControllerHostImpl>(stats_);
+    options.listeners.push_back(host_);
+    RLReadCounters::Reset();
+    DestroyAndReopen(options);
+    ASSERT_OK(host_->Attach(db_.get()));
+  }
+
+  // A tree with files at L0, L1 and L2.
+  void BuildTree() {
+    WriteKeys(0, 100);
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(2);
+    WriteKeys(50, 150);
+    ASSERT_OK(Flush());
+    MoveFilesToLevel(1);
+    WriteKeys(200, 260);
+    ASSERT_OK(Flush());
+    ASSERT_EQ("1,1,1", FilesPerLevel());
+  }
+
+  std::shared_ptr<RLControllerHostImpl> host_;
+};
+
+TEST_F(RLControllerHostImplTest, AttachNeedsStatisticsAndRunsOnce) {
+  RLControllerHostImpl without(nullptr);
+  EXPECT_TRUE(without.Attach(db_.get()).IsInvalidArgument());
+  OpenWithHost(BaseOptions());
+  EXPECT_TRUE(host_->Attach(db_.get()).IsInvalidArgument());
+}
+
+TEST_F(RLControllerHostImplTest, OptionsAreTheRunsOwn) {
+  Options options = BaseOptions();
+  options.max_bytes_for_level_multiplier = 6;
+  options.max_bytes_for_level_base = 16 << 20;
+  options.level0_file_num_compaction_trigger = 3;
+  options.level0_slowdown_writes_trigger = 17;
+  options.level0_stop_writes_trigger = 30;
+  OpenWithHost(options);
+  const RLHostOptions o = host_->Options();
+  EXPECT_EQ(4, o.num_levels);
+  EXPECT_EQ(6.0, o.level_multiplier);
+  EXPECT_EQ(std::vector<int>(4, 1), o.level_multiplier_additional);
+  EXPECT_EQ(16u << 20, o.base_level_bytes);
+  EXPECT_EQ(64u << 20, o.write_buffer_size);
+  EXPECT_EQ(3, o.l0_trigger);
+  EXPECT_EQ(17, o.l0_slowdown_trigger);
+  EXPECT_EQ(30, o.l0_stop_trigger);
+}
+
+TEST_F(RLControllerHostImplTest, SnapshotDescribesTheTree) {
+  OpenWithHost(BaseOptions());
+  BuildTree();
+  ASSERT_OK(Put(Key(1000), "in the memtable"));
+  const auto bytes = LevelBytes();
+  const auto snapshot = host_->Snapshot();
+  ASSERT_EQ(4u, snapshot->levels.size());
+  for (int level = 0; level < 4; ++level) {
+    SCOPED_TRACE(level);
+    const RLLevelSnapshot& l = snapshot->levels[level];
+    EXPECT_EQ(bytes.count(level) ? bytes.at(level) : 0u, l.bytes);
+    EXPECT_EQ(NumTableFilesAtLevel(level), l.num_files);
+    EXPECT_EQ(0u, l.bytes_compacting);
+    EXPECT_EQ(0, l.num_files_compacting);
+  }
+  // Static ladder: C_1 = max_bytes_for_level_base, C_i = C_1 T^(i-1).
+  const uint64_t base = Options().max_bytes_for_level_base;
+  EXPECT_EQ(base, snapshot->levels[1].target_bytes);
+  EXPECT_EQ(base * 10, snapshot->levels[2].target_bytes);
+  // L0's score is its file count over the trigger.
+  EXPECT_EQ(1.0 / Options().level0_file_num_compaction_trigger,
+            snapshot->levels[0].score);
+  EXPECT_EQ(0u, snapshot->levels[0].due_since_micros);
+  EXPECT_EQ(3u, snapshot->score_order.size());
+  EXPECT_EQ(0, snapshot->score_order[0]);  // the highest score
+  EXPECT_EQ(LiveSstBytes(), snapshot->live_sst_bytes);
+  uint64_t pending = 0;
+  ASSERT_TRUE(db_->GetIntProperty(
+      DB::Properties::kEstimatePendingCompactionBytes, &pending));
+  EXPECT_EQ(pending, snapshot->pending_compaction_bytes);
+  EXPECT_EQ(std::vector<double>(4, 1.0), snapshot->level_target_multipliers);
+  EXPECT_EQ(Options().level0_file_num_compaction_trigger, snapshot->l0_trigger);
+  EXPECT_EQ(-1, snapshot->running_start_level);
+  uint64_t memtable = 0;
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kCurSizeActiveMemTable, &memtable));
+  EXPECT_EQ(memtable, snapshot->active_memtable_bytes);
+  EXPECT_GT(snapshot->active_memtable_bytes, 0u);
+  EXPECT_FALSE(snapshot->write_stopped);
+  EXPECT_GT(snapshot->generation, 0u);
+
+  // A later install publishes a later snapshot.
+  ASSERT_OK(Flush());
+  EXPECT_GT(host_->Snapshot()->generation, snapshot->generation);
+  EXPECT_EQ(2, host_->Snapshot()->levels[0].num_files);
+}
+
+// A tree whose highest score is L1's, over its target: the order is by score,
+// not by level; L1 is due since the install that made it due; the pending
+// estimate is the property's and not zero.
+TEST_F(RLControllerHostImplTest, SnapshotRanksByScoreAndMarksDueLevels) {
+  Options options = BaseOptions();
+  // L1 (800 keys, ~90 KiB) is over its target; L0 (one ~7 KiB file) scores
+  // by its file count, 1/4; L2 (100 keys) is far below its 640 KiB.
+  options.max_bytes_for_level_base = 64 << 10;
+  OpenWithHost(options);
+  const uint64_t start = CompactionPressureObserver::NowMicros();
+  WriteKeys(0, 100);
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(2);
+  WriteKeys(1000, 1800);
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+  WriteKeys(200, 260);
+  ASSERT_OK(Flush());
+  ASSERT_EQ("1,1,1", FilesPerLevel());
+
+  const auto snapshot = host_->Snapshot();
+  ASSERT_EQ(4u, snapshot->levels.size());
+  EXPECT_GT(snapshot->levels[1].score, 1.0);
+  EXPECT_EQ(0.25, snapshot->levels[0].score);
+  EXPECT_LT(snapshot->levels[2].score, 0.25);
+  EXPECT_EQ(std::vector<int>({1, 0, 2}), snapshot->score_order);
+  EXPECT_GE(snapshot->levels[1].due_since_micros, start);
+  EXPECT_LE(snapshot->levels[1].due_since_micros, snapshot->t_micros);
+  EXPECT_EQ(0u, snapshot->levels[0].due_since_micros);
+  EXPECT_EQ(0u, snapshot->levels[2].due_since_micros);
+  uint64_t pending = 0;
+  ASSERT_TRUE(db_->GetIntProperty(
+      DB::Properties::kEstimatePendingCompactionBytes, &pending));
+  EXPECT_GT(pending, 0u);
+  EXPECT_EQ(pending, snapshot->pending_compaction_bytes);
+}
+
+TEST_F(RLControllerHostImplTest, CountersAreTheTickers) {
+  OpenWithHost(BaseOptions());
+  BuildTree();
+  for (int i = 0; i < 300; i += 7) {
+    Get(Key(i));
+  }
+  {
+    std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+    it->Seek(Key(40));
+    ASSERT_OK(it->status());
+  }
+  const RLOpCounts ops = host_->OpCounts();
+  EXPECT_EQ(RLOperationCount(*stats_), ops.total());
+  EXPECT_EQ(RLOperationCount(*stats_), host_->OpCount());
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_KEYS_WRITTEN), ops.keys_written);
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_KEYS_READ), ops.keys_read);
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_DB_SEEK), ops.seeks);
+  EXPECT_EQ(stats_->getTickerCount(BYTES_WRITTEN), ops.bytes_written);
+
+  std::vector<RLLevelReadCounts> reads;
+  host_->ReadCounters(&reads);
+  ASSERT_EQ(4u, reads.size());
+  RLLevelReadCounts sum;
+  for (const auto& level : reads) {
+    sum.probes += level.probes;
+    sum.filter_passes += level.filter_passes;
+    sum.filter_hits += level.filter_hits;
+    sum.seeks += level.seeks;
+  }
+  EXPECT_EQ(stats_->getTickerCount(POINT_SST_PROBE), sum.probes);
+  EXPECT_EQ(stats_->getTickerCount(BLOOM_FILTER_FULL_POSITIVE),
+            sum.filter_passes);
+  EXPECT_EQ(stats_->getTickerCount(BLOOM_FILTER_FULL_TRUE_POSITIVE),
+            sum.filter_hits);
+  EXPECT_EQ(stats_->getTickerCount(SORTED_RUN_SEEK), sum.seeks);
+  EXPECT_GT(sum.probes, 0u);
+  EXPECT_GT(sum.seeks, 0u);
+}
+
+TEST_F(RLControllerHostImplTest, JobRecordsReachTheCallbackUntilRemoved) {
+  OpenWithHost(BaseOptions());
+  std::vector<RLJobRecord> records;
+  std::mutex mu;
+  host_->SetJobCallback([&](const RLJobRecord& record) {
+    std::lock_guard<std::mutex> lock(mu);
+    records.push_back(record);
+  });
+  // Read inside the merge: the picker's score recompute has published its
+  // inputs as being compacted.
+  std::shared_ptr<const RLTreeSnapshot> inside_job;
+  SyncPoint::GetInstance()->SetCallBack(
+      "CompactionJob::Run():Start",
+      [&](void* /*arg*/) { inside_job = host_->Snapshot(); });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  BuildTree();  // three flushes and three trivial moves
+  const uint64_t l0_file = LevelBytes()[0];
+  auto before = LevelBytes();
+  ASSERT_OK(dbfull()->TEST_CompactRange(1, nullptr, nullptr, nullptr,
+                                        /*disallow_trivial_move=*/true));
+  const uint64_t output = LevelBytes()[2];
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_NE(nullptr, inside_job);
+  EXPECT_EQ(1, inside_job->running_start_level);
+  EXPECT_EQ(before[1], inside_job->levels[1].bytes_compacting);
+  EXPECT_EQ(before[2], inside_job->levels[2].bytes_compacting);
+  EXPECT_EQ(1, inside_job->levels[1].num_files_compacting);
+  EXPECT_EQ(1, inside_job->levels[2].num_files_compacting);
+  EXPECT_EQ(0u, inside_job->levels[0].bytes_compacting);
+  const auto after_job = host_->Snapshot();
+  EXPECT_EQ(-1, after_job->running_start_level);
+  EXPECT_EQ(0u, after_job->levels[2].bytes_compacting);
+
+  std::vector<RLJobRecord> flushes, begins, ends;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    for (const auto& r : records) {
+      (r.kind == RLJobRecord::Kind::kFlushEnd          ? flushes
+       : r.kind == RLJobRecord::Kind::kCompactionBegin ? begins
+                                                       : ends)
+          .push_back(r);
+    }
+  }
+  ASSERT_EQ(3u, flushes.size());
+  EXPECT_EQ(l0_file, flushes.back().x);  // the flushed file's bytes
+  for (const auto& r : flushes) {
+    EXPECT_EQ(-1, r.start_level);
+    EXPECT_EQ(0, r.output_level);
+    EXPECT_GT(r.x, 0u);
+    EXPECT_TRUE(r.ok);
+  }
+  ASSERT_EQ(4u, begins.size());
+  ASSERT_EQ(4u, ends.size());
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_TRUE(begins[i].trivial);
+    EXPECT_TRUE(ends[i].trivial);
+    EXPECT_EQ(begins[i].job_id, ends[i].job_id);
+  }
+  const RLJobRecord& merge = ends[3];
+  EXPECT_EQ(begins[3].job_id, merge.job_id);
+  EXPECT_FALSE(merge.trivial);
+  EXPECT_EQ(1, merge.start_level);
+  EXPECT_EQ(2, merge.output_level);
+  EXPECT_EQ(before[1], merge.s);
+  EXPECT_EQ(before[2], merge.o);
+  EXPECT_EQ(output, merge.x);
+  EXPECT_TRUE(merge.ok);
+  EXPECT_EQ(0u, merge.due_since_micros);  // manual
+  EXPECT_LE(begins[3].op, merge.op);
+  EXPECT_LE(begins[3].t_micros, merge.t_micros);
+  EXPECT_EQ(RLOperationCount(*stats_), merge.op);
+
+  host_->SetJobCallback(nullptr);
+  ASSERT_OK(Put(Key(500), "v"));
+  ASSERT_OK(Flush());
+  std::lock_guard<std::mutex> lock(mu);
+  EXPECT_EQ(11u, records.size());
+}
+
+TEST_F(RLControllerHostImplTest, ApplyIsOneSetOptionsSeenInTheNextSnapshot) {
+  OpenWithHost(BaseOptions());
+  BuildTree();
+  const uint64_t generation = host_->Snapshot()->generation;
+  // 4/3 needs all 17 digits: six (std::to_string) would not read back as it.
+  const double m1 = 4.0 / 3;
+  std::string error;
+  ASSERT_TRUE(host_->Apply({1.0, m1, 1.5, 2.0}, 3, &error)) << error;
+  const Options in_effect = db_->GetOptions();
+  EXPECT_EQ(std::vector<double>({1.0, m1, 1.5, 2.0}),
+            in_effect.level_target_multipliers);
+  EXPECT_EQ(3, in_effect.level0_file_num_compaction_trigger);
+
+  const auto snapshot = host_->Snapshot();
+  EXPECT_GT(snapshot->generation, generation);
+  EXPECT_EQ(in_effect.level_target_multipliers,
+            snapshot->level_target_multipliers);
+  EXPECT_EQ(3, snapshot->l0_trigger);
+  const uint64_t base = Options().max_bytes_for_level_base;
+  EXPECT_EQ(static_cast<uint64_t>(static_cast<long double>(base) * m1),
+            snapshot->levels[1].target_bytes);
+  EXPECT_EQ(1.0 / 3, snapshot->levels[0].score);
+
+  // Refused, with the options in effect unchanged: a wrong length, and a
+  // vector the fork's validation rejects (entry 0 must be 1).
+  EXPECT_FALSE(host_->Apply({1.0, 1.0}, 4, &error));
+  EXPECT_NE(std::string::npos, error.find("2 multipliers for 4 levels"));
+  error.clear();
+  EXPECT_FALSE(host_->Apply({0.9, 1.0, 1.0, 1.0}, 4, &error));
+  EXPECT_FALSE(error.empty());
+  EXPECT_EQ(in_effect.level_target_multipliers,
+            db_->GetOptions().level_target_multipliers);
+  EXPECT_FALSE(host_->Draining());
+}
+
+TEST_F(RLControllerHostImplTest, TheDrainRestoresNativeAndRefusesApply) {
+  OpenWithHost(BaseOptions());
+  std::string error;
+  ASSERT_TRUE(host_->Apply({1.0, 1.5, 1.0, 1.0}, 6, &error)) << error;
+  ASSERT_OK(host_->BeginDrain());
+  EXPECT_TRUE(host_->Draining());
+  const Options in_effect = db_->GetOptions();
+  EXPECT_EQ(std::vector<double>(4, 1.0), in_effect.level_target_multipliers);
+  EXPECT_EQ(Options().level0_file_num_compaction_trigger,
+            in_effect.level0_file_num_compaction_trigger);
+  EXPECT_EQ(std::vector<double>(4, 1.0),
+            host_->Snapshot()->level_target_multipliers);
+  EXPECT_FALSE(host_->Apply({1.0, 1.5, 1.0, 1.0}, 6, &error));
+  EXPECT_NE(std::string::npos, error.find("drain"));
+  EXPECT_EQ(std::vector<double>(4, 1.0),
+            db_->GetOptions().level_target_multipliers);
+}
+
+TEST_F(RLControllerHostImplTest, ANativeDrainMakesNoSetOptionsCall) {
+  OpenWithHost(BaseOptions());
+  // Every SetOptions writes a new OPTIONS file (A-Impl-5).
+  const uint64_t options_file =
+      dbfull()->GetVersionSet()->options_file_number();
+  std::string error;
+  ASSERT_TRUE(host_->Apply({1.0, 1.0, 1.0, 1.0}, 4, &error)) << error;
+  const uint64_t after_apply = dbfull()->GetVersionSet()->options_file_number();
+  EXPECT_GT(after_apply, options_file);
+  ASSERT_OK(host_->BeginDrain());
+  EXPECT_FALSE(host_->Apply({1.0, 1.5, 1.0, 1.0}, 6, &error));
+  EXPECT_EQ(after_apply, dbfull()->GetVersionSet()->options_file_number());
+}
+
+TEST_F(RLControllerHostImplTest, APluginLoadsRunsHoldOnlyAndUnloads) {
+  // Fails rather than skips, so tier 2 cannot pass without loading a plugin.
+  const char* plugin = std::getenv("RL_TEST_PLUGIN");
+  ASSERT_TRUE(plugin != nullptr && *plugin != '\0')
+      << "RL_TEST_PLUGIN is not set (01b_build_test_trees.sh sets it to the "
+         "Debug librl_controller.so)";
+  std::unique_ptr<RLControllerPlugin> loaded;
+  EXPECT_TRUE(RLControllerPlugin::Load(dbname_ + "/no_such_plugin.so", "",
+                                       nullptr, &loaded)
+                  .IsIOError());
+  // A library without the entry points.
+  EXPECT_TRUE(RLControllerPlugin::Load("libc.so.6", "", nullptr, &loaded)
+                  .IsInvalidArgument());
+  EXPECT_EQ(nullptr, loaded);
+
+  OpenWithHost(BaseOptions());
+  const std::string config = dbname_ + ".plugin.json";
+  const std::string decisions = dbname_ + ".decisions.jsonl";
+  const std::string transitions = dbname_ + ".transitions.jsonl";
+  {
+    std::ofstream out(config);
+    out << "{\"mode\":\"hold-only\",\"m_min\":0.5,\"m_max\":2,\"k0_min\":2,"
+           "\"k0_cap\":8,\"epsilon\":0.1,\"phi_min\":0.55,\"alpha\":1.5,"
+           "\"kappa_d\":0.25,\"kappa_a\":1,\"k\":10,\"b_max\":1,"
+           "\"beta_w\":1,\"beta_r\":10,\"beta_s\":1,\"c_w\":1e-9,"
+           "\"c_f\":1e-9,\"c_blk\":1e-6,\"c_sk\":1e-6,\"c_s\":1e-17,"
+           "\"q_bar\":1000,\"setoptions_min_interval_ms\":100,"
+           "\"decision_log\":\""
+        << decisions << "\",\"transition_log\":\"" << transitions << "\"}";
+  }
+  // Every SetOptions writes a new OPTIONS file (A-Impl-5).
+  const uint64_t options_file =
+      dbfull()->GetVersionSet()->options_file_number();
+  ASSERT_OK(RLControllerPlugin::Load(plugin, config, host_.get(), &loaded));
+  ASSERT_TRUE(loaded->created());
+  BuildTree();
+  for (int i = 0; i < 200; ++i) {
+    Get(Key(i));
+  }
+  ASSERT_OK(host_->BeginDrain());
+  loaded.reset();  // destroys the controller, then unloads the library
+
+  std::ifstream in(decisions);
+  std::vector<std::string> lines;
+  for (std::string line; std::getline(in, line);) {
+    lines.push_back(line);
+  }
+  ASSERT_GE(lines.size(), 2u);
+  EXPECT_EQ(0u, lines.front().rfind("{\"type\":\"start\"", 0));
+  EXPECT_EQ(0u, lines.back().rfind("{\"type\":\"stop\"", 0));
+  for (const auto& line : lines) {
+    EXPECT_EQ(std::string::npos, line.find("\"type\":\"apply\"")) << line;
+    EXPECT_EQ(std::string::npos, line.find("\"type\":\"fallback\"")) << line;
+  }
+  // Hold-only and a native drain changed nothing: the option is still the
+  // empty vector the DB opened with, and no OPTIONS file was written.
+  EXPECT_TRUE(db_->GetOptions().level_target_multipliers.empty());
+  EXPECT_EQ(options_file, dbfull()->GetVersionSet()->options_file_number());
+
+  // A config the plugin refuses (epsilon must be below 1) still makes a
+  // controller, which falls back (A-Impl-8) and says so in its log.
+  {
+    std::ifstream good(config);
+    std::stringstream text;
+    text << good.rdbuf();
+    std::string bad = text.str();
+    bad.replace(bad.find("\"epsilon\":0.1"), 13, "\"epsilon\":2.0");
+    std::ofstream(config) << bad;
+  }
+  ASSERT_OK(RLControllerPlugin::Load(plugin, config, host_.get(), &loaded));
+  ASSERT_TRUE(loaded->created());
+  loaded.reset();
+  std::ifstream fallback_log(decisions);
+  bool fell_back = false;
+  for (std::string line; std::getline(fallback_log, line);) {
+    fell_back = fell_back || line.rfind("{\"type\":\"fallback\"", 0) == 0;
+  }
+  EXPECT_TRUE(fell_back);
+  std::remove(config.c_str());
+  std::remove(decisions.c_str());
+  std::remove(transitions.c_str());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

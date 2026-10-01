@@ -57,6 +57,16 @@ void CompactionPressureView::Publish(
                              std::memory_order_release);
 }
 
+std::shared_ptr<const RLTreeSnapshot> CompactionPressureView::LoadTree() const {
+  return std::atomic_load_explicit(&tree_, std::memory_order_acquire);
+}
+
+void CompactionPressureView::PublishTree(
+    std::shared_ptr<const RLTreeSnapshot> tree) {
+  std::atomic_store_explicit(&tree_, std::move(tree),
+                             std::memory_order_release);
+}
+
 CompactionPressureObserver::CompactionPressureObserver(int num_levels,
                                                        uint32_t cf_id)
     : cf_id_(cf_id),
@@ -157,7 +167,7 @@ uint64_t CompactionPressureObserver::NowMicros() {
 }
 
 void CompactionPressureObserver::Observe(const VersionStorageInfo* vstorage,
-                                         uint64_t now_micros) {
+                                         int l0_trigger, uint64_t now_micros) {
   if (vstorage == nullptr) return;
   if (now_micros == 0) now_micros = NowMicros();
   std::lock_guard<std::mutex> state_lock(state_mu_);
@@ -225,6 +235,42 @@ void CompactionPressureObserver::Observe(const VersionStorageInfo* vstorage,
                                       current.episode_start_pressure;
   }
   initialized_ = true;
+  if (tree_enabled_.load(std::memory_order_relaxed)) {
+    // The controller host's view of the same score computation (plan WP2).
+    // Under the DB mutex, so the being-compacted flags are stable.
+    auto tree = std::make_shared<RLTreeSnapshot>();
+    tree->generation = publication->generation;
+    tree->t_micros = now_micros;
+    tree->levels.resize(levels_.size());
+    tree->level_target_multipliers.assign(levels_.size(), 1.0);
+    for (size_t level = 0; level < levels_.size(); ++level) {
+      const int i = static_cast<int>(level);
+      RLLevelSnapshot& out = tree->levels[level];
+      for (const FileMetaData* file : vstorage->LevelFiles(i)) {
+        const uint64_t size = file->fd.GetFileSize();
+        out.bytes += size;
+        ++out.num_files;
+        if (file->being_compacted) {
+          out.bytes_compacting += size;
+          ++out.num_files_compacting;
+        }
+      }
+      out.target_bytes = vstorage->MaxBytesForLevel(i);
+      out.score = new_scores[level];
+      out.due_since_micros = levels_[level].due_since_micros;
+      tree->live_sst_bytes += out.bytes;
+      if (level > 0) {
+        tree->level_target_multipliers[level] = vstorage->CapacityScale(i);
+      }
+    }
+    for (int rank = 0; rank <= max_rank; ++rank) {
+      tree->score_order.push_back(vstorage->CompactionScoreLevel(rank));
+    }
+    tree->pending_compaction_bytes =
+        vstorage->estimated_compaction_needed_bytes();
+    tree->l0_trigger = l0_trigger;
+    view_->PublishTree(std::move(tree));
+  }
   view_->Publish(std::move(publication));
 
   // Publication runs inside the accepted score recomputation, so this is the

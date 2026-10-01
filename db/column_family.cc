@@ -1227,7 +1227,21 @@ void ColumnFamilyData::SetCurrent(Version* current_version) {
   if (current_ != nullptr && compaction_pressure_observer_ != nullptr) {
     current_->storage_info()->SetCompactionPressureObserver(
         compaction_pressure_observer_.get());
-    compaction_pressure_observer_->Observe(current_->storage_info());
+    compaction_pressure_observer_->Observe(
+        current_->storage_info(),
+        current_->GetMutableCFOptions().level0_file_num_compaction_trigger);
+  }
+}
+
+void ColumnFamilyData::EnableRLTreeSnapshots() {
+  if (compaction_pressure_observer_ == nullptr) {
+    return;
+  }
+  compaction_pressure_observer_->EnableTreeSnapshots();
+  if (current_ != nullptr) {
+    compaction_pressure_observer_->Observe(
+        current_->storage_info(),
+        current_->GetMutableCFOptions().level0_file_num_compaction_trigger);
   }
 }
 

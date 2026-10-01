@@ -5,18 +5,33 @@
 
 #include "db/rl_controller_host.h"
 
+#include <dlfcn.h>
+
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 
+#include "db/column_family.h"
 #include "db/compaction/compaction_pressure_observer.h"
+#include "db/db_impl/db_impl.h"
+#include "db/memtable.h"
 #include "db/rl_read_counters.h"
+#include "db/write_controller.h"
 #include "rocksdb/db.h"
 #include "rocksdb/system_clock.h"
+#include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// RLLevelReadCounts' fields are in RLReadCounter's order.
+static_assert(static_cast<int>(RLReadCounter::kProbe) == 0 &&
+                  static_cast<int>(RLReadCounter::kFilterPass) == 1 &&
+                  static_cast<int>(RLReadCounter::kFilterHit) == 2 &&
+                  static_cast<int>(RLReadCounter::kSeek) == 3 &&
+                  RLReadCounters::kKinds == 4,
+              "RLLevelReadCounts follows RLReadCounter");
 
 std::atomic<uint64_t> RLReadCounters::counters_[RLReadCounters::kMaxLevels]
                                                [RLReadCounters::kKinds] = {};
@@ -180,6 +195,287 @@ Status RLHostLog::Stamp(DB* db, const std::string& name,
   WriteLine(line);
   return write_failed_ ? Status::IOError("RLHostLog: a record was lost")
                        : Status::OK();
+}
+
+RLControllerHostImpl::RLControllerHostImpl(
+    std::shared_ptr<Statistics> statistics)
+    : statistics_(std::move(statistics)) {}
+
+Status RLControllerHostImpl::Attach(DB* db) {
+  if (db_ != nullptr) {
+    return Status::InvalidArgument("RLControllerHost: already attached");
+  }
+  if (statistics_ == nullptr) {
+    return Status::InvalidArgument(
+        "RLControllerHost needs the DB's statistics for its operation counts");
+  }
+  // A plain DB: checked in Debug builds only, since the Release library is
+  // built without RTTI (USE_RTTI=AUTO), where dynamic_cast does not compile.
+  auto* impl = static_cast_with_check<DBImpl>(db->GetRootDB());
+  // `Options` alone names RLControllerHost::Options() in this class.
+  const ROCKSDB_NAMESPACE::Options options = db->GetOptions();
+  if (options.num_levels < 1 ||
+      options.num_levels > RLReadCounters::kMaxLevels) {
+    return Status::NotSupported("RLControllerHost: num_levels outside [1, " +
+                                std::to_string(RLReadCounters::kMaxLevels) +
+                                "]");
+  }
+  options_.num_levels = options.num_levels;
+  options_.level_multiplier = options.max_bytes_for_level_multiplier;
+  // One entry per level, the only ones RocksDB reads: the default vector has
+  // seven entries whatever num_levels is, and a missing entry means 1.
+  options_.level_multiplier_additional =
+      options.max_bytes_for_level_multiplier_additional;
+  options_.level_multiplier_additional.resize(options.num_levels, 1);
+  options_.base_level_bytes = options.max_bytes_for_level_base;
+  options_.write_buffer_size = options.write_buffer_size;
+  options_.l0_trigger = options.level0_file_num_compaction_trigger;
+  options_.l0_slowdown_trigger = options.level0_slowdown_writes_trigger;
+  options_.l0_stop_trigger = options.level0_stop_writes_trigger;
+  db_ = db;
+  db_impl_ = impl;
+  cfd_ =
+      static_cast_with_check<ColumnFamilyHandleImpl>(db->DefaultColumnFamily())
+          ->cfd();
+  {
+    InstrumentedMutexLock lock(impl->mutex());
+    cfd_->EnableRLTreeSnapshots();
+  }
+  const auto view = cfd_->compaction_pressure_view();
+  if (view == nullptr || view->LoadTree() == nullptr) {
+    return Status::NotSupported(
+        "RLControllerHost: the column family publishes no snapshot");
+  }
+  return Status::OK();
+}
+
+RLHostOptions RLControllerHostImpl::Options() const { return options_; }
+
+std::shared_ptr<const RLTreeSnapshot> RLControllerHostImpl::Snapshot() const {
+  std::shared_ptr<const RLTreeSnapshot> published;
+  if (cfd_ != nullptr) {
+    const auto view = cfd_->compaction_pressure_view();
+    if (view != nullptr) {
+      published = view->LoadTree();
+    }
+  }
+  auto snapshot = published == nullptr
+                      ? std::make_shared<RLTreeSnapshot>()
+                      : std::make_shared<RLTreeSnapshot>(*published);
+  {
+    // The job listed first began first. A job's install still marks its
+    // inputs as being compacted, so the flags in the published version are
+    // not used for this.
+    std::lock_guard<std::mutex> lock(jobs_mu_);
+    snapshot->running_start_level =
+        running_.empty() ? -1 : running_.begin()->second;
+  }
+  if (db_impl_ != nullptr) {
+    // Live fields, without the DB mutex: the thread-local SuperVersion holds
+    // the active memtable, and the stop count is atomic.
+    SuperVersion* sv = db_impl_->GetAndRefSuperVersion(cfd_);
+    snapshot->active_memtable_bytes =
+        static_cast_with_check<MemTable>(sv->mem)->ApproximateMemoryUsageFast();
+    db_impl_->ReturnAndCleanupSuperVersion(cfd_, sv);
+    snapshot->write_stopped = db_impl_->write_controller().IsStopped();
+  }
+  return snapshot;
+}
+
+RLOpCounts RLControllerHostImpl::OpCounts() const {
+  RLOpCounts counts;
+  if (statistics_ != nullptr) {
+    counts.keys_written = statistics_->getTickerCount(NUMBER_KEYS_WRITTEN);
+    counts.keys_read = statistics_->getTickerCount(NUMBER_KEYS_READ);
+    counts.seeks = statistics_->getTickerCount(NUMBER_DB_SEEK);
+    counts.bytes_written = statistics_->getTickerCount(BYTES_WRITTEN);
+  }
+  return counts;
+}
+
+void RLControllerHostImpl::ReadCounters(
+    std::vector<RLLevelReadCounts>* out) const {
+  out->assign(options_.num_levels, RLLevelReadCounts());
+  for (int level = 0; level < options_.num_levels; ++level) {
+    RLLevelReadCounts& counts = (*out)[level];
+    counts.probes = RLReadCounters::Get(level, RLReadCounter::kProbe);
+    counts.filter_passes =
+        RLReadCounters::Get(level, RLReadCounter::kFilterPass);
+    counts.filter_hits = RLReadCounters::Get(level, RLReadCounter::kFilterHit);
+    counts.seeks = RLReadCounters::Get(level, RLReadCounter::kSeek);
+  }
+}
+
+void RLControllerHostImpl::SetJobCallback(
+    std::function<void(const RLJobRecord&)> callback) {
+  // Waits for a call in flight; the previous function is destroyed here.
+  std::lock_guard<std::mutex> lock(callback_mu_);
+  callback_ = std::move(callback);
+}
+
+void RLControllerHostImpl::Deliver(const RLJobRecord& record) {
+  std::lock_guard<std::mutex> lock(callback_mu_);
+  if (callback_) {
+    callback_(record);
+  }
+}
+
+Status RLControllerHostImpl::SetOptionsLocked(const std::vector<double>& m,
+                                              int k0) {
+  // Every digit a double needs, so the fork's validation sees the exact
+  // values the plugin checked (std::to_string would round to six places).
+  std::string vector;
+  char buffer[32];
+  for (size_t i = 0; i < m.size(); ++i) {
+    snprintf(buffer, sizeof(buffer), "%.17g", m[i]);
+    vector.append(i == 0 ? "" : ":").append(buffer);
+  }
+  return db_->SetOptions(
+      db_->DefaultColumnFamily(),
+      {{"level_target_multipliers", vector},
+       {"level0_file_num_compaction_trigger", std::to_string(k0)}});
+}
+
+bool RLControllerHostImpl::Apply(const std::vector<double>& m, int k0,
+                                 std::string* error) {
+  std::lock_guard<std::mutex> lock(apply_mu_);
+  Status s;
+  if (draining_.load(std::memory_order_acquire)) {
+    s = Status::Aborted("RLControllerHost: the drain has started");
+  } else if (db_ == nullptr) {
+    s = Status::InvalidArgument("RLControllerHost: not attached");
+  } else if (m.size() != static_cast<size_t>(options_.num_levels)) {
+    s = Status::InvalidArgument(
+        "RLControllerHost: " + std::to_string(m.size()) + " multipliers for " +
+        std::to_string(options_.num_levels) + " levels");
+  } else {
+    s = SetOptionsLocked(m, k0);
+  }
+  if (!s.ok() && error != nullptr) {
+    *error = s.ToString();
+  }
+  return s.ok();
+}
+
+Status RLControllerHostImpl::BeginDrain() {
+  std::lock_guard<std::mutex> lock(apply_mu_);
+  draining_.store(true, std::memory_order_release);
+  if (db_ == nullptr) {
+    return Status::OK();
+  }
+  const ROCKSDB_NAMESPACE::Options in_effect = db_->GetOptions();
+  const bool native =
+      in_effect.level0_file_num_compaction_trigger == options_.l0_trigger &&
+      std::all_of(in_effect.level_target_multipliers.begin(),
+                  in_effect.level_target_multipliers.end(),
+                  [](double m) { return m == 1.0; });
+  if (native) {
+    return Status::OK();
+  }
+  return SetOptionsLocked(std::vector<double>(options_.num_levels, 1.0),
+                          options_.l0_trigger);
+}
+
+RLJobRecord RLControllerHostImpl::CompactionRecord(
+    const CompactionJobInfo& info, bool end) const {
+  RLJobRecord record;
+  record.kind = end ? RLJobRecord::Kind::kCompactionEnd
+                    : RLJobRecord::Kind::kCompactionBegin;
+  record.job_id = info.job_id;
+  record.start_level = info.base_input_level;
+  record.output_level = info.output_level;
+  record.reason = static_cast<int>(info.compaction_reason);
+  record.trivial = info.stats.num_input_files_trivially_moved > 0;
+  record.s = info.rl_start_level_input_bytes;
+  record.o = info.rl_output_level_input_bytes;
+  record.x = end ? info.stats.total_output_bytes : 0;
+  record.op = statistics_ == nullptr ? 0 : RLOperationCount(*statistics_);
+  record.t_micros = CompactionPressureObserver::NowMicros();
+  record.due_since_micros = info.rl_start_level_due_since_micros;
+  record.ok = !end || info.status.ok();
+  return record;
+}
+
+void RLControllerHostImpl::OnTableFileCreated(
+    const TableFileCreationInfo& info) {
+  if (info.reason != TableFileCreationReason::kFlush || !info.status.ok()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(jobs_mu_);
+  flush_bytes_[info.job_id] += info.file_size;
+}
+
+void RLControllerHostImpl::OnFlushCompleted(DB* /*db*/,
+                                            const FlushJobInfo& info) {
+  RLJobRecord record;
+  record.kind = RLJobRecord::Kind::kFlushEnd;
+  record.job_id = info.job_id;
+  record.start_level = -1;
+  record.output_level = 0;
+  {
+    // The file was created, and counted, before the flush installed it.
+    std::lock_guard<std::mutex> lock(jobs_mu_);
+    const auto it = flush_bytes_.find(info.job_id);
+    if (it != flush_bytes_.end()) {
+      record.x = it->second;
+      flush_bytes_.erase(it);
+    }
+  }
+  record.op = statistics_ == nullptr ? 0 : RLOperationCount(*statistics_);
+  record.t_micros = CompactionPressureObserver::NowMicros();
+  Deliver(record);
+}
+
+void RLControllerHostImpl::OnCompactionBegin(DB* /*db*/,
+                                             const CompactionJobInfo& info) {
+  {
+    std::lock_guard<std::mutex> lock(jobs_mu_);
+    running_[info.job_id] = info.base_input_level;
+  }
+  Deliver(CompactionRecord(info, /*end=*/false));
+}
+
+void RLControllerHostImpl::OnCompactionCompleted(
+    DB* /*db*/, const CompactionJobInfo& info) {
+  {
+    std::lock_guard<std::mutex> lock(jobs_mu_);
+    running_.erase(info.job_id);
+  }
+  Deliver(CompactionRecord(info, /*end=*/true));
+}
+
+// ponytail: dlopen from libc, which needs glibc 2.34 or later (the node's
+// toolchain floor already implies it); link ${CMAKE_DL_LIBS} for older ones.
+Status RLControllerPlugin::Load(const std::string& path,
+                                const std::string& config_path,
+                                RLControllerHost* host,
+                                std::unique_ptr<RLControllerPlugin>* result) {
+  dlerror();
+  void* library = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (library == nullptr) {
+    const char* reason = dlerror();
+    return Status::IOError("cannot load the controller plugin " + path,
+                           reason == nullptr ? "" : reason);
+  }
+  auto create = reinterpret_cast<RLControllerCreateFn>(
+      dlsym(library, "rl_controller_create"));
+  auto destroy = reinterpret_cast<RLControllerDestroyFn>(
+      dlsym(library, "rl_controller_destroy"));
+  if (create == nullptr || destroy == nullptr) {
+    dlclose(library);
+    return Status::InvalidArgument(
+        path + " lacks rl_controller_create or rl_controller_destroy");
+  }
+  void* controller = create(host, config_path.c_str());
+  result->reset(new RLControllerPlugin(library, destroy, controller));
+  return Status::OK();
+}
+
+RLControllerPlugin::~RLControllerPlugin() {
+  if (controller_ != nullptr) {
+    destroy_(controller_);
+  }
+  dlclose(library_);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

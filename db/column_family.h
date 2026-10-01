@@ -463,6 +463,10 @@ class ColumnFamilyData {
 
   CompactionPicker* compaction_picker() { return compaction_picker_.get(); }
   std::shared_ptr<CompactionPressureView> compaction_pressure_view() const;
+  // Research fork, plan WP2: the pressure view also publishes the controller
+  // host's tree snapshot from now on, starting with the current version's.
+  // REQUIRES: DB mutex held.
+  void EnableRLTreeSnapshots();
   // thread-safe
   const Comparator* user_comparator() const {
     return internal_comparator_.user_comparator();

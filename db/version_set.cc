@@ -4031,7 +4031,8 @@ void VersionStorageInfo::ComputeCompactionScore(
 
   EstimateCompactionBytesNeeded(mutable_cf_options);
   if (compaction_pressure_observer_ != nullptr) {
-    compaction_pressure_observer_->Observe(this);
+    compaction_pressure_observer_->Observe(
+        this, mutable_cf_options.level0_file_num_compaction_trigger);
   }
 }
 

@@ -3,26 +3,32 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 //
-// Research fork, Programme 1: the host side of the controller (plan WP2-WP4).
-// So far the host log (WP4), which every arm writes, native included. The
-// snapshot view, batched SetOptions and plugin loading of WP2 join here with
-// the plugin (plan §7 step 8).
+// Research fork, Programme 1: the host side of the controller (plan WP2-WP4):
+// the host log (WP4), which every arm writes, native included; and the
+// controller host with its plugin loader (WP2), on controller arms only.
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "rocksdb/listener.h"
+#include "rocksdb/rl_controller_host.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 
+class ColumnFamilyData;
 class DB;
+class DBImpl;
 
 // Operations served since the statistics object was created: keys written
 // (Puts, Deletes, Merges), Gets and iterator seeks. Plan WP2's OpCount().
@@ -87,6 +93,110 @@ class RLHostLog : public EventListener {
   const int num_levels_;
   // A line failed to write, or a property it needed could not be read.
   bool write_failed_ = false;
+};
+
+// The controller host (plan WP2): RLControllerHost
+// (include/rocksdb/rl_controller_host.h) on the DB's default column family.
+// It is also an EventListener, registered when the DB opens, so it has seen
+// every job, including those still running when the plugin starts; Attach()
+// binds it to the open DB at n_w. db_bench runs one DB with one column
+// family.
+//
+// Snapshot() reads the tree snapshot that the column family's pressure
+// observer publishes at every score computation, under the DB mutex, once
+// Attach() has switched it on; Snapshot() itself takes no DB mutex. Apply()
+// and BeginDrain() serialise on one mutex, so an Apply either finishes
+// before the drain's own SetOptions or is refused.
+class RLControllerHostImpl : public RLControllerHost, public EventListener {
+ public:
+  explicit RLControllerHostImpl(std::shared_ptr<Statistics> statistics);
+
+  RLControllerHostImpl(const RLControllerHostImpl&) = delete;
+  RLControllerHostImpl& operator=(const RLControllerHostImpl&) = delete;
+
+  // Binds the host to `db`'s default column family, reads the options fixed
+  // for the run and publishes the first snapshot. Once, without the DB
+  // mutex, before the plugin is created; `db` must outlive the plugin.
+  Status Attach(DB* db);
+
+  // The drain (plan WP4): refuses every later Apply, then sets every
+  // multiplier to 1 and the L0 trigger to its value at Attach() in one
+  // SetOptions, or makes no call when those are already in effect.
+  Status BeginDrain();
+
+  // RLControllerHost.
+  RLHostOptions Options() const override;
+  std::shared_ptr<const RLTreeSnapshot> Snapshot() const override;
+  RLOpCounts OpCounts() const override;
+  void ReadCounters(std::vector<RLLevelReadCounts>* out) const override;
+  void SetJobCallback(
+      std::function<void(const RLJobRecord&)> callback) override;
+  bool Apply(const std::vector<double>& m, int k0, std::string* error) override;
+  bool Draining() const override {
+    return draining_.load(std::memory_order_acquire);
+  }
+
+  // EventListener.
+  const char* Name() const override { return "RLControllerHost"; }
+  void OnTableFileCreated(const TableFileCreationInfo& info) override;
+  void OnFlushCompleted(DB* db, const FlushJobInfo& info) override;
+  void OnCompactionBegin(DB* db, const CompactionJobInfo& info) override;
+  void OnCompactionCompleted(DB* db, const CompactionJobInfo& info) override;
+
+ private:
+  // Requires apply_mu_. One SetOptions carrying both options.
+  Status SetOptionsLocked(const std::vector<double>& m, int k0);
+  void Deliver(const RLJobRecord& record);
+  RLJobRecord CompactionRecord(const CompactionJobInfo& info, bool end) const;
+
+  const std::shared_ptr<Statistics> statistics_;
+  // Set by Attach(), read-only afterwards.
+  DB* db_ = nullptr;
+  DBImpl* db_impl_ = nullptr;
+  ColumnFamilyData* cfd_ = nullptr;
+  RLHostOptions options_;
+
+  std::mutex apply_mu_;
+  std::atomic<bool> draining_{false};
+
+  // The job callback; held while it runs.
+  std::mutex callback_mu_;
+  std::function<void(const RLJobRecord&)> callback_;
+
+  // Running compactions (job id -> start level), and the bytes of the files
+  // each running flush has created (job id -> bytes).
+  mutable std::mutex jobs_mu_;
+  std::map<int, int> running_;
+  std::map<int, uint64_t> flush_bytes_;
+};
+
+// A loaded controller plugin (plan WP2): dlopens the library, looks up
+// rl_controller_create and rl_controller_destroy, and creates the controller
+// for `host`. Destroying it destroys the controller first and only then
+// closes the library.
+class RLControllerPlugin {
+ public:
+  // An error if the library or a symbol is missing. A library whose
+  // rl_controller_create returns nullptr loads with created() false; the
+  // host then runs as native.
+  static Status Load(const std::string& path, const std::string& config_path,
+                     RLControllerHost* host,
+                     std::unique_ptr<RLControllerPlugin>* result);
+  ~RLControllerPlugin();
+
+  RLControllerPlugin(const RLControllerPlugin&) = delete;
+  RLControllerPlugin& operator=(const RLControllerPlugin&) = delete;
+
+  bool created() const { return controller_ != nullptr; }
+
+ private:
+  RLControllerPlugin(void* library, RLControllerDestroyFn destroy,
+                     void* controller)
+      : library_(library), destroy_(destroy), controller_(controller) {}
+
+  void* library_;
+  RLControllerDestroyFn destroy_;
+  void* controller_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
