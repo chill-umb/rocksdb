@@ -181,7 +181,7 @@ Status TableCache::FindTable(
     const bool no_io, HistogramImpl* file_read_hist, bool skip_filters,
     int level, bool prefetch_index_and_filter_in_cache,
     size_t max_file_size_for_l0_meta_pin, Temperature file_temperature,
-    bool pin_table_handle) {
+    bool pin_table_handle, RLReadCounter rl_reopen) {
   assert(out_table_reader != nullptr && *out_table_reader == nullptr);
   assert(handle != nullptr && *handle == nullptr);
   PERF_TIMER_GUARD_WITH_CLOCK(find_table_nanos, ioptions_.clock);
@@ -222,6 +222,11 @@ Status TableCache::FindTable(
     *handle = cache_.Lookup(key);
     if (*handle == nullptr) {
       std::unique_ptr<TableReader> table_reader;
+      // Research fork (D-21): a user read's reopen, timed from the open to
+      // the insert, which closes the table the insert evicts.
+      const bool rl_counted = rl_reopen == RLReadCounter::kGetReopen ||
+                              rl_reopen == RLReadCounter::kIterReopen;
+      StopWatchNano<> rl_timer(ioptions_.clock, rl_counted);
       s = GetTableReader(ro, file_options, internal_comparator, file_meta,
                          false /* sequential mode */, file_read_hist,
                          &table_reader, mutable_cf_options, skip_filters, level,
@@ -238,6 +243,13 @@ Status TableCache::FindTable(
         if (s.ok()) {
           // Release ownership of table reader.
           (void)table_reader.release();
+          if (rl_counted) {
+            const uint64_t nanos = rl_timer.ElapsedNanos();
+            RLReadCounters::Add(level, rl_reopen);
+            RLReadCounters::Add(level, RLReadCounter::kReopenNanos, nanos);
+            RecordTick(ioptions_.stats, READ_TABLE_REOPEN);
+            RecordTick(ioptions_.stats, READ_TABLE_REOPEN_NANOS, nanos);
+          }
         }
       }
     }
@@ -298,7 +310,10 @@ InternalIterator* TableCache::NewIterator(
                 file_read_hist, skip_filters, level,
                 true /* prefetch_index_and_filter_in_cache */,
                 max_file_size_for_l0_meta_pin, file_meta.temperature,
-                maybe_pin_table_handle && should_pin_table_handles_);
+                maybe_pin_table_handle && should_pin_table_handles_,
+                caller == TableReaderCaller::kUserIterator
+                    ? RLReadCounter::kIterReopen
+                    : RLReadCounter::kCount);
   InternalIterator* result = nullptr;
   if (s.ok()) {
     if (options.table_filter &&
@@ -509,7 +524,7 @@ Status TableCache::Get(const ReadOptions& options,
                   file_read_hist, skip_filters, level,
                   true /* prefetch_index_and_filter_in_cache */,
                   max_file_size_for_l0_meta_pin, file_meta.temperature,
-                  should_pin_table_handles_);
+                  should_pin_table_handles_, RLReadCounter::kGetReopen);
     SequenceNumber* max_covering_tombstone_seq =
         get_context->max_covering_tombstone_seq();
     if (s.ok() && max_covering_tombstone_seq != nullptr &&

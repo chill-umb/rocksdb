@@ -17,6 +17,7 @@
 #include "cache/typed_cache.h"
 #include "db/dbformat.h"
 #include "db/range_del_aggregator.h"
+#include "db/rl_read_counters.h"
 #include "options/cf_options.h"
 #include "port/port.h"
 #include "rocksdb/cache.h"
@@ -187,6 +188,9 @@ class TableCache {
   // @param pin_table_handle If true, pins the table reader on file_meta so
   //              future lookups bypass the cache. *handle is set to nullptr
   //              on return in this case.
+  // @param rl_reopen Research fork (D-21): kGetReopen or kIterReopen when
+  //              a user read calls, so that opening a closed table is
+  //              counted and timed at `level`; kCount for any other caller.
   Status FindTable(const ReadOptions& ro, const FileOptions& toptions,
                    const InternalKeyComparator& internal_comparator,
                    const FileMetaData& file_meta, TypedHandle**,
@@ -197,7 +201,8 @@ class TableCache {
                    bool prefetch_index_and_filter_in_cache = true,
                    size_t max_file_size_for_l0_meta_pin = 0,
                    Temperature file_temperature = Temperature::kUnknown,
-                   bool pin_table_handle = false);
+                   bool pin_table_handle = false,
+                   RLReadCounter rl_reopen = RLReadCounter::kCount);
 
   // Get the table properties of a given table.
   // @no_io: indicates if we should load table to the cache if it is not present

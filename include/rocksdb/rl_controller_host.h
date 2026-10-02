@@ -111,11 +111,15 @@ struct RLOpCounts {
 // One level's read counters, in the order of RLReadCounter
 // (db/rl_read_counters.h). False-positive block reads are
 // filter_passes - filter_hits; the hit's own read is the shared bucket's.
+// Reopens are tables a Get or a user iterator found closed (D-21).
 struct RLLevelReadCounts {
   uint64_t probes = 0;         // kProbe, POINT_SST_PROBE
   uint64_t filter_passes = 0;  // kFilterPass, BLOOM_FILTER_FULL_POSITIVE
   uint64_t filter_hits = 0;    // kFilterHit, BLOOM_FILTER_FULL_TRUE_POSITIVE
   uint64_t seeks = 0;          // kSeek, SORTED_RUN_SEEK
+  uint64_t get_reopens = 0;    // kGetReopen, READ_TABLE_REOPEN with the next
+  uint64_t iter_reopens = 0;   // kIterReopen
+  uint64_t reopen_nanos = 0;   // kReopenNanos, READ_TABLE_REOPEN_NANOS
 };
 
 // A job record, with the fields of the host log's job_begin and job_end

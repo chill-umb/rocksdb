@@ -30,7 +30,10 @@ static_assert(static_cast<int>(RLReadCounter::kProbe) == 0 &&
                   static_cast<int>(RLReadCounter::kFilterPass) == 1 &&
                   static_cast<int>(RLReadCounter::kFilterHit) == 2 &&
                   static_cast<int>(RLReadCounter::kSeek) == 3 &&
-                  RLReadCounters::kKinds == 4,
+                  static_cast<int>(RLReadCounter::kGetReopen) == 4 &&
+                  static_cast<int>(RLReadCounter::kIterReopen) == 5 &&
+                  static_cast<int>(RLReadCounter::kReopenNanos) == 6 &&
+                  RLReadCounters::kKinds == 7,
               "RLLevelReadCounts follows RLReadCounter");
 
 std::atomic<uint64_t> RLReadCounters::counters_[RLReadCounters::kMaxLevels]
@@ -68,7 +71,8 @@ Status RLHostLog::Open(const std::string& path,
   std::shared_ptr<RLHostLog> log(
       new RLHostLog(file, std::move(statistics), num_levels));
   std::string line = Begin("header");
-  AppendField(&line, "schema", 1);
+  // Schema 2 (D-21): each levels row gains the reopen counters.
+  AppendField(&line, "schema", 2);
   AppendField(&line, "num_levels", static_cast<uint64_t>(num_levels));
   AppendField(&line, "t_us", CompactionPressureObserver::NowMicros());
   AppendField(&line, "wall_us", SystemClock::Default()->NowMicros());
@@ -172,7 +176,8 @@ Status RLHostLog::Stamp(DB* db, const std::string& name,
   AppendField(&line, "stall_micros",
               std::strtoull(db_stats["db.user_write_stall_micros"].c_str(),
                             nullptr, 10));
-  // levels[i] = [probe, filter pass, filter hit, seek] (RLReadCounter order).
+  // levels[i] = [probe, filter pass, filter hit, seek, get reopen, iterator
+  // reopen, reopen nanos] (RLReadCounter order; schema 2, D-21).
   line.append(",\"levels\":[");
   for (int level = 0; level < num_levels_; ++level) {
     line.append(level == 0 ? "[" : ",[");
@@ -303,6 +308,11 @@ void RLControllerHostImpl::ReadCounters(
         RLReadCounters::Get(level, RLReadCounter::kFilterPass);
     counts.filter_hits = RLReadCounters::Get(level, RLReadCounter::kFilterHit);
     counts.seeks = RLReadCounters::Get(level, RLReadCounter::kSeek);
+    counts.get_reopens = RLReadCounters::Get(level, RLReadCounter::kGetReopen);
+    counts.iter_reopens =
+        RLReadCounters::Get(level, RLReadCounter::kIterReopen);
+    counts.reopen_nanos =
+        RLReadCounters::Get(level, RLReadCounter::kReopenNanos);
   }
 }
 

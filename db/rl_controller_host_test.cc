@@ -29,6 +29,7 @@
 #include "db/rl_read_counters.h"
 #include "port/stack_trace.h"
 #include "rocksdb/statistics.h"
+#include "test_util/sync_point.h"
 #include "util/random.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -46,7 +47,8 @@ uint64_t Field(const std::string& line, const std::string& key) {
   return std::strtoull(line.c_str() + at + needle.size(), nullptr, 10);
 }
 
-// A stamp's `levels`: one [probe, pass, hit, seek] row per level.
+// A stamp's `levels`: one [probe, pass, hit, seek, get reopen, iterator
+// reopen, reopen nanos] row per level.
 std::vector<std::array<uint64_t, RLReadCounters::kKinds>> Levels(
     const std::string& line) {
   std::vector<std::array<uint64_t, RLReadCounters::kKinds>> rows;
@@ -173,7 +175,8 @@ TEST_F(RLControllerHostTest, HeaderComesFirst) {
   const auto lines = Records();
   ASSERT_FALSE(lines.empty());
   EXPECT_EQ(0u, lines[0].rfind("{\"type\":\"header\"", 0));
-  EXPECT_EQ(1u, Field(lines[0], "schema"));
+  // Schema 2 (D-21): the levels rows carry the reopen counters.
+  EXPECT_EQ(2u, Field(lines[0], "schema"));
   EXPECT_EQ(4u, Field(lines[0], "num_levels"));
   EXPECT_GT(Field(lines[0], "t_us"), 0u);
   EXPECT_GT(Field(lines[0], "wall_us"), 0u);
@@ -326,9 +329,21 @@ TEST_F(RLControllerHostTest, HSamplesFollowInstallsAndEndAtLiveSstBytes) {
 }
 
 TEST_F(RLControllerHostTest, StampCarriesCountersTickersAndStall) {
-  OpenWithHostLog(BaseOptions());
+  // A table cache of one table (max_open_files 11, set back by a sync point
+  // after SanitizeOptions raises it to 20; Debug builds only), closed before
+  // the reads, so that the stamp's reopen columns are not all zero.
+  Options options = BaseOptions();
+  options.max_open_files = 11;
+  SyncPoint::GetInstance()->SetCallBack(
+      "SanitizeOptions::AfterChangeMaxOpenFiles",
+      [](void* arg) { *static_cast<int*>(arg) = 11; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  OpenWithHostLog(options);
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
   WriteKeys(0, 100);
   ASSERT_OK(Flush());
+  dbfull()->TEST_table_cache()->EraseUnRefEntries();
   for (int i = 0; i < 150; i += 7) {
     Get(Key(i));
   }
@@ -357,11 +372,17 @@ TEST_F(RLControllerHostTest, StampCarriesCountersTickersAndStall) {
       {RLReadCounter::kFilterPass, BLOOM_FILTER_FULL_POSITIVE},
       {RLReadCounter::kFilterHit, BLOOM_FILTER_FULL_TRUE_POSITIVE},
       {RLReadCounter::kSeek, SORTED_RUN_SEEK},
+      {RLReadCounter::kGetReopen, READ_TABLE_REOPEN},
+      {RLReadCounter::kReopenNanos, READ_TABLE_REOPEN_NANOS},
   };
   for (const auto& [kind, ticker] : pairs) {
     uint64_t sum = 0;
     for (const auto& row : levels) {
       sum += row[static_cast<int>(kind)];
+      // One ticker counts both kinds of reopen.
+      if (kind == RLReadCounter::kGetReopen) {
+        sum += row[static_cast<int>(RLReadCounter::kIterReopen)];
+      }
     }
     std::string name;
     for (const auto& entry : TickersNameMap) {
@@ -375,6 +396,8 @@ TEST_F(RLControllerHostTest, StampCarriesCountersTickersAndStall) {
   }
   EXPECT_GT(levels[0][static_cast<int>(RLReadCounter::kProbe)], 0u);
   EXPECT_GT(levels[0][static_cast<int>(RLReadCounter::kSeek)], 0u);
+  EXPECT_GT(levels[0][static_cast<int>(RLReadCounter::kGetReopen)], 0u);
+  EXPECT_GT(levels[0][static_cast<int>(RLReadCounter::kReopenNanos)], 0u);
 }
 
 // The controller host (plan WP2), registered as a listener when the DB
@@ -729,7 +752,8 @@ TEST_F(RLControllerHostImplTest, APluginLoadsRunsHoldOnlyAndUnloads) {
            "\"k0_cap\":8,\"epsilon\":0.1,\"phi_min\":0.55,\"alpha\":1.5,"
            "\"kappa_d\":0.25,\"kappa_a\":1,\"k\":10,\"b_max\":1,"
            "\"beta_w\":1,\"beta_r\":10,\"beta_s\":1,\"c_w\":1e-9,"
-           "\"c_f\":1e-9,\"c_blk\":1e-6,\"c_sk\":1e-6,\"c_s\":1e-17,"
+           "\"c_f\":1e-9,\"c_blk\":1e-6,\"c_sk\":1e-6,\"c_open\":1e-5,"
+           "\"c_s\":1e-17,"
            "\"q_bar\":1000,\"setoptions_min_interval_ms\":100,"
            "\"decision_log\":\""
         << decisions << "\",\"transition_log\":\"" << transitions << "\"}";

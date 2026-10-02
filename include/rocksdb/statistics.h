@@ -588,6 +588,10 @@ enum Tickers : uint32_t {
   // caches.
   POINT_SST_PROBE,
   SORTED_RUN_SEEK,
+  // Research fork (PREREGISTRATION D-21): tables a Get or a user iterator
+  // found closed and reopened, and the nanoseconds those reopens took.
+  READ_TABLE_REOPEN,
+  READ_TABLE_REOPEN_NANOS,
 
   TICKER_ENUM_MAX
 };

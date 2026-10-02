@@ -11,11 +11,21 @@
 //   kFilterPass  BLOOM_FILTER_FULL_POSITIVE       the whole-key filter passed
 //   kFilterHit   BLOOM_FILTER_FULL_TRUE_POSITIVE  the key was in that file
 //   kSeek        SORTED_RUN_SEEK                  a user seek of one run
+//   kGetReopen   READ_TABLE_REOPEN (with the next)  a Get reopened a table
+//   kIterReopen  READ_TABLE_REOPEN                  a user iterator did
+//   kReopenNanos READ_TABLE_REOPEN_NANOS            the time those took
 //
 // so on the Get and user-iterator paths the per-level sums equal those
 // tickers (MultiGet is not counted per level). A level's false-positive
 // block reads are kFilterPass - kFilterHit; the hit's own block read goes to
 // the shared hit-read bucket, which no level is charged.
+//
+// A reopen (PREREGISTRATION D-21) is TableCache::FindTable opening a table
+// it found closed, keyed by the level the read passed in: the table cache
+// holds at most open_files - 10 tables. Its time runs from the open to the
+// cache insert, which closes the table the insert evicts. Opens by flushes,
+// compactions and other callers are not counted: each new file's verifying
+// open is a write cost, in c_w's job seconds (D-20 §2d).
 //
 // The table reader's own level is not used: it is the level the file was
 // first opened at, stale after a trivial move.
@@ -37,6 +47,9 @@ enum class RLReadCounter : int {
   kFilterPass,
   kFilterHit,
   kSeek,
+  kGetReopen,
+  kIterReopen,
+  kReopenNanos,
   kCount
 };
 
@@ -47,12 +60,12 @@ class RLReadCounters {
 
   // A level outside [0, kMaxLevels) is not counted: -1 marks a table
   // iterator built outside a version (ingestion, sst_dump, verification).
-  static void Add(int level, RLReadCounter kind) {
+  static void Add(int level, RLReadCounter kind, uint64_t amount = 1) {
     if (level < 0 || level >= kMaxLevels) {
       return;
     }
     counters_[level][static_cast<int>(kind)].fetch_add(
-        1, std::memory_order_relaxed);
+        amount, std::memory_order_relaxed);
   }
 
   static uint64_t Get(int level, RLReadCounter kind) {

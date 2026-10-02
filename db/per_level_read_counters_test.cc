@@ -4,7 +4,8 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 // Research fork: per-level read counters (PATHWAYS D §4, Gate N0 item 3;
-// implementation plan WP3 and §6.2).
+// implementation plan WP3 and §6.2), and the reads' table reopens
+// (PREREGISTRATION D-21).
 
 #include <array>
 #include <cstdio>
@@ -18,6 +19,7 @@
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -32,7 +34,18 @@ class PerLevelReadCountersTest : public DBTestBase {
 
   // Levels are filled by hand and never compacted on their own. Table
   // readers stay open, so a moved file keeps the level it was opened at.
-  void OpenTree() {
+  // With one_open_table, the table cache holds one table instead: a read of
+  // any other table reopens it, and the version builder pins no reader (it
+  // pins only while the cache is under a quarter full, and a quarter of one
+  // is none). SanitizeOptions raises max_open_files to 20, so a sync point
+  // sets it back to 11, a cache of 11 - 10 = 1 table (Debug builds only).
+  void OpenTree(bool one_open_table = false) {
+    if (one_open_table) {
+      SyncPoint::GetInstance()->SetCallBack(
+          "SanitizeOptions::AfterChangeMaxOpenFiles",
+          [](void* arg) { *static_cast<int*>(arg) = 11; });
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
     Options options;
     options.env = env_;
     options.create_if_missing = true;
@@ -42,7 +55,7 @@ class PerLevelReadCountersTest : public DBTestBase {
     options.disable_auto_compactions = true;
     options.compression = kNoCompression;
     options.write_buffer_size = 64 << 20;
-    options.max_open_files = -1;
+    options.max_open_files = one_open_table ? 11 : -1;
     options.statistics = CreateDBStatistics();
     BlockBasedTableOptions table_options;
     table_options.filter_policy.reset(NewBloomFilterPolicy(10));
@@ -50,7 +63,15 @@ class PerLevelReadCountersTest : public DBTestBase {
     stats_ = options.statistics;
     RLReadCounters::Reset();
     DestroyAndReopen(options);
+    if (one_open_table) {
+      SyncPoint::GetInstance()->DisableProcessing();
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      ASSERT_EQ(1u, dbfull()->TEST_table_cache()->GetCapacity());
+    }
   }
+
+  // Closes every table no reader holds, so the next read reopens it.
+  void CloseTables() { dbfull()->TEST_table_cache()->EraseUnRefEntries(); }
 
   // One flushed file holding `keys` (value "v" + key), moved to `level`.
   // Fill deeper levels first: each move must find the levels it crosses
@@ -115,6 +136,7 @@ class PerLevelReadCountersTest : public DBTestBase {
         {RLReadCounter::kFilterPass, BLOOM_FILTER_FULL_POSITIVE},
         {RLReadCounter::kFilterHit, BLOOM_FILTER_FULL_TRUE_POSITIVE},
         {RLReadCounter::kSeek, SORTED_RUN_SEEK},
+        {RLReadCounter::kReopenNanos, READ_TABLE_REOPEN_NANOS},
     };
     for (const auto& [kind, ticker] : pairs) {
       uint64_t sum = 0;
@@ -124,7 +146,19 @@ class PerLevelReadCountersTest : public DBTestBase {
       EXPECT_EQ(stats_->getTickerCount(ticker), sum)
           << "kind " << static_cast<int>(kind);
     }
+    // One ticker counts both kinds of reopen.
+    uint64_t reopens = 0;
+    for (int level = 0; level < kLevels; ++level) {
+      reopens += At(counts, level, RLReadCounter::kGetReopen) +
+                 At(counts, level, RLReadCounter::kIterReopen);
+    }
+    EXPECT_EQ(stats_->getTickerCount(READ_TABLE_REOPEN), reopens);
   }
+
+  // The four read kinds, before the reopens.
+  static constexpr RLReadCounter kReadKinds[] = {
+      RLReadCounter::kProbe, RLReadCounter::kFilterPass,
+      RLReadCounter::kFilterHit, RLReadCounter::kSeek};
 
   uint64_t FileNumberAt(int level) {
     std::vector<LiveFileMetaData> files;
@@ -221,9 +255,14 @@ TEST_F(PerLevelReadCountersTest, TrivialMoveCountsAtTheNewLevel) {
     for (int level = 0; level < kLevels; ++level) {
       SCOPED_TRACE("L" + std::to_string(level));
       const uint64_t want = level == where ? 1 : 0;
-      for (int kind = 0; kind < RLReadCounters::kKinds; ++kind) {
-        EXPECT_EQ(want, d[level][kind]) << "kind " << kind;
+      for (RLReadCounter kind : kReadKinds) {
+        EXPECT_EQ(want, At(d, level, kind))
+            << "kind " << static_cast<int>(kind);
       }
+      // Every table stays open (max_open_files -1): nothing is reopened.
+      EXPECT_EQ(0u, At(d, level, RLReadCounter::kGetReopen));
+      EXPECT_EQ(0u, At(d, level, RLReadCounter::kIterReopen));
+      EXPECT_EQ(0u, At(d, level, RLReadCounter::kReopenNanos));
     }
   };
 
@@ -275,6 +314,108 @@ TEST_F(PerLevelReadCountersTest, SeekCountsOncePerSortedRun) {
   }
   it.reset();
   ExpectSumsEqualTickers();
+}
+
+// D-21: a Get that finds a table closed reopens it, counted and timed at the
+// level being probed. Each probed level reopens once; levels below the hit
+// are not probed.
+TEST_F(PerLevelReadCountersTest, GetReopensAtEachProbedLevel) {
+  OpenTree(/*one_open_table=*/true);
+  BuildCoveringTree(/*filler=*/0);
+  for (int j = 0; j < kLevels; ++j) {
+    SCOPED_TRACE("key at L" + std::to_string(j));
+    const std::string key = "k" + std::to_string(j);
+    CloseTables();
+    const Counts before = Read();
+    const uint64_t opens_before = stats_->getTickerCount(NO_FILE_OPENS);
+    ASSERT_EQ("v" + key, Get(key));
+    const Counts d = Delta(before);
+    uint64_t reopens = 0;
+    for (int level = 0; level < kLevels; ++level) {
+      SCOPED_TRACE("L" + std::to_string(level));
+      const uint64_t want = level <= j ? 1 : 0;
+      EXPECT_EQ(want, At(d, level, RLReadCounter::kGetReopen));
+      EXPECT_EQ(0u, At(d, level, RLReadCounter::kIterReopen));
+      if (want) {
+        EXPECT_GT(At(d, level, RLReadCounter::kReopenNanos), 0u);
+      } else {
+        EXPECT_EQ(0u, At(d, level, RLReadCounter::kReopenNanos));
+      }
+      reopens += At(d, level, RLReadCounter::kGetReopen);
+    }
+    // These reads opened nothing but the tables they reopened.
+    EXPECT_EQ(reopens, stats_->getTickerCount(NO_FILE_OPENS) - opens_before);
+  }
+  // A table that is still open is not reopened.
+  CloseTables();
+  ASSERT_EQ("vk0", Get("k0"));
+  const Counts before = Read();
+  ASSERT_EQ("vk0", Get("k0"));
+  EXPECT_EQ(0u, At(Delta(before), 0, RLReadCounter::kGetReopen));
+  ExpectSumsEqualTickers();
+}
+
+// D-21: a user iterator reopens each table it opens: every L0 file when it
+// is built, and at each other level the file it is positioned in, again
+// when a scan crosses into the level's next file (which seeks no new run).
+TEST_F(PerLevelReadCountersTest, IteratorReopensEachTableItOpens) {
+  OpenTree(/*one_open_table=*/true);
+  FileAt(2, {"a", "z"});
+  FileAt(1, {"b", "c"});
+  FileAt(1, {"d", "e"});
+  FileAt(0, {"m"});
+  FileAt(0, {"n"});
+  ASSERT_EQ("2,2,1", FilesPerLevel());
+
+  CloseTables();
+  const Counts before = Read();
+  std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+  it->Seek("b");
+  std::string last;
+  for (; it->Valid() && it->key().ToString() <= "e"; it->Next()) {
+    last = it->key().ToString();
+  }
+  ASSERT_OK(it->status());
+  ASSERT_EQ("e", last);
+  const Counts d = Delta(before);
+  EXPECT_EQ(2u, At(d, 0, RLReadCounter::kIterReopen));
+  EXPECT_EQ(2u, At(d, 1, RLReadCounter::kIterReopen));
+  EXPECT_EQ(1u, At(d, 2, RLReadCounter::kIterReopen));
+  EXPECT_EQ(0u, At(d, 3, RLReadCounter::kIterReopen));
+  EXPECT_EQ(1u, At(d, 1, RLReadCounter::kSeek));
+  for (int level = 0; level < kLevels; ++level) {
+    EXPECT_EQ(0u, At(d, level, RLReadCounter::kGetReopen));
+    EXPECT_EQ(At(d, level, RLReadCounter::kIterReopen) > 0,
+              At(d, level, RLReadCounter::kReopenNanos) > 0);
+  }
+  it.reset();
+  ExpectSumsEqualTickers();
+}
+
+// D-21 (and D-20 §2d): opens by flushes and compactions are write costs, in
+// c_w's job seconds, and are not the reads' reopens.
+TEST_F(PerLevelReadCountersTest, JobOpensAreNotReadReopens) {
+  OpenTree(/*one_open_table=*/true);
+  const uint64_t opens_before = stats_->getTickerCount(NO_FILE_OPENS);
+  FileAt(0, {"a", "m"});
+  FileAt(0, {"b", "n"});
+  CloseTables();
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  ASSERT_EQ("0,1", FilesPerLevel());
+  // Each flush and the compaction opened their outputs, and the compaction
+  // reopened its closed inputs.
+  EXPECT_GE(stats_->getTickerCount(NO_FILE_OPENS) - opens_before, 5u);
+  const Counts counts = Read();
+  for (int level = 0; level < kLevels; ++level) {
+    for (RLReadCounter kind :
+         {RLReadCounter::kGetReopen, RLReadCounter::kIterReopen,
+          RLReadCounter::kReopenNanos}) {
+      EXPECT_EQ(0u, At(counts, level, kind))
+          << "L" << level << " kind " << static_cast<int>(kind);
+    }
+  }
+  EXPECT_EQ(0u, stats_->getTickerCount(READ_TABLE_REOPEN));
+  EXPECT_EQ(0u, stats_->getTickerCount(READ_TABLE_REOPEN_NANOS));
 }
 
 }  // namespace ROCKSDB_NAMESPACE
