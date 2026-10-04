@@ -50,6 +50,12 @@ enum class RLReadCounter : int {
   kGetReopen,
   kIterReopen,
   kReopenNanos,
+  // Hidden internal entries a user iterator stepped over (PREREGISTRATION
+  // D-23 §3(a), D-24 §2), keyed by the level where the hidden entry lives:
+  // NUMBER_ITER_SKIP's entries, counted on forward steps by DBIter and added
+  // when it is destroyed, as that ticker is. A memtable's entries are not
+  // counted per level.
+  kHiddenStep,
   kCount
 };
 

@@ -300,6 +300,9 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
     {SORTED_RUN_SEEK, "rocksdb.sorted.run.seek"},
     {READ_TABLE_REOPEN, "rocksdb.read.table.reopen"},
     {READ_TABLE_REOPEN_NANOS, "rocksdb.read.table.reopen.nanos"},
+    {RL_SCAN_SETUP_NANOS, "rocksdb.rl.scan.setup.nanos"},
+    {RL_SCAN_SETUP_COUNT, "rocksdb.rl.scan.setup.count"},
+    {RL_SCAN_TEARDOWN_NANOS, "rocksdb.rl.scan.teardown.nanos"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

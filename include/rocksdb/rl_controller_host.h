@@ -120,13 +120,34 @@ struct RLLevelReadCounts {
   uint64_t get_reopens = 0;    // kGetReopen, READ_TABLE_REOPEN with the next
   uint64_t iter_reopens = 0;   // kIterReopen
   uint64_t reopen_nanos = 0;   // kReopenNanos, READ_TABLE_REOPEN_NANOS
+  // kHiddenStep: hidden entries a user iterator stepped over that live at
+  // this level (NUMBER_ITER_SKIP's, forward steps; D-23, D-24). PATHWAYS D §4
+  // charges them to the level directly above.
+  uint64_t hidden_steps = 0;
+};
+
+// The cumulative foreground-step counters of the priced step types
+// (PREREGISTRATION D-23 §3(a), D-24 §2; the host log's "fg" list, entries 0
+// to 8): what an interference window's quiet read cost per operation is
+// computed from.
+struct RLStepCounts {
+  uint64_t probes = 0;        // POINT_SST_PROBE
+  uint64_t block_probes = 0;  // BLOOM_FILTER_FULL_POSITIVE
+  uint64_t run_seeks = 0;     // SORTED_RUN_SEEK
+  uint64_t reopens = 0;       // READ_TABLE_REOPEN
+  uint64_t nexts_found = 0;   // NUMBER_DB_NEXT_FOUND, returned entries
+  uint64_t iter_skips = 0;    // NUMBER_ITER_SKIP, hidden entries
+  uint64_t gets = 0;          // NUMBER_KEYS_READ
+  uint64_t scans = 0;         // NUMBER_DB_SEEK
+  uint64_t puts = 0;          // NUMBER_KEYS_WRITTEN
 };
 
 // A job record, with the fields of the host log's job_begin and job_end
-// lines. A compaction sends one record when it starts and one when it ends;
-// a flush sends one when it ends.
+// lines (flush_begin and flush_end for a flush). A compaction or a flush
+// sends one record when it starts and one when it ends; a failed flush sends
+// no end record.
 struct RLJobRecord {
-  enum class Kind { kCompactionBegin, kCompactionEnd, kFlushEnd };
+  enum class Kind { kCompactionBegin, kCompactionEnd, kFlushBegin, kFlushEnd };
   Kind kind = Kind::kCompactionBegin;
   int job_id = 0;
   int start_level = -1;  // -1 for a flush
@@ -142,6 +163,9 @@ struct RLJobRecord {
   // 0 if it was not due or the job was not picked automatically.
   uint64_t due_since_micros = 0;
   bool ok = true;  // at the end: the job succeeded
+  // The cumulative step counters when the record was made (D-23, D-24), read
+  // at the event, so a window can be off by one operation's steps at each end.
+  RLStepCounts steps;
 };
 
 class RLControllerHost {
@@ -160,6 +184,9 @@ class RLControllerHost {
 
   // Fills num_levels entries.
   virtual void ReadCounters(std::vector<RLLevelReadCounts>* out) const = 0;
+
+  // The cumulative foreground-step counters, read now (D-23, D-24).
+  virtual RLStepCounts StepCounts() const = 0;
 
   // Replaces the job callback; an empty function removes it. It waits for a
   // call of the previous callback that is still running, and destroys the

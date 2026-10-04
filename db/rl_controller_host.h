@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -17,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "rocksdb/listener.h"
@@ -34,6 +36,10 @@ class DBImpl;
 // (Puts, Deletes, Merges), Gets and iterator seeks. Plan WP2's OpCount().
 uint64_t RLOperationCount(const Statistics& stats);
 
+// The cumulative foreground-step counters (PREREGISTRATION D-23 §3(a), D-24
+// §2), read now.
+RLStepCounts RLReadStepCounts(const Statistics& stats);
+
 // The host log: one JSON object per line, flushed as written. Records
 // (plan WP4; PATHWAYS Gate N0 items 3-5, D §4, G.4, H §5):
 //
@@ -49,6 +55,17 @@ uint64_t RLOperationCount(const Statistics& stats);
 //              micros (the counter behind the internal-stats "Cumulative
 //              stall" line), the per-level read counters and every ticker
 //
+// Schema 3 (PREREGISTRATION D-23 §3(a), D-24 §2; the interim binary) adds
+// the cumulative foreground-step counters "fg" (the tickers the header
+// names, in that order) to job_begin and job_end, and:
+//   flush_begin  a flush's job id, operation count and fg, when it starts
+//   flush_end    the same, plus X (the bytes of the files it created) and
+//                its file count, when it completes (written before its h)
+//   snap         operation count and fg, whenever the operation count has
+//                advanced by at least the stride since the last snap (a
+//                poller thread, every millisecond; stride 0: none)
+// and a kHiddenStep entry at the end of each stamp's levels rows.
+//
 // Times are steady_clock microseconds (`t_us`), the clock of the due-since
 // values; the header and stamps also carry wall-clock micros (`wall_us`),
 // the event log's clock. Operation counts come from the DB's statistics, so
@@ -60,15 +77,20 @@ uint64_t RLOperationCount(const Statistics& stats);
 class RLHostLog : public EventListener {
  public:
   // Creates (truncating) `path` and writes the header.
+  // `snapshot_stride` is the snap records' stride in operations; 0 writes
+  // none.
   static Status Open(const std::string& path,
                      std::shared_ptr<Statistics> statistics, int num_levels,
-                     std::shared_ptr<RLHostLog>* result);
+                     std::shared_ptr<RLHostLog>* result,
+                     uint64_t snapshot_stride = 0);
   ~RLHostLog() override;
 
   RLHostLog(const RLHostLog&) = delete;
   RLHostLog& operator=(const RLHostLog&) = delete;
 
   const char* Name() const override { return "RLHostLog"; }
+  void OnFlushBegin(DB* db, const FlushJobInfo& info) override;
+  void OnTableFileCreated(const TableFileCreationInfo& info) override;
   void OnFlushCompleted(DB* db, const FlushJobInfo& info) override;
   void OnCompactionBegin(DB* db, const CompactionJobInfo& info) override;
   void OnCompactionCompleted(DB* db, const CompactionJobInfo& info) override;
@@ -79,10 +101,15 @@ class RLHostLog : public EventListener {
   Status Stamp(DB* db, const std::string& name, const std::string& extra = "");
 
  private:
-  RLHostLog(FILE* file, std::shared_ptr<Statistics> statistics, int num_levels);
+  RLHostLog(FILE* file, std::shared_ptr<Statistics> statistics, int num_levels,
+            uint64_t snapshot_stride);
 
   // Requires mu_. The line must not end in a newline.
   void WriteLine(const std::string& line);
+  // Appends ,"fg":[...] read now.
+  void AppendSteps(std::string* line) const;
+  // The snapshot poller's loop.
+  void PollSnapshots();
   void JobRecord(const CompactionJobInfo& info, bool end);
   void HSample(DB* db, const char* cause, int job_id);
 
@@ -93,6 +120,17 @@ class RLHostLog : public EventListener {
   const int num_levels_;
   // A line failed to write, or a property it needed could not be read.
   bool write_failed_ = false;
+  // The bytes and files each running flush has created (job id -> value).
+  std::map<int, uint64_t> flush_bytes_;
+  std::map<int, uint64_t> flush_files_;
+
+  // The snapshot poller: started by Open when the stride is positive,
+  // stopped and joined by the destructor. It sleeps without mu_.
+  const uint64_t snapshot_stride_;
+  std::mutex poller_mu_;
+  std::condition_variable poller_cv_;
+  bool poller_stop_ = false;  // guarded by poller_mu_
+  std::thread poller_;
 };
 
 // The controller host (plan WP2): RLControllerHost
@@ -129,6 +167,7 @@ class RLControllerHostImpl : public RLControllerHost, public EventListener {
   std::shared_ptr<const RLTreeSnapshot> Snapshot() const override;
   RLOpCounts OpCounts() const override;
   void ReadCounters(std::vector<RLLevelReadCounts>* out) const override;
+  RLStepCounts StepCounts() const override;
   void SetJobCallback(
       std::function<void(const RLJobRecord&)> callback) override;
   bool Apply(const std::vector<double>& m, int k0, std::string* error) override;
@@ -139,6 +178,7 @@ class RLControllerHostImpl : public RLControllerHost, public EventListener {
   // EventListener.
   const char* Name() const override { return "RLControllerHost"; }
   void OnTableFileCreated(const TableFileCreationInfo& info) override;
+  void OnFlushBegin(DB* db, const FlushJobInfo& info) override;
   void OnFlushCompleted(DB* db, const FlushJobInfo& info) override;
   void OnCompactionBegin(DB* db, const CompactionJobInfo& info) override;
   void OnCompactionCompleted(DB* db, const CompactionJobInfo& info) override;

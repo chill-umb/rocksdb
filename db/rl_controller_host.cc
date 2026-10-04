@@ -8,9 +8,11 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 
 #include "db/column_family.h"
@@ -33,7 +35,8 @@ static_assert(static_cast<int>(RLReadCounter::kProbe) == 0 &&
                   static_cast<int>(RLReadCounter::kGetReopen) == 4 &&
                   static_cast<int>(RLReadCounter::kIterReopen) == 5 &&
                   static_cast<int>(RLReadCounter::kReopenNanos) == 6 &&
-                  RLReadCounters::kKinds == 7,
+                  static_cast<int>(RLReadCounter::kHiddenStep) == 7 &&
+                  RLReadCounters::kKinds == 8,
               "RLLevelReadCounts follows RLReadCounter");
 
 std::atomic<uint64_t> RLReadCounters::counters_[RLReadCounters::kMaxLevels]
@@ -43,6 +46,20 @@ uint64_t RLOperationCount(const Statistics& stats) {
   return stats.getTickerCount(NUMBER_KEYS_WRITTEN) +
          stats.getTickerCount(NUMBER_KEYS_READ) +
          stats.getTickerCount(NUMBER_DB_SEEK);
+}
+
+RLStepCounts RLReadStepCounts(const Statistics& stats) {
+  RLStepCounts counts;
+  counts.probes = stats.getTickerCount(POINT_SST_PROBE);
+  counts.block_probes = stats.getTickerCount(BLOOM_FILTER_FULL_POSITIVE);
+  counts.run_seeks = stats.getTickerCount(SORTED_RUN_SEEK);
+  counts.reopens = stats.getTickerCount(READ_TABLE_REOPEN);
+  counts.nexts_found = stats.getTickerCount(NUMBER_DB_NEXT_FOUND);
+  counts.iter_skips = stats.getTickerCount(NUMBER_ITER_SKIP);
+  counts.gets = stats.getTickerCount(NUMBER_KEYS_READ);
+  counts.scans = stats.getTickerCount(NUMBER_DB_SEEK);
+  counts.puts = stats.getTickerCount(NUMBER_KEYS_WRITTEN);
+  return counts;
 }
 
 namespace {
@@ -55,11 +72,27 @@ std::string Begin(const char* type) {
   return std::string("{\"type\":\"") + type + "\"";
 }
 
+// The host log's "fg" list (schema 3): the foreground-step counters of
+// D-23 §3(a), RLStepCounts' fields in order, then the reopen and scan
+// set-up timers.
+constexpr Tickers kForegroundTickers[] = {
+    POINT_SST_PROBE,        BLOOM_FILTER_FULL_POSITIVE, SORTED_RUN_SEEK,
+    READ_TABLE_REOPEN,      NUMBER_DB_NEXT_FOUND,       NUMBER_ITER_SKIP,
+    NUMBER_KEYS_READ,       NUMBER_DB_SEEK,             NUMBER_KEYS_WRITTEN,
+    READ_TABLE_REOPEN_NANOS, RL_SCAN_SETUP_NANOS};
+
+const std::string& TickerName(Tickers ticker) {
+  static const std::map<uint32_t, std::string> names(TickersNameMap.begin(),
+                                                     TickersNameMap.end());
+  return names.at(ticker);
+}
+
 }  // namespace
 
 Status RLHostLog::Open(const std::string& path,
                        std::shared_ptr<Statistics> statistics, int num_levels,
-                       std::shared_ptr<RLHostLog>* result) {
+                       std::shared_ptr<RLHostLog>* result,
+                       uint64_t snapshot_stride) {
   if (statistics == nullptr) {
     return Status::InvalidArgument(
         "RLHostLog needs the DB's statistics for its operation counts");
@@ -68,14 +101,23 @@ Status RLHostLog::Open(const std::string& path,
   if (file == nullptr) {
     return Status::IOError("RLHostLog: cannot create " + path, strerror(errno));
   }
-  std::shared_ptr<RLHostLog> log(
-      new RLHostLog(file, std::move(statistics), num_levels));
+  std::shared_ptr<RLHostLog> log(new RLHostLog(file, std::move(statistics),
+                                               num_levels, snapshot_stride));
   std::string line = Begin("header");
-  // Schema 2 (D-21): each levels row gains the reopen counters.
-  AppendField(&line, "schema", 2);
+  // Schema 2 (D-21): each levels row gains the reopen counters. Schema 3
+  // (D-23, D-24): the fg counters, flush records, snaps and hidden steps.
+  AppendField(&line, "schema", 3);
   AppendField(&line, "num_levels", static_cast<uint64_t>(num_levels));
   AppendField(&line, "t_us", CompactionPressureObserver::NowMicros());
   AppendField(&line, "wall_us", SystemClock::Default()->NowMicros());
+  line.append(",\"fg\":[");
+  for (size_t i = 0; i < std::size(kForegroundTickers); ++i) {
+    line.append(i == 0 ? "\"" : ",\"")
+        .append(TickerName(kForegroundTickers[i]))
+        .append("\"");
+  }
+  line.append("]");
+  AppendField(&line, "stride", snapshot_stride);
   {
     std::lock_guard<std::mutex> lock(log->mu_);
     log->WriteLine(line);
@@ -83,18 +125,62 @@ Status RLHostLog::Open(const std::string& path,
       return Status::IOError("RLHostLog: cannot write " + path);
     }
   }
+  if (snapshot_stride > 0) {
+    log->poller_ = std::thread([raw = log.get()] { raw->PollSnapshots(); });
+  }
   *result = std::move(log);
   return Status::OK();
 }
 
 RLHostLog::RLHostLog(FILE* file, std::shared_ptr<Statistics> statistics,
-                     int num_levels)
+                     int num_levels, uint64_t snapshot_stride)
     : file_(file),
       statistics_(std::move(statistics)),
       num_levels_(
-          std::min(std::max(num_levels, 1), RLReadCounters::kMaxLevels)) {}
+          std::min(std::max(num_levels, 1), RLReadCounters::kMaxLevels)),
+      snapshot_stride_(snapshot_stride) {}
 
-RLHostLog::~RLHostLog() { fclose(file_); }
+RLHostLog::~RLHostLog() {
+  if (poller_.joinable()) {
+    {
+      std::lock_guard<std::mutex> lock(poller_mu_);
+      poller_stop_ = true;
+    }
+    poller_cv_.notify_all();
+    poller_.join();
+  }
+  fclose(file_);
+}
+
+void RLHostLog::AppendSteps(std::string* line) const {
+  line->append(",\"fg\":[");
+  for (size_t i = 0; i < std::size(kForegroundTickers); ++i) {
+    line->append(i == 0 ? "" : ",")
+        .append(std::to_string(statistics_->getTickerCount(kForegroundTickers[i])));
+  }
+  line->append("]");
+}
+
+void RLHostLog::PollSnapshots() {
+  // The first snap falls once the stride is served after the log opens.
+  uint64_t last = RLOperationCount(*statistics_);
+  std::unique_lock<std::mutex> wait(poller_mu_);
+  while (!poller_cv_.wait_for(wait, std::chrono::milliseconds(1),
+                              [this] { return poller_stop_; })) {
+    if (RLOperationCount(*statistics_) < last + snapshot_stride_) {
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    // Read under mu_, as every other line's, so op never decreases.
+    const uint64_t op = RLOperationCount(*statistics_);
+    std::string line = Begin("snap");
+    AppendField(&line, "t_us", CompactionPressureObserver::NowMicros());
+    AppendField(&line, "op", op);
+    AppendSteps(&line);
+    WriteLine(line);
+    last = op;
+  }
+}
 
 void RLHostLog::WriteLine(const std::string& line) {
   if (fputs(line.c_str(), file_) == EOF || fputs("}\n", file_) == EOF ||
@@ -136,11 +222,42 @@ void RLHostLog::JobRecord(const CompactionJobInfo& info, bool end) {
     AppendField(&line, "x", info.stats.total_output_bytes);
     AppendField(&line, "ok", info.status.ok() ? 1 : 0);
   }
+  AppendSteps(&line);
   WriteLine(line);
+}
+
+void RLHostLog::OnFlushBegin(DB* /*db*/, const FlushJobInfo& info) {
+  std::lock_guard<std::mutex> lock(mu_);
+  std::string line = Begin("flush_begin");
+  AppendField(&line, "job", static_cast<uint64_t>(info.job_id));
+  AppendField(&line, "t_us", CompactionPressureObserver::NowMicros());
+  AppendField(&line, "op", RLOperationCount(*statistics_));
+  AppendSteps(&line);
+  WriteLine(line);
+}
+
+void RLHostLog::OnTableFileCreated(const TableFileCreationInfo& info) {
+  if (info.reason != TableFileCreationReason::kFlush || !info.status.ok()) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(mu_);
+  flush_bytes_[info.job_id] += info.file_size;
+  flush_files_[info.job_id] += 1;
 }
 
 void RLHostLog::OnFlushCompleted(DB* db, const FlushJobInfo& info) {
   std::lock_guard<std::mutex> lock(mu_);
+  // The flush's files were created, and counted, before it installed them.
+  std::string line = Begin("flush_end");
+  AppendField(&line, "job", static_cast<uint64_t>(info.job_id));
+  AppendField(&line, "t_us", CompactionPressureObserver::NowMicros());
+  AppendField(&line, "op", RLOperationCount(*statistics_));
+  AppendField(&line, "x", flush_bytes_[info.job_id]);
+  AppendField(&line, "files", flush_files_[info.job_id]);
+  flush_bytes_.erase(info.job_id);
+  flush_files_.erase(info.job_id);
+  AppendSteps(&line);
+  WriteLine(line);
   HSample(db, "flush", info.job_id);
 }
 
@@ -177,7 +294,8 @@ Status RLHostLog::Stamp(DB* db, const std::string& name,
               std::strtoull(db_stats["db.user_write_stall_micros"].c_str(),
                             nullptr, 10));
   // levels[i] = [probe, filter pass, filter hit, seek, get reopen, iterator
-  // reopen, reopen nanos] (RLReadCounter order; schema 2, D-21).
+  // reopen, reopen nanos, hidden steps] (RLReadCounter order; schema 2,
+  // D-21; schema 3, D-23/D-24).
   line.append(",\"levels\":[");
   for (int level = 0; level < num_levels_; ++level) {
     line.append(level == 0 ? "[" : ",[");
@@ -313,7 +431,14 @@ void RLControllerHostImpl::ReadCounters(
         RLReadCounters::Get(level, RLReadCounter::kIterReopen);
     counts.reopen_nanos =
         RLReadCounters::Get(level, RLReadCounter::kReopenNanos);
+    counts.hidden_steps =
+        RLReadCounters::Get(level, RLReadCounter::kHiddenStep);
   }
+}
+
+RLStepCounts RLControllerHostImpl::StepCounts() const {
+  return statistics_ == nullptr ? RLStepCounts()
+                                : RLReadStepCounts(*statistics_);
 }
 
 void RLControllerHostImpl::SetJobCallback(
@@ -403,6 +528,7 @@ RLJobRecord RLControllerHostImpl::CompactionRecord(
   record.t_micros = CompactionPressureObserver::NowMicros();
   record.due_since_micros = info.rl_start_level_due_since_micros;
   record.ok = !end || info.status.ok();
+  record.steps = StepCounts();
   return record;
 }
 
@@ -433,6 +559,19 @@ void RLControllerHostImpl::OnFlushCompleted(DB* /*db*/,
   }
   record.op = statistics_ == nullptr ? 0 : RLOperationCount(*statistics_);
   record.t_micros = CompactionPressureObserver::NowMicros();
+  record.steps = StepCounts();
+  Deliver(record);
+}
+
+void RLControllerHostImpl::OnFlushBegin(DB* /*db*/, const FlushJobInfo& info) {
+  RLJobRecord record;
+  record.kind = RLJobRecord::Kind::kFlushBegin;
+  record.job_id = info.job_id;
+  record.start_level = -1;
+  record.output_level = 0;
+  record.op = statistics_ == nullptr ? 0 : RLOperationCount(*statistics_);
+  record.t_micros = CompactionPressureObserver::NowMicros();
+  record.steps = StepCounts();
   Deliver(record);
 }
 

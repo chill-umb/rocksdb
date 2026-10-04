@@ -12,6 +12,7 @@
 
 #include "db/rl_controller_host.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -99,11 +100,11 @@ class RLControllerHostTest : public DBTestBase {
     return options;
   }
 
-  void OpenWithHostLog(Options options) {
+  void OpenWithHostLog(Options options, uint64_t snapshot_stride = 0) {
     stats_ = CreateDBStatistics();
     options.statistics = stats_;
-    ASSERT_OK(
-        RLHostLog::Open(log_path_, stats_, options.num_levels, &host_log_));
+    ASSERT_OK(RLHostLog::Open(log_path_, stats_, options.num_levels,
+                              &host_log_, snapshot_stride));
     options.listeners.push_back(host_log_);
     RLReadCounters::Reset();
     DestroyAndReopen(options);
@@ -175,11 +176,100 @@ TEST_F(RLControllerHostTest, HeaderComesFirst) {
   const auto lines = Records();
   ASSERT_FALSE(lines.empty());
   EXPECT_EQ(0u, lines[0].rfind("{\"type\":\"header\"", 0));
-  // Schema 2 (D-21): the levels rows carry the reopen counters.
-  EXPECT_EQ(2u, Field(lines[0], "schema"));
+  // Schema 3 (D-23 §3(a), D-24 §2): the fg names and the snapshot stride.
+  EXPECT_EQ(3u, Field(lines[0], "schema"));
   EXPECT_EQ(4u, Field(lines[0], "num_levels"));
+  EXPECT_NE(std::string::npos,
+            lines[0].find("\"fg\":[\"rocksdb.point.sst.probe\","
+                          "\"rocksdb.bloom.filter.full.positive\","
+                          "\"rocksdb.sorted.run.seek\","
+                          "\"rocksdb.read.table.reopen\","
+                          "\"rocksdb.number.db.next.found\","
+                          "\"rocksdb.number.iter.skip\","
+                          "\"rocksdb.number.keys.read\","
+                          "\"rocksdb.number.db.seek\","
+                          "\"rocksdb.number.keys.written\","
+                          "\"rocksdb.read.table.reopen.nanos\","
+                          "\"rocksdb.rl.scan.setup.nanos\"]"))
+      << lines[0];
+  EXPECT_EQ(0u, Field(lines[0], "stride"));
   EXPECT_GT(Field(lines[0], "t_us"), 0u);
   EXPECT_GT(Field(lines[0], "wall_us"), 0u);
+}
+
+// D-23 §3(a): a flush writes flush_begin, then flush_end and its h sample,
+// with its file's bytes; job records and flush records carry the fg
+// counters, which never decrease.
+TEST_F(RLControllerHostTest, FlushRecordsAndForegroundCounters) {
+  OpenWithHostLog(BaseOptions());
+  WriteKeys(0, 50);
+  ASSERT_OK(Flush());
+  const auto lines = Records();
+  int begin = -1, end = -1, h = -1;
+  for (int i = 0; i < static_cast<int>(lines.size()); ++i) {
+    if (lines[i].rfind("{\"type\":\"flush_begin\"", 0) == 0) {
+      begin = i;
+    } else if (lines[i].rfind("{\"type\":\"flush_end\"", 0) == 0) {
+      end = i;
+    } else if (lines[i].rfind("{\"type\":\"h\"", 0) == 0 && end >= 0 &&
+               h < 0) {
+      h = i;
+    }
+  }
+  ASSERT_GE(begin, 0);
+  ASSERT_GT(end, begin);
+  ASSERT_EQ(end + 1, h);
+  EXPECT_EQ(Field(lines[begin], "job"), Field(lines[end], "job"));
+  EXPECT_EQ(Field(lines[end], "job"), Field(lines[h], "job"));
+  EXPECT_EQ(1u, Field(lines[end], "files"));
+  EXPECT_EQ(LiveSstBytes(), Field(lines[end], "x"));
+  EXPECT_EQ(50u, Field(lines[end], "op"));
+  // fg: 11 entries; entry 8 is the Puts, equal to op here.
+  for (int i : {begin, end}) {
+    const size_t at = lines[i].find("\"fg\":[");
+    ASSERT_NE(std::string::npos, at);
+    const std::string list =
+        lines[i].substr(at + 6, lines[i].find(']', at) - at - 6);
+    EXPECT_EQ(10, std::count(list.begin(), list.end(), ',')) << list;
+  }
+  const std::string fg_end =
+      lines[end].substr(lines[end].find("\"fg\":["));
+  int commas = 0;
+  size_t pos = 6;
+  while (commas < 8) {
+    pos = fg_end.find(',', pos) + 1;
+    ++commas;
+  }
+  EXPECT_EQ(50u, std::strtoull(fg_end.c_str() + pos, nullptr, 10));
+}
+
+// D-23 §3(a): with a stride, a snap whenever the operation count has advanced
+// by at least the stride; with none, no snap.
+TEST_F(RLControllerHostTest, SnapshotsFollowTheStride) {
+  OpenWithHostLog(BaseOptions(), /*snapshot_stride=*/100);
+  EXPECT_EQ(100u, Field(Records("header")[0], "stride"));
+  for (int batch = 0; batch < 10; ++batch) {
+    WriteKeys(batch * 100, (batch + 1) * 100);
+    // The poller wakes every millisecond.
+    env_->SleepForMicroseconds(20000);
+  }
+  const auto snaps = Records("snap");
+  ASSERT_GE(snaps.size(), 9u);
+  uint64_t last = 0;
+  for (const auto& line : snaps) {
+    const uint64_t op = Field(line, "op");
+    EXPECT_GE(op, last + 100) << line;
+    EXPECT_NE(std::string::npos, line.find("\"fg\":[")) << line;
+    last = op;
+  }
+  host_log_.reset();  // joins the poller
+}
+
+TEST_F(RLControllerHostTest, NoSnapshotsWithoutAStride) {
+  OpenWithHostLog(BaseOptions());
+  WriteKeys(0, 300);
+  env_->SleepForMicroseconds(20000);
+  EXPECT_TRUE(Records("snap").empty());
 }
 
 TEST_F(RLControllerHostTest, OperationCountIsKeysWrittenGetsAndSeeks) {
@@ -614,17 +704,25 @@ TEST_F(RLControllerHostImplTest, JobRecordsReachTheCallbackUntilRemoved) {
   EXPECT_EQ(-1, after_job->running_start_level);
   EXPECT_EQ(0u, after_job->levels[2].bytes_compacting);
 
-  std::vector<RLJobRecord> flushes, begins, ends;
+  // D-23 §3(a): a flush sends a begin record too.
+  std::vector<RLJobRecord> flush_begins, flushes, begins, ends;
   {
     std::lock_guard<std::mutex> lock(mu);
     for (const auto& r : records) {
-      (r.kind == RLJobRecord::Kind::kFlushEnd          ? flushes
+      (r.kind == RLJobRecord::Kind::kFlushBegin        ? flush_begins
+       : r.kind == RLJobRecord::Kind::kFlushEnd        ? flushes
        : r.kind == RLJobRecord::Kind::kCompactionBegin ? begins
                                                        : ends)
           .push_back(r);
     }
   }
+  ASSERT_EQ(3u, flush_begins.size());
   ASSERT_EQ(3u, flushes.size());
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_EQ(flush_begins[i].job_id, flushes[i].job_id);
+    EXPECT_LE(flush_begins[i].op, flushes[i].op);
+    EXPECT_LE(flush_begins[i].steps.puts, flushes[i].steps.puts);
+  }
   EXPECT_EQ(l0_file, flushes.back().x);  // the flushed file's bytes
   for (const auto& r : flushes) {
     EXPECT_EQ(-1, r.start_level);
@@ -652,12 +750,51 @@ TEST_F(RLControllerHostImplTest, JobRecordsReachTheCallbackUntilRemoved) {
   EXPECT_LE(begins[3].op, merge.op);
   EXPECT_LE(begins[3].t_micros, merge.t_micros);
   EXPECT_EQ(RLOperationCount(*stats_), merge.op);
+  // The step counters, read at the same event as op.
+  EXPECT_EQ(merge.op,
+            merge.steps.puts + merge.steps.gets + merge.steps.scans);
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_KEYS_WRITTEN), merge.steps.puts);
 
   host_->SetJobCallback(nullptr);
   ASSERT_OK(Put(Key(500), "v"));
   ASSERT_OK(Flush());
   std::lock_guard<std::mutex> lock(mu);
-  EXPECT_EQ(11u, records.size());
+  EXPECT_EQ(14u, records.size());
+}
+
+// D-23 §3(a): StepCounts() is the fg tickers, read now; the per-level
+// counters carry the hidden steps.
+TEST_F(RLControllerHostImplTest, StepCountsAreTheForegroundTickers) {
+  OpenWithHost(BaseOptions());
+  BuildTree();
+  ASSERT_EQ("v", Get(Key(0)).substr(0, 1));
+  {
+    std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+    int n = 0;
+    for (it->SeekToFirst(); it->Valid() && n < 10; it->Next()) {
+      ++n;
+    }
+  }
+  const RLStepCounts steps = host_->StepCounts();
+  EXPECT_EQ(stats_->getTickerCount(POINT_SST_PROBE), steps.probes);
+  EXPECT_EQ(stats_->getTickerCount(BLOOM_FILTER_FULL_POSITIVE),
+            steps.block_probes);
+  EXPECT_EQ(stats_->getTickerCount(SORTED_RUN_SEEK), steps.run_seeks);
+  EXPECT_EQ(stats_->getTickerCount(READ_TABLE_REOPEN), steps.reopens);
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_DB_NEXT_FOUND), steps.nexts_found);
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_ITER_SKIP), steps.iter_skips);
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_KEYS_READ), steps.gets);
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_DB_SEEK), steps.scans);
+  EXPECT_EQ(stats_->getTickerCount(NUMBER_KEYS_WRITTEN), steps.puts);
+  EXPECT_GT(steps.puts, 0u);
+  EXPECT_GT(steps.nexts_found, 0u);
+  std::vector<RLLevelReadCounts> counts;
+  host_->ReadCounters(&counts);
+  uint64_t hidden = 0;
+  for (const auto& level : counts) {
+    hidden += level.hidden_steps;
+  }
+  EXPECT_LE(hidden, steps.iter_skips);
 }
 
 TEST_F(RLControllerHostImplTest, ApplyIsOneSetOptionsSeenInTheNextSnapshot) {

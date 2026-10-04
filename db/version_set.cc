@@ -2377,6 +2377,9 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
   }
 
   auto* arena = merge_iter_builder->GetArena();
+  // Research fork (D-23/D-24): this level's iterators carry its number, for
+  // the per-level hidden-step counter.
+  merge_iter_builder->RLSetLevel(level);
   if (level == 0) {
     // Merge all level zero files together since they may overlap
     std::unique_ptr<TruncatedRangeDelIterator> tombstone_iter = nullptr;

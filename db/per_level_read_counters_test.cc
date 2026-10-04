@@ -394,6 +394,45 @@ TEST_F(PerLevelReadCountersTest, IteratorReopensEachTableItOpens) {
 
 // D-21 (and D-20 §2d): opens by flushes and compactions are write costs, in
 // c_w's job seconds, and are not the reads' reopens.
+// D-23/D-24: a forward scan's hidden entries count at the level where each
+// lives, when the iterator is destroyed, and the levels' sum is
+// NUMBER_ITER_SKIP's. Key "a" has a version at every level, "z" at L2 and
+// L3: the scan returns a, b, m, z and steps over L1's, L2's and L3's "a"
+// and L3's "z".
+TEST_F(PerLevelReadCountersTest, HiddenStepsCountAtTheHiddenEntrysLevel) {
+  OpenTree();
+  FileAt(3, {"a", "m", "z"});
+  FileAt(2, {"a", "z"});
+  FileAt(1, {"a"});
+  FileAt(0, {"a", "b"});
+  ASSERT_EQ("1,1,1,1", FilesPerLevel());
+  const Counts before = Read();
+  const uint64_t skips_before = stats_->getTickerCount(NUMBER_ITER_SKIP);
+  {
+    std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
+    std::vector<std::string> keys;
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      keys.push_back(it->key().ToString());
+    }
+    ASSERT_OK(it->status());
+    EXPECT_EQ((std::vector<std::string>{"a", "b", "m", "z"}), keys);
+    const Counts during = Delta(before);
+    for (int level = 0; level < kLevels; ++level) {
+      EXPECT_EQ(0u, At(during, level, RLReadCounter::kHiddenStep));
+    }
+  }
+  const Counts d = Delta(before);
+  EXPECT_EQ(0u, At(d, 0, RLReadCounter::kHiddenStep));
+  EXPECT_EQ(1u, At(d, 1, RLReadCounter::kHiddenStep));
+  EXPECT_EQ(1u, At(d, 2, RLReadCounter::kHiddenStep));
+  EXPECT_EQ(2u, At(d, 3, RLReadCounter::kHiddenStep));
+  EXPECT_EQ(4u, stats_->getTickerCount(NUMBER_ITER_SKIP) - skips_before);
+  // The scan set-up timer counted the one iterator.
+  EXPECT_EQ(1u, stats_->getTickerCount(RL_SCAN_SETUP_COUNT));
+  EXPECT_GT(stats_->getTickerCount(RL_SCAN_SETUP_NANOS), 0u);
+  EXPECT_GT(stats_->getTickerCount(RL_SCAN_TEARDOWN_NANOS), 0u);
+}
+
 TEST_F(PerLevelReadCountersTest, JobOpensAreNotReadReopens) {
   OpenTree(/*one_open_table=*/true);
   const uint64_t opens_before = stats_->getTickerCount(NO_FILE_OPENS);

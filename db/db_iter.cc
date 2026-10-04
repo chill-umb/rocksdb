@@ -178,6 +178,7 @@ void DBIter::Next() {
   ResetValueAndColumns();
   local_stats_.skip_count_ += num_internal_keys_skipped_;
   local_stats_.skip_count_--;
+  RLReturned();
   num_internal_keys_skipped_ = 0;
   iter_step_since_seek_++;
   bool ok = true;
@@ -1494,6 +1495,7 @@ bool DBIter::TooManyInternalKeysSkipped(bool increment) {
     return true;
   } else if (increment) {
     num_internal_keys_skipped_++;
+    RLVisit();
   }
   return false;
 }

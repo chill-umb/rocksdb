@@ -489,6 +489,21 @@ class MergingIterator : public InternalIterator {
     }
   }
 
+  // Research fork (D-23/D-24): the LSM level of the current entry's child
+  // on a forward step (rl_child_levels_, set by MergeIteratorBuilder); -1
+  // for a memtable, in reverse, or for a child added without a level.
+  int RLCurrentLevel() const override {
+    if (current_ == nullptr || direction_ != kForward || minHeap_.empty()) {
+      return -1;
+    }
+    const HeapItem* top = minHeap_.top();
+    if (top->type != HeapItem::Type::ITERATOR ||
+        top->level >= rl_child_levels_.size()) {
+      return -1;
+    }
+    return rl_child_levels_[top->level];
+  }
+
  private:
   // Represents an element in the min/max heap. Each HeapItem corresponds to a
   // point iterator or a range tombstone iterator, differentiated by
@@ -650,6 +665,9 @@ class MergingIterator : public InternalIterator {
   // This follows from that current_ = CurrentForward()/CurrentReverse() is
   // called at the end of each InternalIterator API.
   IteratorWrapper* current_;
+  // Research fork (D-23/D-24): the LSM level of each child, by child index;
+  // shorter than children_ when children were added without one.
+  std::vector<int> rl_child_levels_;
   // If any of the children have non-ok status, this is one of them.
   Status status_;
   // Invariant: min heap property is maintained (parent is always <= child).
@@ -1687,16 +1705,23 @@ MergeIteratorBuilder::~MergeIteratorBuilder() {
   }
 }
 
+void MergeIteratorBuilder::RLAddChild(InternalIterator* iter, int level) {
+  merge_iter->AddIterator(iter);
+  merge_iter->rl_child_levels_.resize(merge_iter->children_.size() - 1, -1);
+  merge_iter->rl_child_levels_.push_back(level);
+}
+
 void MergeIteratorBuilder::AddIterator(InternalIterator* iter) {
   if (!use_merging_iter && first_iter != nullptr) {
-    merge_iter->AddIterator(first_iter);
+    RLAddChild(first_iter, rl_first_level_);
     use_merging_iter = true;
     first_iter = nullptr;
   }
   if (use_merging_iter) {
-    merge_iter->AddIterator(iter);
+    RLAddChild(iter, rl_level_);
   } else {
     first_iter = iter;
+    rl_first_level_ = rl_level_;
   }
 }
 
@@ -1711,12 +1736,12 @@ void MergeIteratorBuilder::AddPointAndTombstoneIterator(
   if (!use_merging_iter && (add_range_tombstone || first_iter)) {
     use_merging_iter = true;
     if (first_iter) {
-      merge_iter->AddIterator(first_iter);
+      RLAddChild(first_iter, rl_first_level_);
       first_iter = nullptr;
     }
   }
   if (use_merging_iter) {
-    merge_iter->AddIterator(point_iter);
+    RLAddChild(point_iter, rl_level_);
     if (add_range_tombstone) {
       // If there was a gap, fill in nullptr as empty range tombstone iterators.
       while (merge_iter->range_tombstone_iters_.size() <
@@ -1735,6 +1760,7 @@ void MergeIteratorBuilder::AddPointAndTombstoneIterator(
     }
   } else {
     first_iter = point_iter;
+    rl_first_level_ = rl_level_;
   }
 }
 

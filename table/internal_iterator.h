@@ -205,6 +205,12 @@ class InternalIteratorBase : public Cleanable {
   // used by MergingIterator and LevelIterator for now.
   virtual bool IsDeleteRangeSentinelKey() const { return false; }
 
+  // Research fork (PREREGISTRATION D-23 §3(a), D-24 §2): the LSM level of
+  // the entry the iterator is positioned on, for the per-level hidden-step
+  // counter; -1 for a memtable, or when unknown. Only MergingIterator
+  // knows it, on forward steps.
+  virtual int RLCurrentLevel() const { return -1; }
+
   virtual void Prepare(const MultiScanArgs* /*scan_opts*/) {}
 
  protected:

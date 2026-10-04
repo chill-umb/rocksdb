@@ -86,11 +86,20 @@ class MergeIteratorBuilder {
   // This is used for DB iterator to refresh memtable range tombstones.
   InternalIterator* Finish(ArenaWrappedDBIter* db_iter = nullptr);
 
+  // Research fork (D-23/D-24): the LSM level of the iterators added from now
+  // on; -1 (the default) for memtables. Version sets it per level.
+  void RLSetLevel(int level) { rl_level_ = level; }
+
  private:
   MergingIterator* merge_iter;
   InternalIterator* first_iter;
   bool use_merging_iter;
   Arena* arena;
+  // The level of the iterators being added, and of first_iter.
+  int rl_level_ = -1;
+  int rl_first_level_ = -1;
+  // Adds `iter` to merge_iter with its level.
+  void RLAddChild(InternalIterator* iter, int level);
   // Used to set LevelIterator.range_tombstone_iter_.
   // See AddRangeTombstoneIterator() implementation for more detail.
   std::vector<std::pair<size_t, std::unique_ptr<TruncatedRangeDelIterator>**>>

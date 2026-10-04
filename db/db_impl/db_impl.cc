@@ -53,6 +53,7 @@
 #include "db/merge_context.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/range_tombstone_fragmenter.h"
+#include "db/rl_scan_timer.h"
 #include "db/table_cache.h"
 #include "db/table_properties_collector.h"
 #include "db/transaction_log_impl.h"
@@ -4087,6 +4088,11 @@ std::unique_ptr<MultiScan> DBImpl::NewMultiScan(
 
 Iterator* DBImpl::NewIterator(const ReadOptions& _read_options,
                               ColumnFamilyHandle* column_family) {
+  // Research fork (PREREGISTRATION D-23 §3(a), D-24 §2): the scan set-up
+  // timer, from entry to return on every path, with its count.
+  RLScanTimer rl_setup_timer(immutable_db_options_.statistics.get(),
+                             immutable_db_options_.clock, RL_SCAN_SETUP_NANOS,
+                             RL_SCAN_SETUP_COUNT);
   if (_read_options.io_activity != Env::IOActivity::kUnknown &&
       _read_options.io_activity != Env::IOActivity::kDBIterator) {
     return NewErrorIterator(Status::InvalidArgument(

@@ -949,6 +949,11 @@ DEFINE_string(rl_host_log, "",
               "compaction job records and phase stamps, one JSON object per "
               "line (db/rl_controller_host.h). Needs --statistics.");
 
+DEFINE_uint64(rl_host_log_stride, 0,
+              "Research fork (PREREGISTRATION D-23 §3(a), D-24 §2): write a "
+              "counter snapshot (snap) to the --rl_host_log every this many "
+              "operations; 0 writes none.");
+
 DEFINE_string(rl_plugin, "",
               "Research fork (plan WP2): the controller plugin to load, e.g. "
               "build-controller/librl_controller.so. Created at the first "
@@ -3478,7 +3483,8 @@ class Benchmark {
       Status s = FLAGS_num_multi_db > 1
                      ? Status::NotSupported("--rl_host_log with --num_multi_db")
                      : RLHostLog::Open(FLAGS_rl_host_log, dbstats,
-                                       FLAGS_num_levels, &rl_host_log_);
+                                       FLAGS_num_levels, &rl_host_log_,
+                                       FLAGS_rl_host_log_stride);
       if (!s.ok()) {
         fprintf(stderr, "--rl_host_log: %s\n", s.ToString().c_str());
         ErrorExit();

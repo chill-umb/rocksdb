@@ -592,6 +592,12 @@ enum Tickers : uint32_t {
   // found closed and reopened, and the nanoseconds those reopens took.
   READ_TABLE_REOPEN,
   READ_TABLE_REOPEN_NANOS,
+  // Research fork (PREREGISTRATION D-23 §3(a), D-24 §2): a user iterator's
+  // set-up time (DBImpl::NewIterator, entry to return), the iterators so
+  // created, and its teardown time (DBIter's destructor), in nanoseconds.
+  RL_SCAN_SETUP_NANOS,
+  RL_SCAN_SETUP_COUNT,
+  RL_SCAN_TEARDOWN_NANOS,
 
   TICKER_ENUM_MAX
 };

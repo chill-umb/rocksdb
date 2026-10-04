@@ -8,10 +8,13 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <array>
 #include <cstdint>
 #include <string>
 
 #include "db/db_impl/db_impl.h"
+#include "db/rl_read_counters.h"
+#include "db/rl_scan_timer.h"
 #include "memory/arena.h"
 #include "options/cf_options.h"
 #include "rocksdb/db.h"
@@ -145,6 +148,8 @@ class DBIter final : public Iterator {
   void operator=(const DBIter&) = delete;
 
   ~DBIter() override {
+    // Research fork (D-23/D-24): the scan's teardown time.
+    RLScanTimer rl_teardown_timer(statistics_, clock_, RL_SCAN_TEARDOWN_NANOS);
     MarkMemtableForFlushForAvgTrigger();
     ThreadStatus::OperationType cur_op_type =
         ThreadStatusUtil::GetThreadOperation();
@@ -157,6 +162,7 @@ class DBIter final : public Iterator {
     RecordTick(statistics_, NO_ITERATOR_DELETED);
     ResetInternalKeysSkippedCounter();
     local_stats_.BumpGlobalStatistics(statistics_);
+    RLFlushHiddenSteps();
     iter_.DeleteIter(arena_mode_);
     ThreadStatusUtil::SetThreadOperation(cur_op_type);
   }
@@ -339,6 +345,7 @@ class DBIter final : public Iterator {
     local_stats_.skip_count_ += num_internal_keys_skipped_;
     if (valid_) {
       local_stats_.skip_count_--;
+      RLReturned();
     }
     num_internal_keys_skipped_ = 0;
   }
@@ -475,6 +482,37 @@ class DBIter final : public Iterator {
   uint64_t max_skip_;
   uint64_t max_skippable_internal_keys_;
   uint64_t num_internal_keys_skipped_;
+  // Research fork (PREREGISTRATION D-23 §3(a), D-24 §2): the per-level
+  // hidden-step counter. NUMBER_ITER_SKIP is the internal entries visited
+  // (num_internal_keys_skipped_) less one per valid position. Each visit is
+  // counted at the LSM level of the merging iterator's current child (index
+  // level + 1; 0 for a memtable or an unknown child), and each "less one"
+  // at the level of the last visit, which on a forward step is the returned
+  // entry. Added to RLReadCounters' kHiddenStep at destruction, with the
+  // ticker. Merge results and reverse steps carry no level.
+  std::array<uint64_t, RLReadCounters::kMaxLevels + 1> rl_hidden_{};
+  int rl_last_level_ = -1;
+  void RLVisit() {
+    const int level = iter_.iter() == nullptr ? -1 : iter_.iter()->RLCurrentLevel();
+    rl_last_level_ =
+        level >= 0 && level < RLReadCounters::kMaxLevels ? level : -1;
+    ++rl_hidden_[rl_last_level_ + 1];
+  }
+  void RLReturned() {
+    uint64_t& count = rl_hidden_[rl_last_level_ + 1];
+    if (count > 0) {
+      --count;
+    }
+  }
+  void RLFlushHiddenSteps() {
+    for (int level = 0; level < RLReadCounters::kMaxLevels; ++level) {
+      if (rl_hidden_[level + 1] > 0) {
+        RLReadCounters::Add(level, RLReadCounter::kHiddenStep,
+                            rl_hidden_[level + 1]);
+      }
+    }
+    rl_hidden_.fill(0);
+  }
   const Slice* iterate_lower_bound_;
   const Slice* iterate_upper_bound_;
 
