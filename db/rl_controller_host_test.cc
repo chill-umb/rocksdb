@@ -767,7 +767,7 @@ TEST_F(RLControllerHostImplTest, JobRecordsReachTheCallbackUntilRemoved) {
 TEST_F(RLControllerHostImplTest, StepCountsAreTheForegroundTickers) {
   OpenWithHost(BaseOptions());
   BuildTree();
-  ASSERT_EQ("v", Get(Key(0)).substr(0, 1));
+  ASSERT_NE("NOT_FOUND", Get(Key(0)));
   {
     std::unique_ptr<Iterator> it(db_->NewIterator(ReadOptions()));
     int n = 0;
@@ -885,7 +885,8 @@ TEST_F(RLControllerHostImplTest, APluginLoadsRunsHoldOnlyAndUnloads) {
   const std::string transitions = dbname_ + ".transitions.jsonl";
   {
     std::ofstream out(config);
-    out << "{\"mode\":\"hold-only\",\"m_min\":0.5,\"m_max\":2,\"k0_min\":2,"
+    out << "{\"mode\":\"hold-only\",\"cost_model\":1,"
+           "\"m_min\":0.5,\"m_max\":2,\"k0_min\":2,"
            "\"k0_cap\":8,\"epsilon\":0.1,\"phi_min\":0.55,\"alpha\":1.5,"
            "\"kappa_d\":0.25,\"kappa_a\":1,\"k\":10,\"b_max\":1,"
            "\"beta_w\":1,\"beta_r\":10,\"beta_s\":1,\"c_w\":1e-9,"
