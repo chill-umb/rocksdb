@@ -621,6 +621,7 @@ TEST_MAIN_SOURCES =                                                     \
   tools/block_cache_analyzer/block_cache_trace_analyzer_test.cc         \
   tools/io_tracer_parser_test.cc                                        \
   tools/ldb_cmd_test.cc                                                 \
+  tools/mixgraph_suite_test.cc                                          \
   tools/reduce_levels_test.cc                                           \
   tools/sst_dump_test.cc                                                \
   tools/trace_analyzer_test.cc                                          \

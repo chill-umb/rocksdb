@@ -1521,6 +1521,9 @@ per_level_read_counters_test: $(OBJ_DIR)/db/per_level_read_counters_test.o $(TES
 rl_controller_host_test: $(OBJ_DIR)/db/rl_controller_host_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+mixgraph_suite_test: $(OBJ_DIR)/tools/mixgraph_suite_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 db_range_del_test: $(OBJ_DIR)/db/db_range_del_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

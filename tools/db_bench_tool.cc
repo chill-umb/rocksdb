@@ -79,6 +79,7 @@
 #include "rocksdb/write_batch.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
+#include "tools/mixgraph_suite.h"
 #include "tools/simulated_hybrid_file_system.h"
 #include "util/cast_util.h"
 #include "util/compression.h"
@@ -1677,6 +1678,33 @@ DEFINE_uint64(
     "Interval of which the sine wave read_rate_limit is recalculated");
 DEFINE_int64(mix_accesses, -1,
              "The total query accesses of mix_graph workload");
+
+// Research fork: the Programme 1 workload suite (docs/PREREGISTRATION.md
+// D-29 in the parent repository; tools/mixgraph_suite.h).
+DEFINE_bool(mixgraph_decouple_query, false,
+            "mixgraph: draw each operation's query type from its own random "
+            "stream, independent of the draw that picks its key (Cao et al., "
+            "FAST 2020, Section 7.2). False keeps db_bench's released "
+            "behaviour, where one draw picks both.");
+DEFINE_bool(mixgraph_decouple_sizes, false,
+            "mixgraph: draw each Put's value size and each Seek's scan length "
+            "from their own random stream, independent of the draw that picks "
+            "the key; the size distributions are unchanged. False keeps "
+            "db_bench's released behaviour, where the key's draw sets both.");
+DEFINE_double(mix_insert_ratio, 0.0,
+              "mixgraph: the ratio of inserts of new keys. A new key keeps a "
+              "loaded key's 8-byte ID, chosen uniformly, and sorts directly "
+              "after it; every other operation then picks uniformly among the "
+              "keys present. Needs uniform keys (key_dist_a or key_dist_b 0), "
+              "one thread, no prefix, no --use_existing_keys and key_size >= "
+              "17.");
+DEFINE_string(mix_phases, "",
+              "mixgraph: phases by operation count, "
+              "'ops:get:put:seek[:insert]' joined by ';'. The counts must sum "
+              "to the run's operations (--reads, or --num) with --duration 0. "
+              "Each switch prints RL_PHASE_START and stamps phase_start in the "
+              "host log. Empty: one phase from the mix_*_ratio flags, which "
+              "phases replace.");
 
 DEFINE_uint64(
     benchmark_read_rate_limit, 0,
@@ -7300,8 +7328,6 @@ class Benchmark {
     bool use_prefix_modeling = false;
     bool use_random_modeling = false;
     GenerateTwoTermExpKeys gen_exp;
-    std::vector<double> ratio{FLAGS_mix_get_ratio, FLAGS_mix_put_ratio,
-                              FLAGS_mix_seek_ratio};
     char value_buffer[default_value_max];
     QueryDecider query;
     RandomGenerator gen;
@@ -7313,7 +7339,6 @@ class Benchmark {
     std::unique_ptr<const char[]> key_guard;
     Slice key = AllocateKey(&key_guard);
     PinnableSlice pinnable_val;
-    query.Initiate(ratio);
 
     // the limit of qps initiation
     if (FLAGS_sine_mix_rate) {
@@ -7335,6 +7360,90 @@ class Benchmark {
       use_random_modeling = true;
     }
 
+    // Research fork (D-29; tools/mixgraph_suite.h): phases, inserts of new
+    // keys and the decoupled query draw. With none of their flags set, the
+    // query decider, every random draw and the output are db_bench's as
+    // released.
+    namespace ms = mixgraph_suite;
+    std::vector<ms::Phase> phases;
+    if (FLAGS_mix_insert_ratio < 0.0) {
+      fprintf(stderr, "--mix_insert_ratio must be >= 0\n");
+      ErrorExit();
+    }
+    if (!FLAGS_mix_phases.empty()) {
+      std::string error;
+      if (!ms::ParsePhases(FLAGS_mix_phases, &phases, &error)) {
+        fprintf(stderr, "--mix_phases: %s\n", error.c_str());
+        ErrorExit();
+      }
+      if (FLAGS_duration > 0 ||
+          ms::TotalOps(phases) != static_cast<uint64_t>(reads_)) {
+        fprintf(stderr,
+                "--mix_phases: the phases' %" PRIu64
+                " operations must equal the run's %" PRId64
+                ", with --duration 0\n",
+                ms::TotalOps(phases), reads_);
+        ErrorExit();
+      }
+      if (FLAGS_mix_insert_ratio != 0.0 || FLAGS_threads != 1) {
+        fprintf(stderr,
+                "--mix_phases needs --threads=1 and gives inserts per phase, "
+                "not by --mix_insert_ratio\n");
+        ErrorExit();
+      }
+    } else {
+      ms::Phase only;
+      only.ops = std::numeric_limits<uint64_t>::max();
+      only.get = FLAGS_mix_get_ratio;
+      only.put = FLAGS_mix_put_ratio;
+      only.seek = FLAGS_mix_seek_ratio;
+      only.insert = FLAGS_mix_insert_ratio;
+      phases.push_back(only);
+    }
+    bool insert_mode = false;
+    for (const ms::Phase& p : phases) {
+      insert_mode = insert_mode || p.insert > 0.0;
+    }
+    if (insert_mode &&
+        (!use_random_modeling || FLAGS_threads != 1 || keys_per_prefix_ > 0 ||
+         !keys_.empty() ||
+         key_size_ < static_cast<int>(ms::kInsertKeyMinSize))) {
+      fprintf(stderr,
+              "mixgraph inserts need uniform keys (key_dist_a or key_dist_b "
+              "0), --threads=1, no prefix, no --use_existing_keys and "
+              "--key_size >= %zu\n",
+              ms::kInsertKeyMinSize);
+      ErrorExit();
+    }
+    // QueryDecider's type index for an insert; inserts get a fourth ratio
+    // only when some phase has them, so the released three-way split is
+    // unchanged otherwise.
+    constexpr int kInsertType = 3;
+    std::vector<QueryDecider> deciders(phases.size());
+    for (size_t i = 0; i < phases.size(); ++i) {
+      std::vector<double> ratio{phases[i].get, phases[i].put, phases[i].seek};
+      if (insert_mode) {
+        ratio.push_back(phases[i].insert);
+      }
+      deciders[i].Initiate(ratio);
+    }
+    query = deciders[0];
+    size_t phase = 0;
+    uint64_t phase_end = phases[0].ops;
+    uint64_t op_in_run = 0;
+    const bool decouple = FLAGS_mixgraph_decouple_query;
+    Random64 query_stream(
+        ms::StreamSeed(*seed_base, thread->tid, ms::kQueryStreamSalt));
+    const bool decouple_sizes = FLAGS_mixgraph_decouple_sizes;
+    Random64 size_stream(
+        ms::StreamSeed(*seed_base, thread->tid, ms::kSizeStreamSalt));
+    Random64 present_key_stream(
+        ms::StreamSeed(*seed_base, thread->tid, ms::kPresentKeyStreamSalt));
+    const uint64_t insert_seed =
+        ms::StreamSeed(*seed_base, thread->tid, ms::kInsertIdSalt);
+    const uint64_t loaded_keys = static_cast<uint64_t>(FLAGS_num);
+    int64_t inserts = 0;  // insert c (1-based) sorts after InsertedKeyId(c)
+
     // The measured phase starts at the first mixgraph operation, n_w
     // (PATHWAYS A8, H §5). The workload has one client thread.
     if (thread->tid == 0 && dbstats != nullptr) {
@@ -7346,6 +7455,19 @@ class Benchmark {
 
     Duration duration(FLAGS_duration, reads_);
     while (!duration.Done(1)) {
+      if (op_in_run == phase_end) {
+        // The phases cover exactly the run's operations (checked above).
+        ++phase;
+        assert(phase < phases.size());
+        phase_end += phases[phase].ops;
+        query = deciders[phase];
+        fprintf(stdout, "RL_PHASE_START phase=%zu op=%" PRIu64 "\n",
+                phase + 1, op_in_run);
+        fflush(stdout);
+        StampHostLog("phase_start",
+                     ",\"phase\":" + std::to_string(phase + 1));
+      }
+      ++op_in_run;
       DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(thread);
       int64_t ini_rand, rand_v, key_rand, key_seed;
       ini_rand = GetRandomKey(&thread->rand);
@@ -7361,10 +7483,33 @@ class Benchmark {
       } else {
         key_seed = PowerCdfInversion(u, FLAGS_key_dist_a, FLAGS_key_dist_b);
         Random64 rand(key_seed);
-        key_rand = static_cast<int64_t>(rand.Next()) % FLAGS_num;
+        // Research fork (D-29): the key-sign fix. The released
+        // static_cast<int64_t>(rand.Next()) % FLAGS_num sent about half the
+        // keys outside the loaded key space.
+        key_rand = ms::PowerLawKey(rand.Next(), FLAGS_num);
       }
-      GenerateKeyFromInt(key_rand, FLAGS_num, &key);
-      int query_type = query.GetType(rand_v);
+      const int query_type = query.GetType(ms::QueryTypeDraw(
+          decouple, rand_v, decouple ? query_stream.Next() : 0));
+      // The u of this operation's value size or scan length (D-29).
+      const double u_size = ms::SizeDraw(
+          decouple_sizes, u, decouple_sizes ? size_stream.Next() : 0);
+      if (!insert_mode) {
+        GenerateKeyFromInt(key_rand, FLAGS_num, &key);
+      } else if (query_type == kInsertType) {
+        const uint64_t c = static_cast<uint64_t>(inserts) + 1;
+        GenerateKeyFromInt(ms::InsertedKeyId(insert_seed, c, loaded_keys),
+                           FLAGS_num, &key);
+        ms::WriteInsertSuffix(const_cast<char*>(key.data()), key.size(), c);
+      } else {
+        const ms::PresentKey present =
+            ms::PickPresentKey(present_key_stream.Next(), loaded_keys,
+                               static_cast<uint64_t>(inserts), insert_seed);
+        GenerateKeyFromInt(present.id, FLAGS_num, &key);
+        if (present.inserted) {
+          ms::WriteInsertSuffix(const_cast<char*>(key.data()), key.size(),
+                                present.c);
+        }
+      }
 
       // change the qps
       uint64_t now = FLAGS_env->NowMicros();
@@ -7384,7 +7529,9 @@ class Benchmark {
         double mix_rate_with_noise = AddNoise(
             SineRate(usecs_since_start / 1000000.0), FLAGS_sine_mix_rate_noise);
         read_rate = mix_rate_with_noise * (query.ratio_[0] + query.ratio_[2]);
-        write_rate = mix_rate_with_noise * query.ratio_[1];
+        write_rate = mix_rate_with_noise *
+                     (query.ratio_[1] +
+                      (insert_mode ? query.ratio_[kInsertType] : 0.0));
 
         if (read_rate > 0) {
           thread->shared->read_rate_limiter->SetBytesPerSecond(
@@ -7426,10 +7573,12 @@ class Benchmark {
                                                      nullptr /*stats*/);
         }
         thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db, 1, kRead);
-      } else if (query_type == 1) {
-        // the Put query
-        puts++;
-        int64_t val_size = ParetoCdfInversion(u, FLAGS_value_theta,
+      } else if (query_type == 1 || query_type == kInsertType) {
+        // the Put query, or (research fork, D-29) an insert of a new key
+        if (query_type == 1) {
+          puts++;
+        }
+        int64_t val_size = ParetoCdfInversion(u_size, FLAGS_value_theta,
                                               FLAGS_value_k, FLAGS_value_sigma);
         if (val_size < 10) {
           val_size = 10;
@@ -7450,8 +7599,12 @@ class Benchmark {
           fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           ErrorExit();
         }
+        if (query_type == kInsertType) {
+          inserts++;  // the new key now exists
+        }
 
-        if (thread->shared->write_rate_limiter && puts % 100 == 0) {
+        if (thread->shared->write_rate_limiter &&
+            (puts + inserts) % 100 == 0) {
           thread->shared->write_rate_limiter->Request(100, Env::IO_HIGH,
                                                       nullptr /*stats*/);
         }
@@ -7474,7 +7627,7 @@ class Benchmark {
               seek_found++;
             }
             int64_t scan_length =
-                ParetoCdfInversion(u, FLAGS_iter_theta, FLAGS_iter_k,
+                ParetoCdfInversion(u_size, FLAGS_iter_theta, FLAGS_iter_k,
                                    FLAGS_iter_sigma) %
                 scan_len_max;
             for (int64_t j = 0; j < scan_length && single_iter->Valid(); j++) {
@@ -7509,10 +7662,12 @@ class Benchmark {
              " ScanEntries:%" PRIu64
              ", reads %" PRIu64 " in %" PRIu64
              " found, "
-             "avg size: %.1f value, %.1f scan)\n",
+             "avg size: %.1f value, %.1f scan%s)\n",
              gets, puts, seek, static_cast<uint64_t>(total_scan_length),
              get_found + seek_found, gets + seek,
-             total_val_size / puts, total_scan_length / seek);
+             total_val_size / (puts + inserts), total_scan_length / seek,
+             insert_mode ? (", Inserts:" + std::to_string(inserts)).c_str()
+                         : "");
 
     thread->stats.AddBytes(bytes);
     thread->stats.AddMessage(msg);

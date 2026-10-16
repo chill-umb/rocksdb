@@ -1360,6 +1360,7 @@ if(WITH_TESTS)
         db/level_target_multipliers_test.cc
         db/per_level_read_counters_test.cc
         db/rl_controller_host_test.cc
+        tools/mixgraph_suite_test.cc
   )
   if(WITH_ALL_TESTS)
     list(APPEND TESTS

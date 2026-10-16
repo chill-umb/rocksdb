@@ -5341,6 +5341,12 @@ cpp_unittest_wrapper(name="merger_test",
             extra_compiler_flags=[])
 
 
+cpp_unittest_wrapper(name="mixgraph_suite_test",
+            srcs=["tools/mixgraph_suite_test.cc"],
+            deps=[":rocksdb_test_lib"],
+            extra_compiler_flags=[])
+
+
 cpp_unittest_wrapper(name="mock_env_test",
             srcs=["env/mock_env_test.cc"],
             deps=[":rocksdb_test_lib"],
